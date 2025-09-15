@@ -38,7 +38,7 @@ alias ll='ls -al'
 PATH="$HOME/go/bin:$HOME/sdk/go/bin:$PATH"
 
 # update go version in place
-GoToVersion() {
+go_to_version() {
     VERSION="$1"
     push3 ${HOME}/sdk && \
     go install golang.org/dl/go${VERSION}@latest && \

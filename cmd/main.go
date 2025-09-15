@@ -2,14 +2,16 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 
-	"github.com/spf13/cobra"
+	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/widget"
+
+	_ "github.com/suyashkumar/dicom"
 
 	"github.com/jpfielding/goxel/pkg/logging"
 )
@@ -31,39 +33,17 @@ func main() {
 		slog.Group("goxel",
 			slog.String("git", GitSHA),
 		))
-	NewRoot(ctx, GitSHA).Execute()
-}
 
-func NewRoot(ctx context.Context, gitsha string) *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "prosightctl",
-		Short: "a CLI to manage clearscan configuration/validation",
-		Long:  "the long story",
-		Run: func(cmd *cobra.Command, args []string) {
-			printCommandTree(cmd, 0)
-		},
-	}
-	cmd.AddCommand(
-		NewVersionCmd(ctx, gitsha),
-	)
-	return cmd
-}
+	a := app.New()
+	w := a.NewWindow("Hello")
 
-func printCommandTree(cmd *cobra.Command, indent int) {
-	fmt.Println(strings.Repeat("\t", indent), cmd.Use+":", cmd.Short)
-	for _, subCmd := range cmd.Commands() {
-		printCommandTree(subCmd, indent+1)
-	}
-}
+	hello := widget.NewLabel("Hello Fyne!")
+	w.SetContent(container.NewVBox(
+		hello,
+		widget.NewButton("Hi!", func() {
+			hello.SetText("Welcome :)")
+		}),
+	))
 
-func NewVersionCmd(ctx context.Context, gitsha string) *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "version",
-		Short: "git sha for this build",
-		Long:  "git sha for this build",
-		Run: func(cmd *cobra.Command, args []string) {
-			fmt.Println(gitsha)
-		},
-	}
-	return cmd
+	w.ShowAndRun()
 }
