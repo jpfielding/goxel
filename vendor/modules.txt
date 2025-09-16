@@ -5,6 +5,7 @@ fyne.io/fyne/v2/app
 fyne.io/fyne/v2/canvas
 fyne.io/fyne/v2/container
 fyne.io/fyne/v2/data/binding
+fyne.io/fyne/v2/dialog
 fyne.io/fyne/v2/driver
 fyne.io/fyne/v2/driver/desktop
 fyne.io/fyne/v2/driver/mobile
@@ -145,8 +146,11 @@ github.com/nicksnyder/go-i18n/v2/internal/plural
 github.com/pmezard/go-difflib/difflib
 # github.com/rymdport/portal v0.4.1
 ## explicit; go 1.19
+github.com/rymdport/portal
+github.com/rymdport/portal/filechooser
 github.com/rymdport/portal/internal/apis
 github.com/rymdport/portal/internal/convert
+github.com/rymdport/portal/internal/request
 github.com/rymdport/portal/notification
 github.com/rymdport/portal/openuri
 github.com/rymdport/portal/settings

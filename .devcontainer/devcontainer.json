@@ -34,7 +34,7 @@
     },
     {
       "type": "bind",
-      "source": "${localEnv:HOME}/.git-credentials",
+      "source": "${localEnv:HOME}/.gemini",
       "target": "/home/${localEnv:USER:prosight}/.gemini"
     },
     {

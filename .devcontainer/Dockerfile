@@ -55,6 +55,7 @@ RUN set -eux && \
 
 # agentic ai
 ENV NVM_DIR="${HOME}/.nvm"
+ENV GEMINI_API_KEY=""
 RUN mkdir -p ${NVM_DIR} && \
     curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash && \
     source "$NVM_DIR/nvm.sh" && \
