@@ -111,8 +111,6 @@ func makeMenu(ctx context.Context, a fyne.App, w fyne.Window, canvasImg *canvas.
 	}
 	fileItem := fyne.NewMenuItem("Open File", open)
 	fileItem.Icon = theme.FileIcon()
-	dirItem := fyne.NewMenuItem("Open Directory", open)
-	dirItem.Icon = theme.FolderIcon()
 
 	openSettings := func() {
 		w := a.NewWindow("Goxel Settings")
@@ -167,7 +165,7 @@ func makeMenu(ctx context.Context, a fyne.App, w fyne.Window, canvasImg *canvas.
 		}))
 
 	// a quit item will be appended to our first (File) menu
-	file := fyne.NewMenu("File", fileItem, dirItem)
+	file := fyne.NewMenu("File", fileItem)
 	device := fyne.CurrentDevice()
 	if !device.IsMobile() && !device.IsBrowser() {
 		file.Items = append(file.Items, fyne.NewMenuItemSeparator(), settingsItem)
