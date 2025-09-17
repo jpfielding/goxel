@@ -49,13 +49,13 @@ func (v *viewer) loadDir(dir fyne.ListableURI) {
 		d, err := dicom.Parse(r, fileLength(file.Path()), nil)
 		if i == 0 {
 			if err != nil {
-				fyne.LogError("First file in dir was not DICOM", err)
+				slog.Error("first file in dir was not DICOM", slog.Any("error", err))
 				return
 			}
 			data = d
 		}
 		if err != nil {
-			fyne.LogError("Could not open dicom file "+file.Name()+" in folder", err)
+			slog.Error("could not open dicom file "+file.Name()+" in folder", slog.Any("error", err))
 			continue
 		}
 
@@ -84,7 +84,6 @@ func (v *viewer) loadFile(r io.ReadCloser, length int64) {
 		return
 	}
 	defer r.Close()
-
 	v.loadImage(data)
 }
 
@@ -114,6 +113,8 @@ func (v *viewer) loadImage(data dicom.Dataset) {
 			l, _ := strconv.Atoi(str)
 			v.dicom.SetWindowWidth(int16(l))
 			v.width.SetText(str)
+		default:
+			slog.Info("tag", slog.Any(elem.Tag.String(), elem.Value.String()))
 		}
 	}
 }
@@ -181,10 +182,7 @@ func main() {
 		<-ctx.Done()
 	}()
 	slog.SetDefault(logging.Logger(os.Stdout, false, slog.LevelInfo))
-	ctx = logging.AppendCtx(ctx,
-		slog.Group("goxel",
-			slog.String("git", GitSHA),
-		))
+	ctx = logging.AppendCtx(ctx, slog.Group("goxel", slog.String("git", GitSHA)))
 	a := app.New()
 	a.SetIcon(resourceIconPng)
 
