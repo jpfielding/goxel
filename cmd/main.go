@@ -83,34 +83,33 @@ func (v *viewer) loadFile(r io.ReadCloser, length int64) {
 		dialog.ShowError(err, v.win)
 		return
 	}
-
-	err = r.Close()
+	defer r.Close()
 
 	v.loadImage(data)
 }
 
 func (v *viewer) loadImage(data dicom.Dataset) {
 	for _, elem := range data.Elements {
-		if elem.Tag == tag.PixelData {
+		switch elem.Tag {
+		case tag.PixelData:
 			v.frames = elem.Value.GetValue().(dicom.PixelDataInfo).Frames
 
 			if len(v.frames) == 0 {
 				panic("No images found")
 			}
-
 			v.setFrame(0)
-		} else if elem.Tag == tag.PatientName {
+		case tag.PatientName:
 			v.name.SetText(fmt.Sprintf("%v", elem.Value))
-		} else if elem.Tag == tag.PatientID {
+		case tag.PatientID:
 			v.id.SetText(fmt.Sprintf("%v", elem.Value))
-		} else if elem.Tag == tag.StudyDescription {
+		case tag.StudyDescription:
 			v.study.SetText(fmt.Sprintf("%v", elem.Value))
-		} else if elem.Tag == tag.WindowCenter {
+		case tag.WindowCenter:
 			str := fmt.Sprintf("%v", elem.Value.GetValue().([]string)[0])
 			l, _ := strconv.Atoi(str)
 			v.dicom.SetWindowLevel(int16(l))
 			v.level.SetText(str)
-		} else if elem.Tag == tag.WindowWidth {
+		case tag.WindowWidth:
 			str := fmt.Sprintf("%v", elem.Value.GetValue().([]string)[0])
 			l, _ := strconv.Atoi(str)
 			v.dicom.SetWindowWidth(int16(l))
