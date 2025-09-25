@@ -20,6 +20,7 @@ import (
 	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/widget"
 
+	"github.com/jpfielding/goxel/pkg/dicos"
 	"github.com/jpfielding/goxel/pkg/logging"
 	"github.com/suyashkumar/dicom"
 	"github.com/suyashkumar/dicom/pkg/frame"
@@ -114,7 +115,11 @@ func (v *viewer) loadImage(data dicom.Dataset) {
 			v.dicom.SetWindowWidth(int16(l))
 			v.width.SetText(str)
 		default:
-			slog.Info("tag", slog.Any(elem.Tag.String(), elem.Value.String()))
+			key := elem.Tag.String()
+			if ltn := dicos.LookupTagName(elem.Tag.Group, elem.Tag.Element); ltn != "" {
+				key = ltn
+			}
+			slog.Info("tag", slog.Any(key, elem.Value.String()))
 		}
 	}
 }

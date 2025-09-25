@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"strconv"
 
 	"fyne.io/fyne/v2"
@@ -56,6 +57,9 @@ func (v *viewer) openFolder() {
 
 		v.loadDir(f)
 	}, v.win)
+	wd, _ := os.Getwd()
+	here, _ := storage.ListerForURI(storage.NewFileURI(wd))
+	d.SetLocation(here)
 	d.Show()
 }
 func (v *viewer) setupForm(dicomImg *DICOMImage, img *canvas.Image) fyne.CanvasObject {
