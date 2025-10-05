@@ -115,11 +115,28 @@ func (v *viewer) loadImage(data dicom.Dataset) {
 			v.dicom.SetWindowWidth(int16(l))
 			v.width.SetText(str)
 		default:
-			key := elem.Tag.String()
-			if ltn := dicos.LookupTagName(elem.Tag.Group, elem.Tag.Element); ltn != "" {
+			t := elem.Tag
+			key := t.String()
+			if ltn := dicos.LookupTagName(t.Group, t.Element); ltn != "" {
 				key = ltn
 			}
-			slog.Info("tag", slog.Any(key, elem.Value.String()))
+			switch elem.Value.ValueType() {
+			case dicom.Strings:
+			// Bytes represents an underlying value of []byte
+			case dicom.Bytes:
+			// Ints represents an underlying value of []int
+			case dicom.Ints:
+				// PixelData represents an underlying value of PixelDataInfo
+			case dicom.PixelData:
+				// SequenceItem represents an underlying value of []*Element
+			case dicom.SequenceItem:
+				// Sequences represents an underlying value of []SequenceItem
+			case dicom.Sequences:
+				// Floats represents an underlying value of []float64
+			case dicom.Floats:
+			default:
+				slog.Info("tag", slog.Any(key, elem.Value.String()))
+			}
 		}
 	}
 }

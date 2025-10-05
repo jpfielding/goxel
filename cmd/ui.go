@@ -45,7 +45,10 @@ func (v *viewer) openFile() {
 
 		v.loadFile(f, fileLength(f.URI().Path())) // TODO work with library upstream to not do this
 	}, v.win)
-	d.SetFilter(storage.NewExtensionFileFilter([]string{".dcm"}))
+	d.SetFilter(storage.NewExtensionFileFilter([]string{".dcm", ".dcs"}))
+	wd, _ := os.Getwd()
+	here, _ := storage.ListerForURI(storage.NewFileURI(wd))
+	d.SetLocation(here)
 	d.Show()
 }
 
