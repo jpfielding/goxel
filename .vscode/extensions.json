@@ -1,0 +1,9 @@
+{
+    "unwantedRecommendations": [
+    ],
+    "recommendations": [
+        "eamodio.gitlens",
+        "GitHub.copilot-chat",
+        "bierner.markdown-mermaid"
+    ]
+}
