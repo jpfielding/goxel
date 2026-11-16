@@ -85,6 +85,3 @@ func (v *Viewer) desktopRoot() fyne.CanvasObject {
 	body := container.New(desktopLayout{}, v.sidebar(), v.slicePanel(), centre)
 	return container.NewBorder(bar, status, nil, nil, body)
 }
-
-// phoneRoot builds the compact layouts (Step 7); until then, desktop.
-func (v *Viewer) phoneRoot() fyne.CanvasObject { return v.desktopRoot() }

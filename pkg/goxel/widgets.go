@@ -246,7 +246,7 @@ func newSliderRow(compact bool, label string, lo, hi, step float64, format func(
 			onCommitted(v)
 		}
 	}
-	minus := widget.NewButton("−", func() { nudge(-stepBy) })
+	minus := widget.NewButton("-", func() { nudge(-stepBy) })
 	plus := widget.NewButton("+", func() { nudge(stepBy) })
 	r.value.Alignment = fyne.TextAlignLeading
 	left := fixedWidth(96, container.NewVBox(layout.NewSpacer(), name, layout.NewSpacer()))

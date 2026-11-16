@@ -86,6 +86,9 @@ func (v *Viewer) slicePlaneTools() fyne.CanvasObject {
 	}
 	sync()
 	v.onSync(sync)
+	if v.st.layout.compact() {
+		return container.NewVBox(container.NewGridWithColumns(3, plane, cut, reverse), unavailable)
+	}
 	return container.NewHBox(plane, cut, reverse, unavailable)
 }
 
