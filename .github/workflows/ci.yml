@@ -1,0 +1,21 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request: {}
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: GL/X11 headers for go-gl and Fyne
+        run: sudo apt-get update && sudo apt-get install -y libgl1-mesa-dev xorg-dev
+      - run: go vet ./pkg/...
+      - run: go test -short ./pkg/...
+      - name: wasm compiles
+        run: GOOS=js GOARCH=wasm go build ./...

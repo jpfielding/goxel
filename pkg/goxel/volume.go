@@ -478,6 +478,10 @@ func (vr *VolumeRenderer) CreateRenderer() fyne.WidgetRenderer {
 
 	vr.img.FillMode = canvas.ImageFillStretch // Manual layout
 	vr.img.ScaleMode = canvas.ImageScaleFastest
+	if fyne.CurrentDevice().IsBrowser() {
+		// The browser driver rejects ImageScaleFastest ("Invalid canvas.ImageScale value").
+		vr.img.ScaleMode = canvas.ImageScaleSmooth
+	}
 
 	return &volumeWidgetRenderer{
 		vr:  vr,
