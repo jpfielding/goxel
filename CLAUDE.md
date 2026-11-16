@@ -27,6 +27,11 @@ make lint                         # Run golangci-lint
 make vet                          # Run go vet
 make vulnerability                # Check for security vulnerabilities
 
+# Browser (wasm) build
+make build-wasm                   # Outputs bin/web
+make serve-wasm                   # Serves bin/web on http://127.0.0.1:8080
+GOOS=js GOARCH=wasm go build ./...
+
 # Dependencies
 make update-deps                  # Update go.mod and vendor directory
 
@@ -68,17 +73,28 @@ The codebase is organized into three main functional layers:
 **3. Volume Rendering Layer (`pkg/volume/`)**
 - **Purpose**: GPU-accelerated 3D volume rendering and 2D slice extraction
 - **Key files**:
-  - `gpu_ray_caster.go` - OpenGL-based ray casting for 3D rendering
+  - `gpu_ray_caster.go` - OpenGL 3.3 ray casting for 3D rendering (`!js`)
+  - `gpu_ray_caster_js.go` - WebGL2 implementation of the same `GPUVolumeRenderer` API (`js`)
+  - `shader_body.go` - Ray-march fragment shader shared by both back ends (per-platform header macros)
+  - `half.go` - float16 packing and 2x downsample for the WebGL2 volume texture
+  - `jpeg_frame.go` - JPEG frame helpers used by both renderers
   - `cpu_ray_caster.go` - CPU fallback for systems without GPU
   - `config.go` - Rendering configuration (transfer functions, lighting)
   - `transfer_function.go` - Opacity/color mapping for volume visualization
   - `types.go` - Core volume data structures
-- **Architecture**: Uses OpenGL 3.3 with GLSL shaders for real-time volume ray casting
+- **Architecture**: OpenGL 3.3 on desktop, WebGL2 in the browser, one shared GLSL ray-march body; CPU fallback when neither is available
 
 **4. UI Layer (`pkg/goxel/`)**
 - **Purpose**: Fyne-based GUI for viewing DICOM images
 - **Key files**:
-  - `ui.go` - Main UI orchestration and layout management
+  - `ui.go` - `Viewer`: loading, `rebuild()` from state, applying state to the views
+  - `state.go` - `uiState` (all UI state as plain data), layout classes, pure helpers
+  - `theme.go` - The one Fyne theme (roxel's dark palette; compact sizes on phones)
+  - `responsive.go` - Breakpoint watcher and the desktop layout
+  - `chrome.go`, `sidebar.go`, `controls3d.go`, `controls2d.go` - Desktop control groups
+  - `phone.go` - Compact layouts: tab bar, paged sheets, focus action bar
+  - `widgets.go` - Small helpers (segmented control, slider rows, sections)
+  - `open_desktop.go` / `open_js.go` - File opening per platform (Fyne dialogs / `<input type=file>`, sample fetch)
   - `dicom_loader.go` - Bridge between DICOM data and UI (ScanCollection, CompositeVolume)
   - `scan_adapter.go` - Converts DICOM datasets to UI-compatible pixel data
   - `volume.go` - 3D volume rendering widget
@@ -86,7 +102,7 @@ The codebase is organized into three main functional layers:
   - `dicox.go` - Custom image widget for windowing/level adjustments
   - `*_slider.go` - Custom UI controls for windowing, multi-range selection
   - `bundle.go` - Embedded resources (icon, etc.)
-- **Multi-view support**: Side-by-side 2D/3D views, single 2D, single 3D layouts
+- **Layouts**: desktop (sidebar, 3D column, 2D panel), focus modes, and phone portrait/landscape; the tree is rebuilt from `uiState` only when the layout class, focus, tab, page or study changes
 - **Data model**: `ScanCollection` -> `CompositeVolume` (per series) -> `PixelData` (for 2D) or OpenGL textures (for 3D)
 - **Performance**: Slider-driven renders are debounced (50ms) using `debouncer` to avoid expensive re-render storms
 
