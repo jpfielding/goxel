@@ -27,6 +27,17 @@ func LoadDICOM(path string) (*ScanCollection, error) {
 	return parseDICOMDataset(ds, path)
 }
 
+// LoadBytes parses a single DICOM file held in memory. name is used as the
+// source path for volume naming and display. It is the loader used by the
+// browser build, where files arrive as byte buffers rather than paths.
+func LoadBytes(name string, data []byte) (*ScanCollection, error) {
+	ds, err := dicom.ReadBuffer(data)
+	if err != nil {
+		return nil, fmt.Errorf("parsing DICOM %s: %w", name, err)
+	}
+	return parseDICOMDataset(ds, name)
+}
+
 // dicomFileInfo holds metadata needed to sort DICOM files before loading
 type dicomFileInfo struct {
 	Path           string

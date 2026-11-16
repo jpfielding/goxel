@@ -1,5 +1,7 @@
 package jpeg2k
 
+import "fmt"
+
 // Tile represents a tile in the JPEG 2000 codestream
 type Tile struct {
 	Index      int
@@ -11,7 +13,7 @@ type Tile struct {
 
 // TileComponent holds data for one component of a tile
 type TileComponent struct {
-	Data       []int      // Coefficient data after DWT
+	Data       []int // Coefficient data after DWT
 	Subbands   []SubbandData
 	CodeBlocks []*CodeBlock
 }
@@ -28,21 +30,21 @@ type SubbandData struct {
 
 // TileEncoder encodes a single tile
 type TileEncoder struct {
-	width       int
-	height      int
+	width        int
+	height       int
 	decompLevels int
-	codeBlockW  int
-	codeBlockH  int
+	codeBlockW   int
+	codeBlockH   int
 }
 
 // NewTileEncoder creates a tile encoder
 func NewTileEncoder(width, height, decompLevels, codeBlockW, codeBlockH int) *TileEncoder {
 	return &TileEncoder{
-		width:       width,
-		height:      height,
+		width:        width,
+		height:       height,
 		decompLevels: decompLevels,
-		codeBlockW:  codeBlockW,
-		codeBlockH:  codeBlockH,
+		codeBlockW:   codeBlockW,
+		codeBlockH:   codeBlockH,
 	}
 }
 
@@ -76,21 +78,21 @@ func (te *TileEncoder) EncodeTile(data []int) ([]byte, error) {
 
 // TileDecoder decodes a single tile
 type TileDecoder struct {
-	width       int
-	height      int
+	width        int
+	height       int
 	decompLevels int
-	codeBlockW  int
-	codeBlockH  int
+	codeBlockW   int
+	codeBlockH   int
 }
 
 // NewTileDecoder creates a tile decoder
 func NewTileDecoder(width, height, decompLevels, codeBlockW, codeBlockH int) *TileDecoder {
 	return &TileDecoder{
-		width:       width,
-		height:      height,
+		width:        width,
+		height:       height,
 		decompLevels: decompLevels,
-		codeBlockW:  codeBlockW,
-		codeBlockH:  codeBlockH,
+		codeBlockW:   codeBlockW,
+		codeBlockH:   codeBlockH,
 	}
 }
 
@@ -104,6 +106,9 @@ func (td *TileDecoder) DecodeTile(data []byte) ([]int, error) {
 	width := int(data[0])<<8 | int(data[1])
 	height := int(data[2])<<8 | int(data[3])
 
+	if width != td.width || height != td.height {
+		return nil, fmt.Errorf("%w: tile %dx%d does not match image %dx%d", ErrInvalidSOT, width, height, td.width, td.height)
+	}
 	expectedLen := 4 + width*height*4
 	if len(data) < expectedLen {
 		return nil, ErrInvalidSOT

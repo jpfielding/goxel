@@ -30,6 +30,9 @@ type MultiRangeSlider struct {
 	OnOpacityChanged func(bandIdx int, alpha float64)
 
 	draggedHandle int // 0-indexed handle being dragged, -1 = none
+
+	// Compact enlarges handles and height for touch.
+	Compact bool
 }
 
 // NewMultiRangeSlider creates a slider from color bands.
@@ -275,6 +278,9 @@ type multiRangeSliderRenderer struct {
 func (r *multiRangeSliderRenderer) Layout(size fyne.Size) {
 	trackHeight := float32(6)
 	handleSize := float32(16)
+	if r.s.Compact {
+		handleSize = 22
+	}
 	dotSize := float32(8)
 
 	midY := size.Height - 12
@@ -359,7 +365,10 @@ func (r *multiRangeSliderRenderer) Layout(size fyne.Size) {
 }
 
 func (r *multiRangeSliderRenderer) MinSize() fyne.Size {
-	return fyne.NewSize(200, 60)
+	if r.s.Compact {
+		return fyne.NewSize(200, 96)
+	}
+	return fyne.NewSize(200, 84)
 }
 
 func (r *multiRangeSliderRenderer) Refresh() {

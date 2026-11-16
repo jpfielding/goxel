@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>goxel — DICOM volume viewer</title>
+    <style>
+      html, body { margin: 0; height: 100%; overflow: hidden; background: #10161d; color: #dee7ef;
+        font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+      canvas { display: block; touch-action: none; outline: none; }
+      #goxel-status { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+        color: #b8c4d0; }
+      #goxel-error { display: none; position: fixed; inset: 0; padding: 2rem; max-width: 46rem; margin: auto;
+        height: fit-content; background: #171f28; border: 1px solid #303e4c; border-radius: 6px;
+        white-space: pre-wrap; color: #f6978d; }
+    </style>
+  </head>
+  <body>
+    <div id="goxel-status">Loading goxel… (about 12 MB)</div>
+    <div id="goxel-error" role="alert"></div>
+    <noscript>goxel needs JavaScript, WebAssembly and WebGL.</noscript>
+    <script src="wasm_exec.js"></script>
+    <script>
+      // Touch shim. Fyne's browser driver only listens to mouse and wheel
+      // events, so translate: one finger -> mouse (tap, drag, slider drag),
+      // two fingers -> wheel by the change in finger distance (pinch zoom).
+      // Two-finger pan is not reproduced; the Camera page has an Orbit|Pan
+      // toggle and arrow buttons instead.
+      (() => {
+        let last = null, pinch = null;
+        const fire = (type, x, y, dx = 0, dy = 0) => {
+          const ev = new MouseEvent(type, { clientX: x, clientY: y, button: 0,
+            buttons: type === "mouseup" ? 0 : 1, bubbles: true, cancelable: true });
+          // Fyne reads movementX/Y while pointer lock is available; set them
+          // explicitly since not every engine accepts them in the init dict.
+          Object.defineProperty(ev, "movementX", { value: dx });
+          Object.defineProperty(ev, "movementY", { value: dy });
+          document.dispatchEvent(ev);
+        };
+        const spread = (ts) => Math.hypot(ts[0].clientX - ts[1].clientX, ts[0].clientY - ts[1].clientY);
+        const mine = (e) => e.target instanceof HTMLCanvasElement;
+        addEventListener("touchstart", (e) => {
+          if (!mine(e)) return;
+          e.preventDefault();
+          if (e.touches.length === 1) {
+            const t = e.touches[0];
+            last = { x: t.clientX, y: t.clientY };
+            fire("mousemove", last.x, last.y);
+            fire("mousedown", last.x, last.y);
+          } else if (e.touches.length === 2) {
+            if (last) { fire("mouseup", last.x, last.y); last = null; }
+            pinch = spread(e.touches);
+          }
+        }, { passive: false });
+        addEventListener("touchmove", (e) => {
+          if (!mine(e)) return;
+          e.preventDefault();
+          if (e.touches.length === 1 && last) {
+            const t = e.touches[0];
+            fire("mousemove", t.clientX, t.clientY, t.clientX - last.x, t.clientY - last.y);
+            last = { x: t.clientX, y: t.clientY };
+          } else if (e.touches.length === 2 && pinch !== null) {
+            const d = spread(e.touches);
+            const cx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+            const cy = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+            document.dispatchEvent(new WheelEvent("wheel", { clientX: cx, clientY: cy,
+              deltaY: (pinch - d) * 2, bubbles: true, cancelable: true }));
+            pinch = d;
+          }
+        }, { passive: false });
+        const end = (e) => {
+          if (!mine(e)) return;
+          e.preventDefault();
+          if (e.touches.length === 0 && last) { fire("mouseup", last.x, last.y); last = null; }
+          if (e.touches.length < 2) pinch = null;
+        };
+        addEventListener("touchend", end, { passive: false });
+        addEventListener("touchcancel", end, { passive: false });
+      })();
+    </script>
+    <script>
+      (async () => {
+        const status = document.getElementById("goxel-status");
+        const fail = (why) => {
+          status.remove();
+          const el = document.getElementById("goxel-error");
+          el.textContent = why + "\n\ngoxel's web build needs WebAssembly and WebGL " +
+            "(WebGL2 for the GPU volume renderer): a recent Chrome, Edge, Firefox or Safari.";
+          el.style.display = "block";
+        };
+        if (!window.WebAssembly) return fail("This browser does not support WebAssembly.");
+        const probe = document.createElement("canvas");
+        if (!probe.getContext("webgl") && !probe.getContext("experimental-webgl"))
+          return fail("This browser does not expose WebGL.");
+        if (!document.createElement("canvas").getContext("webgl2"))
+          console.warn("WebGL2 unavailable: the 3D view will use the slow CPU renderer.");
+        try {
+          const go = new Go();
+          const { instance } = await WebAssembly.instantiateStreaming(fetch("goxel.wasm"), go.importObject);
+          status.remove();
+          await go.run(instance);
+        } catch (e) {
+          fail("Failed to start goxel: " + e);
+        }
+      })();
+    </script>
+  </body>
+</html>

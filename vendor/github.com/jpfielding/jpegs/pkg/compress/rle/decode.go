@@ -28,6 +28,15 @@ func Decode(data []byte, width, height int) (image.Image, error) {
 		return nil, fmt.Errorf("rle: invalid segment count %d", numSegments)
 	}
 
+	// Validate caller-supplied geometry before sizing any buffer from it.
+	// Segments are byte planes: 1 = 8-bit gray, 2 = 16-bit gray.
+	if numSegments > 2 {
+		return nil, fmt.Errorf("rle: unsupported segment count %d (only 1 or 2)", numSegments)
+	}
+	if err := checkDecodedSize(width, height, 1, int(numSegments)); err != nil {
+		return nil, err
+	}
+
 	// Decode Segments
 	segments := make([][]byte, numSegments)
 	numPixels := width * height

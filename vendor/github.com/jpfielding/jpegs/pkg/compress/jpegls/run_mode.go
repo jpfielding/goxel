@@ -1,293 +1,224 @@
 package jpegls
 
-import (
-	"image"
-	"image/color"
-	"image/draw"
-)
+// This file holds the T.87 run mode (A.7) and the sample arithmetic shared
+// with regular mode, so the encoder and decoder cannot drift.
+//
+// Line buffers: cur and prev are width+2 element buffers of reconstructed
+// samples with a one-slot offset - sample x lives at index x+1. Slot 0 is the
+// left border and slot width+1 the right border, realizing the A.2.1 edge
+// rules Ra(0,y) = Rb and Rd(width-1,y) = Rb.
 
-// decodeRun decodes a Run Mode segment.
-func (d *Decoder) decodeRun(Ra, Rb int, img draw.Image, currLine []int, x *int, y int) error {
-	// Ra is the value of the "flat" pixels.
-	// Rb is needed for run interruption sign.
+// mapError maps a signed error to a non-negative code (A.5.2). correction is
+// 0, or -1 when the k == 0 && NEAR == 0 bias flip applies.
+func mapError(errVal, correction int) uint32 {
+	v := correction ^ errVal
+	if v >= 0 {
+		return uint32(2 * v)
+	}
+	return uint32(-2*v - 1)
+}
 
-	// Access Context J State
-	// Note: J is array [32]. RunIndex is tracked?
-	// Spec uses 'RUN_index'.
+// unmapError inverts mapError.
+func unmapError(mapped uint32, correction int) int {
+	m := int(mapped)
+	return correction ^ (m>>1 ^ -(m & 1))
+}
 
-	width := d.params.Width
-	// Range = MaxVal + 1
-	// maxVal := d.context.MaxVal
+// quantizeError is the near-lossless error quantization (A.4.4).
+func quantizeError(e, near int) int {
+	if near == 0 {
+		return e
+	}
+	if e >= 0 {
+		return (e + near) / (2*near + 1)
+	}
+	return -((near - e) / (2*near + 1))
+}
 
+// moduloRange reduces a (quantized) error into the coding range (A.4.5).
+func moduloRange(e, rng int) int {
+	if e < 0 {
+		e += rng
+	}
+	if e >= (rng+1)/2 {
+		e -= rng
+	}
+	return e
+}
+
+// validErrVal reports whether a decoded error is one a conformant encoder
+// can produce (|Errval| <= RANGE/2). Rejecting anything larger also keeps the
+// context accumulators bounded on corrupt input.
+func validErrVal(e, rng int) bool {
+	return abs(e) <= rng/2
+}
+
+// fixReconstructed folds a reconstructed value back into [0, maxVal] (A.4.6).
+func fixReconstructed(v, near, rng, maxVal int) int {
+	if v < -near {
+		v += rng * (2*near + 1)
+	} else if v > maxVal+near {
+		v -= rng * (2*near + 1)
+	}
+	return clip(v, 0, maxVal)
+}
+
+// encodeRunLength emits the run-length code (A.7.1.2).
+func encodeRunLength(bw *BitWriter, cm *ContextModel, runLength int, endOfLine bool) {
+	for runLength >= 1<<jTable[cm.RunIndex] {
+		bw.WriteBit(1)
+		runLength -= 1 << jTable[cm.RunIndex]
+		cm.incRunIndex()
+	}
+	if endOfLine {
+		// A residual run reaching the end of line costs a single 1 bit and
+		// does not advance RUNindex.
+		if runLength != 0 {
+			bw.WriteBit(1)
+		}
+		return
+	}
+	bw.WriteBit(0)
+	bw.WriteBits(uint32(runLength), jTable[cm.RunIndex])
+}
+
+// decodeRunLength reads a run-length code for a line with remaining samples
+// left (A.7.1.2).
+func decodeRunLength(br *BitReader, cm *ContextModel, remaining int) (int, error) {
+	index := 0
 	for {
-		// Read R (Run length encoded) or bit?
-		// "Read bit. If 1, read Run Length."
-		b, err := d.br.ReadBit()
+		bit, err := br.ReadBit()
 		if err != nil {
-			return err
+			return 0, err
 		}
-
-		if b == 1 {
-			// Read r bits where r = J[RunIndex]
-			j := d.context.J[d.context.RunIndex]
-			// rBits, err := d.br.ReadBits(j) // REMOVED: b==1 implies full 2^J run without extra bits
-
-			// Run Length = (1 << j)
-			runLength := (1 << j)
-
-			// Clamp to remaining pixels in line
-			remainingPixels := width - *x
-			if runLength > remainingPixels {
-				runLength = remainingPixels
-			}
-
-			// Fill run
-			for i := 0; i < runLength; i++ {
-				currLine[*x] = Ra
-				d.setPixel(img, *x, y, Ra)
-				*x++
-			}
-
-			// Update RunIndex
-			if d.context.RunIndex < 31 {
-				d.context.RunIndex++
-			}
-
-			// Continue loop? Yes.
-		} else {
-			// b == 0. End of Run.
-			// Read remaining run length r (J bits)
-			j := d.context.J[d.context.RunIndex]
-			var rBits uint32
-			if j > 0 {
-				var err error
-				rBits, err = d.br.ReadBits(j)
-				if err != nil {
-					return err
-				}
-			}
-			runLength := int(rBits)
-
-			// Clamp run length to remaining pixels in line
-			remainingPixels := width - *x
-			if runLength > remainingPixels {
-				runLength = remainingPixels
-			}
-
-			// Fill remaining run
-			for i := 0; i < runLength; i++ {
-				currLine[*x] = Ra
-				d.setPixel(img, *x, y, Ra)
-				*x++
-			}
-
-			// Check if we hit EOL?
-			if *x >= width {
-				// EOL reached exactly at end of run?
-				return nil
-			}
-
-			// Read Interruption Sample.
-			// ...
-
-			// Decrement RunIndex Standard: "Decrements RunIndex".
-			if d.context.RunIndex > 0 {
-				d.context.RunIndex--
-			}
-
-			// Decode Interruption Sample
-			// Placeholder: For now, just setting as black/error or try to decode?
-			// Since we don't have full context logic here, let's try to assume small error?
-			// The Encoder wrote a Golomb code for mapped error.
-			// We MUST consume it.
-
-			// Q=365 if a=b, else 366
-			Q := 365
-			if Ra != Rb {
-				Q = 366
-			}
-			k := d.context.ComputeK(Q)
-
-			mappedErr, err := d.br.ReadGolomb(k)
-			if err != nil {
-				return err
-			}
-
-			// Inverse Map Error
-			var ErrVal int
-			if mappedErr%2 == 0 {
-				ErrVal = int(mappedErr / 2)
-			} else {
-				ErrVal = int(-(mappedErr + 1) / 2)
-			}
-
-			// Update Stats
-			d.context.UpdateStats(Q, ErrVal)
-
-			// Reconstruct Ix
-			// ISO A.4.2: Px is Ra if a=b, else Rb.
-			// Here Ra is 'a' and Rb is 'b'.
-			Px := Ra
-			sign := 1
-			if Ra != Rb {
-				Px = Rb
-				if Ra > Rb {
-					sign = -1
-				}
-			}
-
-			Ix := Px + sign*ErrVal
-
-			// Modulo reduction normalization
-			maxVal := d.context.MaxVal
-			rangeVal := maxVal + 1
-			if Ix < -rangeVal/2 {
-				Ix += rangeVal // Wait, normalization on ErrVal or Ix?
-				// ErrVal was encoded after normalization.
-				// Correct: It = (It + range/2) % range - range/2 ...
-				// No, just apply ErrVal.
-				// Encoder:
-				// if ErrVal < -range/2 { ErrVal += range }
-			}
-			// Let's just clip to valid range [0, MaxVal] for now as simplified decoder.
-			if Ix < 0 {
-				Ix += rangeVal
-			}
-			if Ix > maxVal {
-				Ix -= rangeVal
-			}
-			if Ix < 0 {
-				Ix = 0
-			}
-			if Ix > maxVal {
-				Ix = maxVal
-			}
-
-			currLine[*x] = Ix
-			d.setPixel(img, *x, y, Ix)
-			*x++
-			return nil
-		}
-	}
-}
-
-// setPixel helper
-func (d *Decoder) setPixel(img draw.Image, x, y, val int) {
-	if grayImg, ok := img.(*image.Gray); ok {
-		grayImg.SetGray(x, y, color.Gray{Y: uint8(val)})
-	} else if gray16Img, ok := img.(*image.Gray16); ok {
-		gray16Img.SetGray16(x, y, color.Gray16{Y: uint16(val)})
-	}
-}
-
-// encodeRun encodes a Run Mode segment.
-func (e *Encoder) encodeRun(img image.Image, currLine []int, x *int, y int, Ra, Rb int) error {
-	width := e.params.Width
-
-	// 1. Determine Run Length
-	runLength := 0
-	// While pixels match Ra
-	for *x < width {
-		val := currLine[*x]
-		if val != Ra {
+		if bit == 0 {
 			break
 		}
-		runLength++
-		*x++
-	}
-
-	// 2. Encode Run
-	// While runLength >= (1 << J[RunIndex] )
-	for {
-		j := e.context.J[e.context.RunIndex]
-		limit := (1 << j)
-
-		if runLength >= limit {
-			// Write 1 bit (Run continues)
-			if err := e.bw.WriteBit(1); err != nil {
-				return err
-			}
-
-			// Decrement run
-			runLength -= limit
-			if e.context.RunIndex < 31 {
-				e.context.RunIndex++
-			}
-		} else {
-			// Run ends (runLength < limit)
-			// Write 0 bit (Run terminated)
-			if err := e.bw.WriteBit(0); err != nil {
-				return err
-			}
-
-			// Run Terminated by Value or EOL.
-			// Encode runLength using J[RunIndex] bits.
-			if err := e.bw.WriteBits(uint32(runLength), j); err != nil {
-				return err
-			}
-
-			// Decrement Index
-			if e.context.RunIndex > 0 {
-				e.context.RunIndex--
-			}
-
-			// Check EOL - If run ended at line boundary, we are done
-			if *x == width {
-				return nil
-			}
-
-			// Encode Interruption Sample (Ix)
-			Ix := currLine[*x]
-			Px := Ra
-			sign := 1
-			if Ra != Rb {
-				Px = Rb
-				if Ra > Rb {
-					sign = -1
-				}
-			}
-			ErrVal := (Ix - Px)
-			if sign == -1 {
-				ErrVal = -ErrVal
-			}
-
-			// Modulo Reduction
-			maxVal := e.context.MaxVal
-			rangeVal := maxVal + 1
-			if ErrVal < -rangeVal/2 {
-				ErrVal += rangeVal
-			}
-			if ErrVal > rangeVal/2 {
-				ErrVal -= rangeVal
-			}
-
-			// Context for Interruption
-			Q := 365
-			if Ra != Rb {
-				Q = 366
-			}
-
-			// Map Error
-			var MappedErrVal uint32
-			if ErrVal >= 0 {
-				MappedErrVal = uint32(2 * ErrVal)
-			} else {
-				MappedErrVal = uint32(-2*ErrVal - 1)
-			}
-
-			// Write Golomb
-			k := e.context.ComputeK(Q)
-			if err := e.bw.WriteGolomb(k, MappedErrVal); err != nil {
-				return err
-			}
-
-			// Update Stats (AFTER matching decoder order)
-			e.context.UpdateStats(Q, ErrVal)
-
-			// Advance x to consume the interruption sample so outer loop proceeds
-			*x++
-
-			return nil
+		block := 1 << jTable[cm.RunIndex]
+		count := min(block, remaining-index)
+		index += count
+		if count == block {
+			cm.incRunIndex()
+		}
+		if index == remaining {
+			return index, nil
 		}
 	}
+	v, err := br.ReadBits(jTable[cm.RunIndex])
+	if err != nil {
+		return 0, err
+	}
+	index += int(v)
+	if index > remaining {
+		return 0, errBadCode
+	}
+	return index, nil
+}
+
+// interruptionParams selects RItype, the prediction and the sign for a
+// run-interruption sample (A.7.2).
+func interruptionParams(ra, rb, near int) (riType, px, sign int) {
+	if abs(ra-rb) <= near {
+		return 1, ra, 1
+	}
+	if rb > ra {
+		return 0, rb, 1
+	}
+	return 0, rb, -1
+}
+
+// encodeRunInterruption codes the sample ending a run and returns its
+// reconstructed value (A.7.2).
+func encodeRunInterruption(bw *BitWriter, cm *ContextModel, ix, ra, rb int) int {
+	near := cm.Near
+	riType, px, s := interruptionParams(ra, rb, near)
+	ctx := runCtxBase + riType
+
+	errQ := moduloRange(quantizeError((ix-px)*s, near), cm.Range)
+	k := cm.ComputeKRun(riType)
+	nn, n := cm.Nn[riType], cm.N[ctx]
+	mapBit := 0
+	if (k == 0 && errQ > 0 && 2*nn < n) || (errQ < 0 && 2*nn >= n) || (errQ < 0 && k != 0) {
+		mapBit = 1
+	}
+	eMapped := uint32(2*abs(errQ) - riType - mapBit)
+
+	bw.WriteLimitedGolomb(k, eMapped, cm.Limit-jTable[cm.RunIndex]-1, cm.Qbpp)
+	cm.UpdateRunStats(riType, eMapped, errQ < 0)
+	return fixReconstructed(px+s*errQ*(2*near+1), near, cm.Range, cm.MaxVal)
+}
+
+// decodeRunInterruption decodes the sample ending a run (A.7.2).
+func decodeRunInterruption(br *BitReader, cm *ContextModel, ra, rb int) (int, error) {
+	near := cm.Near
+	riType, px, s := interruptionParams(ra, rb, near)
+	ctx := runCtxBase + riType
+
+	k := cm.ComputeKRun(riType)
+	eMapped, err := br.ReadLimitedGolomb(k, cm.Limit-jTable[cm.RunIndex]-1, cm.Qbpp)
+	if err != nil {
+		return 0, err
+	}
+
+	// temp = EMErrval + RItype = 2*|Errval| - map: its parity is map and
+	// ceil(temp/2) is |Errval|. For a positive error the encoder's map is
+	// (k == 0 && 2*Nn < N); the negative case is its complement.
+	temp := int(eMapped) + riType
+	errQ := (temp + temp&1) >> 1
+	mapPositive := 0
+	if k == 0 && 2*cm.Nn[riType] < cm.N[ctx] {
+		mapPositive = 1
+	}
+	if temp&1 != mapPositive {
+		errQ = -errQ
+	}
+	if !validErrVal(errQ, cm.Range) {
+		return 0, errBadCode
+	}
+	cm.UpdateRunStats(riType, eMapped, errQ < 0)
+	return fixReconstructed(px+s*errQ*(2*near+1), near, cm.Range, cm.MaxVal), nil
+}
+
+// encodeRun codes a run starting at sample start and returns the index of
+// the next sample to code. src is the source row.
+func encodeRun(bw *BitWriter, cm *ContextModel, src []uint16, cur, prev []int, start int) int {
+	width := len(src)
+	ra := cur[start]
+
+	end := start
+	for end < width && abs(int(src[end])-ra) <= cm.Near {
+		cur[end+1] = ra
+		end++
+	}
+	encodeRunLength(bw, cm, end-start, end == width)
+	if end == width {
+		return end
+	}
+	cur[end+1] = encodeRunInterruption(bw, cm, int(src[end]), ra, prev[end+1])
+	cm.decRunIndex()
+	return end + 1
+}
+
+// decodeRun decodes a run starting at sample start and returns the index of
+// the next sample to decode.
+func decodeRun(br *BitReader, cm *ContextModel, cur, prev []int, start, width int) (int, error) {
+	ra := cur[start]
+	runLength, err := decodeRunLength(br, cm, width-start)
+	if err != nil {
+		return 0, err
+	}
+	end := start + runLength
+	for i := start; i < end; i++ {
+		cur[i+1] = ra
+	}
+	if end == width {
+		return end, nil
+	}
+	recon, err := decodeRunInterruption(br, cm, ra, prev[end+1])
+	if err != nil {
+		return 0, err
+	}
+	cur[end+1] = recon
+	cm.decRunIndex()
+	return end + 1, nil
 }

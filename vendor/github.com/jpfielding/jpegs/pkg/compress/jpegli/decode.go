@@ -150,44 +150,77 @@ func (d *Decoder) readMarker() (int, error) {
 	return int(buf[0])<<8 | int(buf[1]), nil
 }
 
+// readSegment reads a marker segment's 2-byte length and returns its payload
+// (length excluding the length field itself). Lengths below 2 are rejected.
+func (d *Decoder) readSegment(name string) ([]byte, error) {
+	var lenBuf [2]byte
+	if _, err := io.ReadFull(d.r, lenBuf[:]); err != nil {
+		return nil, fmt.Errorf("jpegli: reading %s length: %w", name, err)
+	}
+	length := int(lenBuf[0])<<8 | int(lenBuf[1])
+	if length < 2 {
+		return nil, fmt.Errorf("jpegli: %s segment length %d < 2", name, length)
+	}
+	data := make([]byte, length-2)
+	if _, err := io.ReadFull(d.r, data); err != nil {
+		return nil, fmt.Errorf("jpegli: reading %s payload: %w", name, err)
+	}
+	return data, nil
+}
+
 func (d *Decoder) skipMarkerData() error {
 	var lenBuf [2]byte
 	if _, err := io.ReadFull(d.r, lenBuf[:]); err != nil {
 		return err
 	}
-	length := int(lenBuf[0])<<8 | int(lenBuf[1]) - 2
-	if length > 0 {
-		_, err := io.CopyN(io.Discard, d.r, int64(length))
-		return err
+	length := int(lenBuf[0])<<8 | int(lenBuf[1])
+	if length < 2 {
+		return fmt.Errorf("jpegli: marker segment length %d < 2", length)
+	}
+	if length > 2 {
+		if _, err := io.CopyN(io.Discard, d.r, int64(length-2)); err != nil {
+			return fmt.Errorf("jpegli: skipping marker segment: %w", err)
+		}
 	}
 	return nil
 }
 
 func (d *Decoder) readSOF() error {
-	var lenBuf [2]byte
-	if _, err := io.ReadFull(d.r, lenBuf[:]); err != nil {
+	data, err := d.readSegment("SOF")
+	if err != nil {
 		return err
 	}
-	length := int(lenBuf[0])<<8 | int(lenBuf[1]) - 2
-
-	data := make([]byte, length)
-	if _, err := io.ReadFull(d.r, data); err != nil {
-		return err
+	if len(data) < 6 {
+		return fmt.Errorf("jpegli: SOF segment too short (%d bytes)", len(data))
 	}
 
 	d.precision = int(data[0])
 	d.height = int(data[1])<<8 | int(data[2])
 	d.width = int(data[3])<<8 | int(data[4])
 	d.components = int(data[5])
+	if d.precision < 2 || d.precision > 16 {
+		return fmt.Errorf("jpegli: invalid precision %d", d.precision)
+	}
+	if len(data) < 6+d.components*3 {
+		return fmt.Errorf("jpegli: SOF segment length %d too short for %d components", len(data), d.components)
+	}
+	bytesPerSample := 1
+	if d.precision > 8 {
+		bytesPerSample = 2
+	}
+	if err := checkDecodedSize(d.width, d.height, d.components, bytesPerSample); err != nil {
+		return err
+	}
 
 	d.compInfo = make([]componentInfo, d.components)
 	for i := 0; i < d.components; i++ {
 		offset := 6 + i*3
 		d.compInfo[i] = componentInfo{
-			id:         int(data[offset]),
-			hSampling:  int(data[offset+1]) >> 4,
-			vSampling:  int(data[offset+1]) & 0x0F,
-			tableIndex: int(data[offset+2]),
+			id:        int(data[offset]),
+			hSampling: int(data[offset+1]) >> 4,
+			vSampling: int(data[offset+1]) & 0x0F,
+			// data[offset+2] is Tq (quantization table), unused in lossless;
+			// the Huffman table selector comes from the SOS header.
 		}
 	}
 
@@ -201,14 +234,8 @@ func (d *Decoder) readSOF() error {
 }
 
 func (d *Decoder) readDHT() error {
-	var lenBuf [2]byte
-	if _, err := io.ReadFull(d.r, lenBuf[:]); err != nil {
-		return err
-	}
-	length := int(lenBuf[0])<<8 | int(lenBuf[1]) - 2
-
-	data := make([]byte, length)
-	if _, err := io.ReadFull(d.r, data); err != nil {
+	data, err := d.readSegment("DHT")
+	if err != nil {
 		return err
 	}
 
@@ -219,51 +246,77 @@ func (d *Decoder) readDHT() error {
 		tableID := int(tableInfo & 0x0F)
 		offset++
 
-		if tableClass != 0 {
-			// Lossless JPEG only uses DC tables
-			// Skip AC table definition
-			var count int
-			for i := 0; i < 16; i++ {
-				count += int(data[offset+i])
-			}
-			offset += 16 + count
-			continue
+		if tableClass > 1 {
+			return fmt.Errorf("jpegli: DHT invalid table class %d", tableClass)
+		}
+		if tableID > 3 {
+			return fmt.Errorf("jpegli: DHT invalid table ID %d", tableID)
+		}
+		if len(data)-offset < 16 {
+			return fmt.Errorf("jpegli: DHT truncated BITS (%d bytes left, need 16)", len(data)-offset)
 		}
 
-		if tableID >= 4 {
-			return fmt.Errorf("invalid Huffman table ID: %d", tableID)
-		}
-
-		ht := &huffmanTable{}
-
-		// Read BITS (16 bytes)
+		var counts [17]int
 		var totalCodes int
-		for i := 0; i < 16; i++ {
-			ht.bits[i+1] = int(data[offset+i])
-			totalCodes += ht.bits[i+1]
+		for i := 1; i <= 16; i++ {
+			counts[i] = int(data[offset+i-1])
+			totalCodes += counts[i]
 		}
 		offset += 16
 
-		// Read HUFFVAL
-		ht.values = make([]byte, totalCodes)
-		copy(ht.values, data[offset:offset+totalCodes])
+		if totalCodes > 256 {
+			return fmt.Errorf("jpegli: DHT declares %d symbols (max 256)", totalCodes)
+		}
+		if len(data)-offset < totalCodes {
+			return fmt.Errorf("jpegli: DHT declares %d symbols but only %d bytes remain", totalCodes, len(data)-offset)
+		}
+		vals := data[offset : offset+totalCodes]
 		offset += totalCodes
 
-		// Generate codes and sizes
+		if tableClass != 0 {
+			// Lossless JPEG only uses DC tables; AC definitions are skipped.
+			continue
+		}
+
+		if totalCodes == 0 {
+			return errors.New("jpegli: DHT table defines no codes")
+		}
+		if !bitsValid(&counts) {
+			return errors.New("jpegli: DHT code lengths are oversubscribed")
+		}
+		for _, v := range vals {
+			if v > 16 {
+				return fmt.Errorf("jpegli: DHT symbol %d exceeds max difference category 16", v)
+			}
+		}
+
+		ht := &huffmanTable{bits: counts}
+		ht.values = make([]byte, totalCodes)
+		copy(ht.values, vals)
 		d.generateHuffmanCodes(ht)
 
 		slog.Debug("jpegli: DHT parsed",
 			slog.Int("tableID", tableID),
-			slog.Int("totalCodes", totalCodes),
-			slog.Any("bits", ht.bits[1:17]),
-			slog.Any("values", ht.values),
-			slog.Any("codes", ht.codes),
-			slog.Any("sizes", ht.sizes))
+			slog.Int("totalCodes", totalCodes))
 
 		d.dcTables[tableID] = ht
 	}
 
 	return nil
+}
+
+// bitsValid reports whether the code length counts (1..16) form a
+// non-oversubscribed prefix code (Kraft inequality, T.81 Annex C).
+func bitsValid(counts *[17]int) bool {
+	code := 0
+	for l := 1; l <= 16; l++ {
+		code += counts[l]
+		if code > 1<<l {
+			return false
+		}
+		code <<= 1
+	}
+	return true
 }
 
 func (d *Decoder) generateHuffmanCodes(ht *huffmanTable) {
@@ -316,62 +369,78 @@ func (d *Decoder) generateHuffmanCodes(ht *huffmanTable) {
 }
 
 func (d *Decoder) readDRI() error {
-	var buf [4]byte
-	if _, err := io.ReadFull(d.r, buf[:]); err != nil {
+	data, err := d.readSegment("DRI")
+	if err != nil {
 		return err
 	}
-	// Length is always 4 (2 bytes length + 2 bytes interval)
-	d.restartInterval = int(buf[2])<<8 | int(buf[3])
+	if len(data) != 2 {
+		return fmt.Errorf("jpegli: DRI payload is %d bytes, want 2", len(data))
+	}
+	d.restartInterval = int(data[0])<<8 | int(data[1])
 	return nil
 }
 
 func (d *Decoder) readSOS() error {
-	var lenBuf [2]byte
-	if _, err := io.ReadFull(d.r, lenBuf[:]); err != nil {
+	if len(d.compInfo) == 0 {
+		return errors.New("jpegli: SOS before SOF")
+	}
+	data, err := d.readSegment("SOS")
+	if err != nil {
 		return err
 	}
-	length := int(lenBuf[0])<<8 | int(lenBuf[1]) - 2
-
-	data := make([]byte, length)
-	if _, err := io.ReadFull(d.r, data); err != nil {
-		return err
+	if len(data) < 1 {
+		return errors.New("jpegli: SOS segment empty")
 	}
 
-	numComponents := int(data[0])
-	_ = numComponents // Used for interleaved scans
+	ns := int(data[0])
+	if ns < 1 || ns > len(d.compInfo) {
+		return fmt.Errorf("jpegli: SOS component count %d invalid (frame has %d)", ns, len(d.compInfo))
+	}
+	if len(data) != 1+2*ns+3 {
+		return fmt.Errorf("jpegli: SOS payload is %d bytes, want %d for %d components", len(data), 1+2*ns+3, ns)
+	}
 
 	// Component selectors and table mappings
 	offset := 1
-	for i := 0; i < numComponents; i++ {
+	for i := 0; i < ns; i++ {
 		selector := int(data[offset])
-		tableMapping := int(data[offset+1])
+		td := int(data[offset+1] >> 4)
 		offset += 2
+		if td > 3 {
+			return fmt.Errorf("jpegli: SOS DC table selector %d out of range", td)
+		}
 
 		// Find component by selector ID
+		found := false
 		for j := range d.compInfo {
 			if d.compInfo[j].id == selector {
-				d.compInfo[j].tableIndex = tableMapping >> 4
-				slog.Debug("jpegli: Component mapping",
-					slog.Int("id", selector),
-					slog.Int("tableIndex", d.compInfo[j].tableIndex))
+				d.compInfo[j].tableIndex = td
+				found = true
 				break
 			}
 		}
+		if !found {
+			return fmt.Errorf("jpegli: SOS component selector %d matches no frame component", selector)
+		}
 	}
 
-	// Spectral selection (Ss, Se) - in lossless, Ss = predictor
+	// Ss = predictor selection in lossless
 	d.predictor = int(data[offset])
-	offset++
-	// Se is always 0 for lossless
-	offset++
+	if d.predictor > 7 {
+		return fmt.Errorf("jpegli: SOS invalid predictor %d", d.predictor)
+	}
+	offset += 2 // skip Se (always 0 for lossless)
 
-	// Successive approximation (Ah, Al) - Al = point transform
+	// Al = point transform
 	d.pointTrans = int(data[offset]) & 0x0F
+	if d.pointTrans >= d.precision {
+		return fmt.Errorf("jpegli: SOS point transform %d >= precision %d", d.pointTrans, d.precision)
+	}
 
 	slog.Debug("jpegli: SOS parsed",
 		slog.Int("predictor", d.predictor),
 		slog.Int("pointTrans", d.pointTrans),
-		slog.Int("numComponents", numComponents))
+		slog.Int("numComponents", ns))
 
 	return nil
 }

@@ -1,81 +1,98 @@
 package jpegls
 
 import (
-	"bufio"
+	"errors"
 	"fmt"
-	"io"
+	"math/bits"
 )
 
-// BitReader handles reading bits from an underlying io.Reader.
+// errEndOfData is returned by BitReader when the input is exhausted mid-scan.
+var errEndOfData = errors.New("unexpected end of JPEG-LS data")
+
+// errBadCode is returned for an entropy code no conformant encoder emits.
+var errBadCode = errors.New("invalid entropy code")
+
+// markerError reports a marker (0xFFxx, xx >= 0x80) met inside the
+// entropy-coded scan. The value is the full 16-bit marker code.
+type markerError int
+
+func (m markerError) Error() string {
+	return fmt.Sprintf("marker 0x%04X encountered in entropy-coded scan", int(m))
+}
+
+// BitReader reads bits from a byte slice, handling T.87 single-bit stuffing
+// (T.87 A.1): the byte following a 0xFF data byte carries only 7 data bits.
+// A byte >= 0x80 following 0xFF is a marker and ends the scan.
 type BitReader struct {
-	r     *bufio.Reader
+	data []byte
+	pos  int
+	// bits is the MSB-first accumulator; the low nBits bits are valid.
 	bits  uint64
 	nBits int
+	// lastFF records that the most recently consumed byte was 0xFF.
+	lastFF bool
+	// marker is the marker that terminated the scan, or 0.
+	marker int
 }
 
-// NewBitReader creates a new BitReader.
-func NewBitReader(r io.Reader) *BitReader {
-	var br *bufio.Reader
-	if b, ok := r.(*bufio.Reader); ok {
-		br = b
-	} else {
-		br = bufio.NewReader(r)
+// NewBitReader creates a BitReader over data.
+func NewBitReader(data []byte) *BitReader {
+	return &BitReader{data: data}
+}
+
+// Pos is the byte offset of the first unconsumed input byte.
+func (br *BitReader) Pos() int { return br.pos }
+
+// MarkerPos is the byte offset of the marker terminating the scan. If the
+// final consumed data byte was 0xFF, its mandatory stuff byte has not been
+// pulled into the accumulator yet and the marker follows it.
+func (br *BitReader) MarkerPos() int {
+	if br.lastFF {
+		return br.pos + 1
 	}
-	return &BitReader{r: br}
+	return br.pos
 }
 
-// fill ensures there are at least n bits in the buffer.
+// fill tops the accumulator up to at least n bits.
 func (br *BitReader) fill(n int) error {
 	for br.nBits < n {
-		b, err := br.r.ReadByte()
-		if err != nil {
-			return err
+		if br.marker != 0 {
+			return markerError(br.marker)
 		}
-
-		if b == 0xFF {
-			next, err := br.r.ReadByte()
-			if err != nil {
-				return err
-			}
-			if next == 0x00 {
-				// Byte stuffing: 0xFF 0x00 -> 0xFF
-			} else {
-				// Marker found!
-				// We unread 'next' so it remains in stream for marker parser.
-				// 0xFF (b) is already consumed. The marker parser must account for this.
-				// However, standard markers are FFxx. If we already ate FF,
-				// the marker parser will see xx.
-				// To be safe, we unread 'next' and return error.
-				br.r.UnreadByte()
-				return fmt.Errorf("marker encountered (0xFF%02X)", next)
-			}
+		if br.pos >= len(br.data) {
+			return errEndOfData
 		}
-
-		br.bits = (br.bits << 8) | uint64(b)
+		b := br.data[br.pos]
+		if br.lastFF {
+			// Stuffed byte: its MSB is the stuffed zero, 7 data bits follow.
+			br.pos++
+			br.bits = br.bits<<7 | uint64(b&0x7F)
+			br.nBits += 7
+			br.lastFF = false
+			continue
+		}
+		if b == 0xFF && br.pos+1 < len(br.data) && br.data[br.pos+1] >= 0x80 {
+			br.marker = 0xFF00 | int(br.data[br.pos+1])
+			return markerError(br.marker)
+		}
+		br.pos++
+		br.bits = br.bits<<8 | uint64(b)
 		br.nBits += 8
+		br.lastFF = b == 0xFF
 	}
 	return nil
 }
 
-// ReadBits reads n bits (up to 32).
+// ReadBits reads n bits (0..32), returned right-justified.
 func (br *BitReader) ReadBits(n int) (uint32, error) {
 	if n == 0 {
 		return 0, nil
 	}
-	if br.nBits < n {
-		if err := br.fill(n); err != nil {
-			return 0, err
-		}
+	if err := br.fill(n); err != nil {
+		return 0, err
 	}
-
-	shift := br.nBits - n
-	mask := uint64(1)<<n - 1
-	if n == 64 { // Should not happen for ReadBits(32) but for completeness
-		mask = ^uint64(0)
-	}
-	val := (br.bits >> shift) & mask
 	br.nBits -= n
-	return uint32(val), nil
+	return uint32(br.bits>>br.nBits) & uint32(uint64(1)<<n-1), nil
 }
 
 // ReadBit reads a single bit.
@@ -83,131 +100,141 @@ func (br *BitReader) ReadBit() (uint32, error) {
 	return br.ReadBits(1)
 }
 
-// ReadGolomb reads a Golomb-Rice code with parameter k.
-// Returns the decoded value (unsigned).
-// Handles the "limit" if necessary (JPEG-LS has escape codes).
-// For now, standard Golomb-Rice: Unary(q) zeros followed by 1, then k bits.
-func (br *BitReader) ReadGolomb(k int) (uint32, error) {
-	// Read unary q (zeros until 1)
-	var q uint32
+// readUnary counts the 0 bits before the terminating 1; a run longer than
+// limit is rejected.
+func (br *BitReader) readUnary(limit int) (int, error) {
+	count := 0
 	for {
-		b, err := br.ReadBit()
-		if err != nil {
-			return 0, err
+		if br.nBits == 0 {
+			if err := br.fill(1); err != nil {
+				return 0, err
+			}
 		}
-		if b == 1 {
-			break
+		// Left-justify the valid window so its next bit sits at bit 63.
+		window := br.bits << (64 - br.nBits)
+		zeros := min(bits.LeadingZeros64(window), br.nBits)
+		if zeros < br.nBits {
+			br.nBits -= zeros + 1
+			count += zeros
+			if count > limit {
+				return 0, errBadCode
+			}
+			return count, nil
 		}
-		q++
-		// Safety limit?
-		if q > 65536 {
-			// Abnormal for standard images
-			return 0, fmt.Errorf("golomb q overflow")
+		count += br.nBits
+		br.nBits = 0
+		if count > limit {
+			return 0, errBadCode
 		}
 	}
+}
 
-	if k == 0 {
-		return q, nil
-	}
-
-	r, err := br.ReadBits(k)
+// ReadLimitedGolomb reads a length-limited Golomb code (T.87 A.5.3).
+func (br *BitReader) ReadLimitedGolomb(k, glimit, qbpp int) (uint32, error) {
+	escape := glimit - qbpp - 1
+	count, err := br.readUnary(escape)
 	if err != nil {
 		return 0, err
 	}
-
-	return (q << k) | r, nil
+	if count < escape {
+		r, err := br.ReadBits(k)
+		if err != nil {
+			return 0, err
+		}
+		return uint32(count)<<k | r, nil
+	}
+	// Escape: the code carries (value - 1) in qbpp bits.
+	v, err := br.ReadBits(qbpp)
+	if err != nil {
+		return 0, err
+	}
+	return v + 1, nil
 }
 
-// BitWriter handles writing bits to an underlying io.Writer.
+// BitWriter accumulates bits into an in-memory buffer, applying T.87
+// single-bit stuffing: after an emitted 0xFF the next byte carries 7 bits.
 type BitWriter struct {
-	w     *bufio.Writer
-	bits  uint64
-	nBits int
+	buf    []byte
+	bits   uint64
+	nBits  int
+	lastFF bool
 }
 
-// NewBitWriter creates a new BitWriter.
-func NewBitWriter(w io.Writer) *BitWriter {
-	var bw *bufio.Writer
-	if b, ok := w.(*bufio.Writer); ok {
-		bw = b
-	} else {
-		bw = bufio.NewWriter(w)
+// NewBitWriter creates a BitWriter appending to buf (which may be nil).
+func NewBitWriter(buf []byte) *BitWriter {
+	return &BitWriter{buf: buf}
+}
+
+func (bw *BitWriter) drain() {
+	for {
+		width := 8
+		if bw.lastFF {
+			width = 7
+		}
+		if bw.nBits < width {
+			return
+		}
+		bw.nBits -= width
+		b := byte(bw.bits>>bw.nBits) & (0xFF >> (8 - width))
+		bw.buf = append(bw.buf, b)
+		bw.lastFF = b == 0xFF
 	}
-	return &BitWriter{w: bw}
 }
 
-// WriteBits writes n bits (val) to the stream.
-func (bw *BitWriter) WriteBits(val uint32, n int) error {
-	bw.bits = (bw.bits << n) | (uint64(val) & ((1 << n) - 1))
+// WriteBits writes the low n bits (0..32) of val, MSB first.
+func (bw *BitWriter) WriteBits(val uint32, n int) {
+	if n == 0 {
+		return
+	}
+	bw.bits = bw.bits<<n | uint64(val)&(uint64(1)<<n-1)
 	bw.nBits += n
-
-	for bw.nBits >= 8 {
-		shift := bw.nBits - 8
-		b := byte(bw.bits >> shift)
-		if err := bw.w.WriteByte(b); err != nil {
-			return err
-		}
-
-		// Byte stuffing
-		if b == 0xFF {
-			// Write 0x00 to escape
-			if err := bw.w.WriteByte(0x00); err != nil {
-				return err
-			}
-		}
-
-		bw.nBits -= 8
-	}
-	return nil
+	bw.drain()
 }
 
 // WriteBit writes a single bit.
-func (bw *BitWriter) WriteBit(bit uint32) error {
-	return bw.WriteBits(bit, 1)
+func (bw *BitWriter) WriteBit(bit uint32) {
+	bw.WriteBits(bit, 1)
 }
 
-// Flush writes remaining bits (padded with 0 if needed) and flushes the writer.
-func (bw *BitWriter) Flush() error {
+// writeUnary writes q zero bits followed by a one.
+func (bw *BitWriter) writeUnary(q int) {
+	for ; q >= 32; q -= 32 {
+		bw.WriteBits(0, 32)
+	}
+	bw.WriteBits(1, q+1)
+}
+
+// WriteLimitedGolomb writes a length-limited Golomb code (T.87 A.5.3).
+func (bw *BitWriter) WriteLimitedGolomb(k int, val uint32, glimit, qbpp int) {
+	q := int(val >> k)
+	escape := glimit - qbpp - 1
+	if q < escape {
+		bw.writeUnary(q)
+		bw.WriteBits(val, k)
+		return
+	}
+	bw.writeUnary(escape)
+	bw.WriteBits(val-1, qbpp)
+}
+
+// Flush zero-pads to a byte boundary. A final 0xFF data byte still gets its
+// mandatory stuff byte so the following marker is not misread.
+func (bw *BitWriter) Flush() {
 	if bw.nBits > 0 {
-		// Pad with zero by shifting left to byte boundary
-		shift := 8 - bw.nBits
-		b := byte(bw.bits << shift)
-		if err := bw.w.WriteByte(b); err != nil {
-			return err
+		width := 8
+		if bw.lastFF {
+			width = 7
 		}
-		if b == 0xFF {
-			if err := bw.w.WriteByte(0x00); err != nil {
-				return err
-			}
-		}
-		bw.nBits = 0
+		b := byte(bw.bits<<(width-bw.nBits)) & (0xFF >> (8 - width))
+		bw.buf = append(bw.buf, b)
+		bw.bits, bw.nBits = 0, 0
+		bw.lastFF = b == 0xFF
 	}
-	return bw.w.Flush()
+	if bw.lastFF {
+		bw.buf = append(bw.buf, 0x00)
+		bw.lastFF = false
+	}
 }
 
-// WriteGolomb writes a Golomb-Rice code for val (non-negative).
-// NOTE: JPEG-LS maps Signed Error -> Non-Negative Code using Mapping (A.5.3).
-// This function writes the MAPPED value.
-func (bw *BitWriter) WriteGolomb(k int, val uint32) error {
-	// val = q * 2^k + r
-	q := val >> k
-	r := val & ((1 << k) - 1)
-
-	// Write Unary q (q zeros followed by 1)
-	for i := uint32(0); i < q; i++ {
-		if err := bw.WriteBit(0); err != nil {
-			return err
-		}
-	}
-	if err := bw.WriteBit(1); err != nil {
-		return err
-	}
-
-	// Write k bits of r
-	if k > 0 {
-		if err := bw.WriteBits(r, k); err != nil {
-			return err
-		}
-	}
-	return nil
-}
+// Bytes returns the buffer written so far (call Flush first).
+func (bw *BitWriter) Bytes() []byte { return bw.buf }

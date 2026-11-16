@@ -1,346 +1,169 @@
 package jpegls
 
 import (
+	"encoding/binary"
 	"fmt"
 	"image"
 	"io"
+	"math/bits"
 )
 
-// Options for encoding
+// Options for encoding.
 type Options struct {
-	Near int // Near-lossless parameter (0 = lossless)
-	// T1, T2, T3 thresholds? (Optional)
-	// Interleave mode? (ILV)
+	// Near is the near-lossless error bound (0 = lossless). Every decoded
+	// sample differs from the source by at most Near. Bounded by
+	// min(255, MAXVAL/2).
+	Near int
+	// Precision is the sample precision in bits (2..16) written to the frame
+	// header. Zero derives it from the image: 8 for *image.Gray; for
+	// *image.Gray16 the bits needed by the largest sample, at least 9 so the
+	// stream decodes back to *image.Gray16.
+	Precision int
 }
 
-// Encoder encodes JPEG-LS data.
-type Encoder struct {
-	bw      *BitWriter
-	params  FrameHeader
-	scan    ScanHeader
-	context *ContextModel
-}
-
-// Encode writes JPEG-LS data to w for the given image.
+// Encode writes img to w as an ITU-T T.87 conformant JPEG-LS stream
+// (single component, ILV=0). Supported image types are *image.Gray and
+// *image.Gray16. A nil opts encodes lossless with a derived precision.
 func Encode(w io.Writer, img image.Image, opts *Options) error {
-	// 1. Validate Image
-	b := img.Bounds()
-	width := b.Max.X - b.Min.X
-	height := b.Max.Y - b.Min.Y
-	if width <= 0 || height <= 0 {
-		return fmt.Errorf("jpegls: invalid image dimensions")
+	if opts == nil {
+		opts = &Options{}
 	}
-
-	// Determine precision and components
-	var components int
-	var precision int
-	var maxVal int
-
-	// Support Gray8 and Gray16 for now
-	switch img.(type) {
+	var samples []uint16
+	var width, height, minPrecision int
+	switch m := img.(type) {
 	case *image.Gray:
-		components = 1
-		precision = 8
-		maxVal = 255
+		width, height = m.Rect.Dx(), m.Rect.Dy()
+		if err := checkDimensions(width, height); err != nil {
+			return err
+		}
+		samples = make([]uint16, width*height)
+		for y := range height {
+			row := m.Pix[y*m.Stride : y*m.Stride+width]
+			for x, v := range row {
+				samples[y*width+x] = uint16(v)
+			}
+		}
+		minPrecision = 8
 	case *image.Gray16:
-		components = 1
-		precision = 16 // Or less? Assume 16.
-		maxVal = 65535 // (1<<16) - 1
+		width, height = m.Rect.Dx(), m.Rect.Dy()
+		if err := checkDimensions(width, height); err != nil {
+			return err
+		}
+		samples = make([]uint16, width*height)
+		for y := range height {
+			row := m.Pix[y*m.Stride : y*m.Stride+2*width]
+			for x := range width {
+				samples[y*width+x] = binary.BigEndian.Uint16(row[2*x:])
+			}
+		}
+		minPrecision = 9
 	default:
-		return fmt.Errorf("jpegls: unsupported image type %T (only Gray/Gray16)", img)
+		return fmt.Errorf("%w: image type %T (only *image.Gray and *image.Gray16)", ErrUnsupported, img)
 	}
 
-	// Options
-	near := 0
-	if opts != nil {
-		near = opts.Near
+	out, err := encodeSamples(samples, width, height, opts.Near, opts.Precision, minPrecision)
+	if err != nil {
+		return err
 	}
-
-	e := &Encoder{
-		bw: NewBitWriter(w),
-		params: FrameHeader{
-			Width:      width,
-			Height:     height,
-			Components: components,
-			Precision:  precision,
-		},
-		scan: ScanHeader{
-			Components: components,
-			Near:       near,
-			// ILV 0 for single component
-		},
-	}
-
-	return e.encode(img, maxVal)
+	_, err = w.Write(out)
+	return err
 }
 
-func (e *Encoder) encode(img image.Image, maxVal int) error {
-	// Write SOI
-	if err := e.writeMarker(MarkerSOI); err != nil {
-		return err
-	}
-
-	// Write SOF55
-	if err := e.writeSOF(); err != nil {
-		return err
-	}
-
-	// Write SOS
-	if err := e.writeSOS(); err != nil {
-		return err
-	}
-
-	// Init Context
-	e.context = NewContextModel(maxVal, e.scan.Near, 64)
-
-	// Encode Scan
-	if err := e.encodeScan(img); err != nil {
-		return err
-	}
-
-	// Flush Bits
-	if err := e.bw.Flush(); err != nil {
-		return err
-	}
-
-	// Write EOI
-	if err := e.writeMarker(MarkerEOI); err != nil {
-		return err
-	}
-
-	// Final Flush to ensure EOI and all bytes are written to underlying writer
-	if err := e.bw.w.Flush(); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (e *Encoder) writeMarker(marker int) error {
-	if err := e.bw.w.WriteByte(0xFF); err != nil {
-		return err
-	}
-	return e.bw.w.WriteByte(byte(marker & 0xFF))
-}
-
-func (e *Encoder) writeSOF() error {
-	// Length: 2 + 1 + 2 + 2 + 1 + Nf*3 = 8 + Nf*3
-	length := 8 + e.params.Components*3
-
-	if err := e.writeMarker(MarkerSOF55); err != nil {
-		return err
-	}
-	if err := e.writeWord(length); err != nil {
-		return err
-	}
-
-	if err := e.bw.w.WriteByte(byte(e.params.Precision)); err != nil {
-		return err
-	}
-	if err := e.writeWord(e.params.Height); err != nil {
-		return err
-	}
-	if err := e.writeWord(e.params.Width); err != nil {
-		return err
-	}
-	if err := e.bw.w.WriteByte(byte(e.params.Components)); err != nil {
-		return err
-	}
-
-	// Components (ID=1, H=1, V=1, Tq=0)
-	for i := 0; i < e.params.Components; i++ {
-		if err := e.bw.w.WriteByte(byte(i + 1)); err != nil {
-			return err
-		} // ID
-		if err := e.bw.w.WriteByte(0x11); err != nil {
-			return err
-		} // H=1 V=1
-		if err := e.bw.w.WriteByte(0x00); err != nil {
-			return err
-		} // Tq
+func checkDimensions(width, height int) error {
+	if width < 1 || width > 65535 || height < 1 || height > 65535 {
+		return fmt.Errorf("%w: image dimensions %dx%d outside 1..65535", ErrInvalidData, width, height)
 	}
 	return nil
 }
 
-func (e *Encoder) writeSOS() error {
-	// Length: 2 + 1 + Ns*2 + 3 = 6 + Ns*2
-	length := 6 + e.scan.Components*2
-
-	if err := e.writeMarker(MarkerSOS); err != nil {
-		return err
+// encodeSamples encodes a row-major single-component sample buffer. A zero
+// precision derives it from the largest sample, but no lower than
+// minPrecision.
+func encodeSamples(samples []uint16, width, height, near, precision, minPrecision int) ([]byte, error) {
+	var maxSample uint16
+	for _, v := range samples {
+		maxSample = max(maxSample, v)
 	}
-	if err := e.writeWord(length); err != nil {
-		return err
+	switch {
+	case precision == 0:
+		precision = max(bits.Len16(maxSample), minPrecision)
+	case precision < 2 || precision > 16:
+		return nil, fmt.Errorf("%w: precision %d outside 2..16", ErrInvalidData, precision)
 	}
-
-	if err := e.bw.w.WriteByte(byte(e.scan.Components)); err != nil {
-		return err
+	maxVal := 1<<precision - 1
+	if int(maxSample) > maxVal {
+		return nil, fmt.Errorf("%w: sample %d does not fit precision %d", ErrInvalidData, maxSample, precision)
 	}
-
-	// Components (ID, Mapping table selector)
-	for i := 0; i < e.scan.Components; i++ {
-		if err := e.bw.w.WriteByte(byte(i + 1)); err != nil {
-			return err
-		}
-		if err := e.bw.w.WriteByte(0x00); err != nil {
-			return err
-		} // Mapping
+	if near < 0 || near > min(255, maxVal/2) {
+		return nil, fmt.Errorf("%w: near %d outside 0..min(255, MAXVAL/2)", ErrInvalidData, near)
 	}
 
-	if err := e.bw.w.WriteByte(byte(e.scan.Near)); err != nil {
-		return err
-	}
-	if err := e.bw.w.WriteByte(byte(e.scan.ILV)); err != nil {
-		return err
-	} // ILV
-	if err := e.bw.w.WriteByte(0x00); err != nil {
-		return err
-	} // Al=0, Ah=0
-
-	return nil
+	buf := make([]byte, 0, 32+len(samples))
+	buf = binary.BigEndian.AppendUint16(buf, MarkerSOI)
+	buf = appendSOF(buf, precision, height, width)
+	buf = appendSOS(buf, 1, near)
+	bw := NewBitWriter(buf)
+	encodeScan(bw, samples, width, height, NewContextModel(maxVal, near, DefaultReset))
+	return binary.BigEndian.AppendUint16(bw.Bytes(), MarkerEOI), nil
 }
 
-func (e *Encoder) writeWord(v int) error {
-	if err := e.bw.w.WriteByte(byte(v >> 8)); err != nil {
-		return err
-	}
-	return e.bw.w.WriteByte(byte(v & 0xFF))
+// appendSOF appends a single-component SOF55 segment.
+func appendSOF(buf []byte, precision, height, width int) []byte {
+	buf = binary.BigEndian.AppendUint16(buf, MarkerSOF55)
+	buf = binary.BigEndian.AppendUint16(buf, 11) // Lf = 8 + 3*Nf
+	buf = append(buf, byte(precision))
+	buf = binary.BigEndian.AppendUint16(buf, uint16(height))
+	buf = binary.BigEndian.AppendUint16(buf, uint16(width))
+	// Nf = 1; component ID 1, 1:1 sampling, Tq 0.
+	return append(buf, 1, 1, 0x11, 0)
 }
 
-func (e *Encoder) encodeScan(img image.Image) error {
-	w := e.params.Width
-	h := e.params.Height
+// appendSOS appends a single-component, non-interleaved SOS segment.
+func appendSOS(buf []byte, componentID byte, near int) []byte {
+	buf = binary.BigEndian.AppendUint16(buf, MarkerSOS)
+	buf = binary.BigEndian.AppendUint16(buf, 8)
+	// Ns = 1, Cs, mapping table 0, NEAR, ILV 0, point transform 0.
+	return append(buf, 1, componentID, 0, byte(near), 0, 0)
+}
 
-	currLine := make([]int, w)
-	prevLine := make([]int, w) // 0s
-	maxVal := e.context.MaxVal
-	// 	// near := e.scan.Near
-	// Must be 0 for now (Lossless)
+// encodeScan writes the entropy-coded segment of one component
+// (T.87 A.4 - A.7) and flushes the bit writer.
+func encodeScan(bw *BitWriter, samples []uint16, width, height int, cm *ContextModel) {
+	near, maxVal, rng := cm.Near, cm.MaxVal, cm.Range
+	prev := make([]int, width+2)
+	cur := make([]int, width+2)
 
-	// Get Pixel Helper
-	getPixel := func(x, y int) int {
-		if gray, ok := img.(*image.Gray); ok {
-			return int(gray.GrayAt(x+img.Bounds().Min.X, y+img.Bounds().Min.Y).Y)
-		}
-		if gray16, ok := img.(*image.Gray16); ok {
-			return int(gray16.Gray16At(x+img.Bounds().Min.X, y+img.Bounds().Min.Y).Y)
-		}
-		return 0
-	}
+	for y := range height {
+		// Edge rules (A.2.1): Ra(0,y) = Rb, Rd(width-1,y) = Rb.
+		cur[0] = prev[1]
+		prev[width+1] = prev[width]
+		src := samples[y*width : (y+1)*width]
 
-	for y := 0; y < h; y++ {
-		// Reset RunIndex at start of line (A.2)
-		e.context.RunIndex = 0
+		for x := 0; x < width; {
+			ra, rb, rc, rd := cur[x], prev[x+1], prev[x], prev[x+2]
+			d1, d2, d3 := rd-rb, rb-rc, rc-ra
 
-		// Read Line into currLine
-		for x := 0; x < w; x++ {
-			currLine[x] = getPixel(x, y)
-		}
-
-		for x := 0; x < w; x++ {
-			// Neighbors
-			var Ra, Rb, Rc, Rd int
-
-			if x > 0 {
-				Ra = currLine[x-1]
-			} else {
-				if y > 0 {
-					Ra = prevLine[0]
-				} else {
-					Ra = 0
-				}
-			}
-
-			if y > 0 {
-				Rb = prevLine[x]
-				if x > 0 {
-					Rc = prevLine[x-1]
-				} else {
-					Rc = prevLine[0]
-				}
-				if x < w-1 {
-					Rd = prevLine[x+1]
-				} else {
-					Rd = Rb
-				}
-			} else {
-				Rb = 0
-				Rc = 0
-				Rd = 0
-			}
-
-			Ix := currLine[x] // Current Pixel
-
-			D1 := Rd - Rb
-			D2 := Rb - Rc
-			D3 := Rc - Ra
-
-			// Run Mode Check (Forcefully Disabled)
-			if false {
-				// Run Mode
-				// Ra, Rb are needed for sign in standard, but we use simplified Ra-based for now.
-				// However, let's pass Rb too for better prediction.
-				if err := e.encodeRun(img, currLine, &x, y, Ra, Rb); err != nil {
-					return err
-				}
-				// x is updated (Next pixel index). But loop increments x.
-				x--
+			if abs(d1) <= near && abs(d2) <= near && abs(d3) <= near {
+				x = encodeRun(bw, cm, src, cur, prev, x)
 				continue
 			}
 
-			// Regular Mode
-			Q, sign := e.context.GetContextIndex(D1, D2, D3)
+			q, sign := cm.GetContextIndex(d1, d2, d3)
+			k := cm.ComputeK(q)
+			px := clip(PredictMED(ra, rb, rc)+sign*cm.C[q], 0, maxVal)
+			errQ := moduloRange(quantizeError((int(src[x])-px)*sign, near), rng)
 
-			Px := PredictMED(Ra, Rb, Rc)
-			Px += sign * e.context.C[Q]
-			Px = clip(Px, 0, maxVal)
-
-			// Error
-			Rx := Ix
-			ErrVal := Rx - Px
-			if sign == -1 {
-				ErrVal = -ErrVal
+			correction := 0
+			if k == 0 && near == 0 && 2*cm.B[q] <= -cm.N[q] {
+				correction = -1
 			}
+			bw.WriteLimitedGolomb(k, mapError(errQ, correction), cm.Limit, cm.Qbpp)
+			cm.UpdateStats(q, errQ)
 
-			// Modulo Reduction
-			rangeVal := maxVal + 1
-			if ErrVal < -rangeVal/2 {
-				ErrVal += rangeVal
-			}
-			if ErrVal > rangeVal/2 {
-				ErrVal -= rangeVal
-			}
-
-			// Map Error for Encoding (A.5.3)
-			// Signed -> Non-Negative
-			var MappedErrVal uint32
-
-			// Mapping Logic:
-			// if near == 0:
-			// if ErrVal >= 0: Mapped = 2 * ErrVal
-			// else: Mapped = -2 * ErrVal - 1
-
-			if ErrVal >= 0 {
-				MappedErrVal = uint32(2 * ErrVal)
-			} else {
-				MappedErrVal = uint32(-2*ErrVal - 1)
-			}
-
-			// Write Golomb
-			k := e.context.ComputeK(Q)
-			// Actually I need to import Fmt.
-			// I'll skip import for now and assume fmt is available or I add it.
-			// File has "errors", "image", "io". No fmt.
-			// I will add import in separate step if needed. Or just blindly assume I can add import.
-			if err := e.bw.WriteGolomb(k, MappedErrVal); err != nil {
-				return err
-			}
-
-			// Update Stats
-			e.context.UpdateStats(Q, ErrVal)
+			cur[x+1] = fixReconstructed(px+sign*errQ*(2*near+1), near, rng, maxVal)
+			x++
 		}
-
-		copy(prevLine, currLine)
+		prev, cur = cur, prev
 	}
-	return nil
+	bw.Flush()
 }

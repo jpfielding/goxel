@@ -98,7 +98,7 @@ func LoadConfig(path string) (*RenderConfig, error) {
 func DefaultConfig() *RenderConfig {
 	return &RenderConfig{
 		Name:             "MVS TRIMAT Default",
-		BackgroundColor:  [3]int{237, 237, 237},
+		BackgroundColor:  [3]int{16, 22, 29}, // theme BG: the 3D view blends into the window
 		RaySamplingStep:  0.5,
 		GlobalBrightness: 0.0,
 		GlobalGamma:      0.95,

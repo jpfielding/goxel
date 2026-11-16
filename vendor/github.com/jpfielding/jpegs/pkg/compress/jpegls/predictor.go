@@ -1,9 +1,7 @@
 package jpegls
 
-// PredictMED implements Median Edge Detection predictor.
-// Ra: Left
-// Rb: Above
-// Rc: Above-Left
+// PredictMED implements the LOCO-I median edge detection predictor.
+// Ra: left, Rb: above, Rc: above-left.
 func PredictMED(Ra, Rb, Rc int) int {
 	if Rc >= max(Ra, Rb) {
 		return min(Ra, Rb)
@@ -14,32 +12,17 @@ func PredictMED(Ra, Rb, Rc int) int {
 	return Ra + Rb - Rc
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
+// clip clamps val to [lo, hi].
+func clip(val, lo, hi int) int {
+	if val < lo {
+		return lo
 	}
-	return b
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-// Clip clamps value to range [min, max]
-func clip(val, min, max int) int {
-	if val < min {
-		return min
-	}
-	if val > max {
-		return max
+	if val > hi {
+		return hi
 	}
 	return val
 }
 
-// Abs returns absolute value
 func abs(x int) int {
 	if x < 0 {
 		return -x

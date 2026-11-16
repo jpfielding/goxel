@@ -76,8 +76,22 @@ install-codex: # opena-ai codex.rs
 
 build-ctl: ## Builds the goxel ui
 	mkdir -p bin
-	CGO_ENABLED=0 go build \
+	go build \
 		-trimpath \
 		-ldflags "-s -w -X 'main.GitSHA=$(GIT_SHA)'" \
 		-o bin/goxel \
 		cmd/main.go
+
+WEB_DIR = bin/web
+
+build-wasm: ## Builds the browser (wasm) viewer into bin/web
+	mkdir -p $(WEB_DIR)/samples
+	GOOS=js GOARCH=wasm go build -trimpath \
+		-ldflags "-s -w -X 'main.GitSHA=$(GIT_SHA)'" \
+		-o $(WEB_DIR)/goxel.wasm ./cmd/web
+	cp "$$(go env GOROOT)/lib/wasm/wasm_exec.js" $(WEB_DIR)/
+	cp cmd/web/index.html $(WEB_DIR)/
+	cp pkg/testdata/dicom/sample_ct.dcm $(WEB_DIR)/samples/
+
+serve-wasm: build-wasm ## Serves bin/web on http://127.0.0.1:8080
+	python3 -m http.server 8080 --bind 127.0.0.1 --directory $(WEB_DIR)

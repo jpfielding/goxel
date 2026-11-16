@@ -1,12 +1,12 @@
+//go:build !js
+
 package volume
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"image"
 	"image/color"
-	"image/jpeg"
 	"log/slog"
 	"math"
 	"runtime"
@@ -16,32 +16,6 @@ import (
 	"github.com/go-gl/gl/v3.3-core/gl"
 	"github.com/go-gl/glfw/v3.3/glfw"
 )
-
-// extractPixelsFromImage extracts grayscale pixel values from an image.Image
-func extractPixelsFromImage(img image.Image) []int {
-	bounds := img.Bounds()
-	width, height := bounds.Dx(), bounds.Dy()
-	pixels := make([]int, width*height)
-
-	for y := 0; y < height; y++ {
-		for x := 0; x < width; x++ {
-			r, _, _, _ := img.At(x+bounds.Min.X, y+bounds.Min.Y).RGBA()
-			// RGBA returns 16-bit values (0-65535), scale to int
-			pixels[y*width+x] = int(r)
-		}
-	}
-	return pixels
-}
-
-// decodeJPEGFrame decodes a standard JPEG compressed frame.
-// Note: DICOM-specific formats (JPEG-LS, JPEG 2000, RLE) are handled by the dicom library.
-func decodeJPEGFrame(data []byte, width, height int, signed bool) []int {
-	// Standard JPEG decoding
-	if img, err := jpeg.Decode(bytes.NewReader(data)); err == nil {
-		return extractPixelsFromImage(img)
-	}
-	return nil
-}
 
 const vertexShaderSource = `
 #version 330 core
@@ -54,158 +28,8 @@ void main() {
 }
 ` + "\x00"
 
-const fragmentShaderSource = `
-#version 330 core
-in vec2 TexCoord;
-out vec4 FragColor;
-
-uniform sampler3D volumeTex;
-uniform sampler1D transferTex;
-uniform vec3 camPos;
-uniform vec3 camForward;
-uniform vec3 camRight;
-uniform vec3 camUp;
-uniform float fov;
-uniform float aspectRatio;
-uniform float windowMin;
-uniform float windowRange;
-uniform float alphaScale;
-uniform float stepSize;
-uniform float scaleZ;
-uniform float rescaleIntercept;
-uniform vec4 tintColor;
-uniform float densityThreshold;
-uniform float ambientIntensity;
-uniform float diffuseIntensity;
-uniform float specularIntensity;
-uniform vec4 clipPlane;
-uniform bool enableClip;
-
-// Ray-box intersection for box [0,1]x[0,1]x[0,scaleZ]
-vec2 intersectBox(vec3 origin, vec3 dir) {
-    vec3 boxSize = vec3(1.0, 1.0, scaleZ);
-    vec3 invDir = 1.0 / dir;
-    vec3 t1 = (vec3(0.0) - origin) * invDir;
-    vec3 t2 = (boxSize - origin) * invDir;
-    vec3 tMin = min(t1, t2);
-    vec3 tMax = max(t1, t2);
-    float tNear = max(max(tMin.x, tMin.y), tMin.z);
-    float tFar = min(min(tMax.x, tMax.y), tMax.z);
-    return vec2(tNear, tFar);
-}
-
-void main() {
-    vec2 uv = TexCoord * 2.0 - 1.0;
-    vec3 rayDir = normalize(camForward + camRight * uv.x * fov * aspectRatio + camUp * uv.y * fov);
-
-    // Intersect with volume bounding box
-    vec2 tHit = intersectBox(camPos, rayDir);
-    float tNear = max(tHit.x, 0.0);
-    float tFar = tHit.y;
-
-    if (tFar < tNear) {
-        FragColor = vec4(0.0);
-        return;
-    }
-
-    vec4 accum = vec4(0.0);
-    float t = tNear;
-    vec3 boxSize = vec3(1.0, 1.0, scaleZ);
-
-    // Light directions for better depth perception
-    vec3 lightDir1 = normalize(vec3(0.5, 0.7, 1.0));   // Main light (front-top-right)
-    vec3 lightDir2 = normalize(vec3(-0.3, 0.2, 0.8));  // Fill light (front-top-left)
-
-    for (int i = 0; i < 4096; i++) {
-        if (t >= tFar || accum.a > 0.98) break;
-
-        vec3 pos = camPos + rayDir * t;
-
-        // Sample normalized coordinate
-        vec3 texPos = pos / boxSize;
-
-        // Clipping plane check (in texture space 0..1)
-        if (enableClip) {
-             if (dot(texPos, clipPlane.xyz) + clipPlane.w < 0.0) {
-                 t += stepSize;
-                 continue;
-             }
-        }
-
-        // Single texture read: density (R) + pre-computed gradient (GBA)
-        vec4 volSample = texture(volumeTex, texPos);
-        float density = volSample.r;
-
-        // Window/level normalization
-        float normalized = clamp((density * 65535.0 + rescaleIntercept - windowMin) / windowRange, 0.0, 1.0);
-
-        if (normalized > densityThreshold) {
-            vec4 sampleColor = texture(transferTex, normalized);
-
-            // Alpha threshold skip: avoid lighting for nearly-transparent samples
-            if (sampleColor.a < 0.001) {
-                t += stepSize;
-                continue;
-            }
-
-            // Apply tint
-            sampleColor.rgb *= tintColor.rgb;
-
-            // Decode pre-computed gradient from GBA channels
-            vec3 gradient = volSample.gba * 2.0 - 1.0;
-            float gradLen = length(gradient);
-
-            // Edge enhancement: boost opacity at surfaces (high gradient)
-            float edgeFactor = smoothstep(0.001, 0.02, gradLen);
-
-            // Only compute full Phong lighting when gradient is significant
-            if (gradLen > 0.01) {
-                vec3 normal = normalize(gradient);
-
-                // Two-light Phong lighting for better depth
-                float NdotL1 = max(dot(normal, lightDir1), 0.0);
-                float NdotL2 = max(dot(normal, lightDir2), 0.0);
-
-                // Specular highlight (Blinn-Phong)
-                vec3 viewDir = -rayDir;
-                vec3 halfVec1 = normalize(lightDir1 + viewDir);
-                vec3 halfVec2 = normalize(lightDir2 + viewDir);
-                float spec1 = pow(max(dot(normal, halfVec1), 0.0), 32.0);
-                float spec2 = pow(max(dot(normal, halfVec2), 0.0), 32.0);
-
-                // Combined lighting
-                float ambient = ambientIntensity;
-                float diffuse = diffuseIntensity * (NdotL1 * 0.7 + NdotL2 * 0.3);
-                float specular = specularIntensity * (spec1 * 0.7 + spec2 * 0.3);
-
-                float lightFactor = ambient + diffuse;
-                sampleColor.rgb *= clamp(lightFactor, 0.4, 1.4);
-                sampleColor.rgb += vec3(specular * 0.3); // Subtle specular highlight
-
-                // Edge enhancement: increase opacity at boundaries
-                sampleColor.a *= (1.0 + edgeFactor * 0.5);
-            } else {
-                // Flat region: ambient-only lighting
-                sampleColor.rgb *= ambientIntensity;
-            }
-
-            // Smoother opacity curve (cube root for softer falloff, then square for surfaces)
-            float alphaAdjust = pow(sampleColor.a, 1.5);
-            float sampleA = alphaAdjust * alphaScale;
-
-            if (sampleA > 0.0005) {
-                float oneMinusAccA = 1.0 - accum.a;
-                accum.rgb += oneMinusAccA * sampleA * sampleColor.rgb;
-                accum.a += oneMinusAccA * sampleA;
-            }
-        }
-
-        t += stepSize;
-    }
-
-    FragColor = accum;
-}
-` + "\x00"
+// fragmentShaderSource is the shared ray-march body behind the desktop header.
+const fragmentShaderSource = desktopFragmentHeader + volumeFragmentBody + "\x00"
 
 // ActiveVolume represents a single volume loaded into the renderer
 type ActiveVolume struct {
@@ -260,6 +84,7 @@ type GPUVolumeRenderer struct {
 	ambientIntensity  float64 // Ambient lighting coefficient (0-1)
 	diffuseIntensity  float64 // Diffuse lighting coefficient (0-1)
 	specularIntensity float64 // Specular lighting coefficient (0-1)
+	depthCue          float64 // Darkening with ray depth (0 = off)
 
 	// Clipping Plane
 	clipPlane  [4]float32
@@ -321,6 +146,7 @@ type volumeUniforms struct {
 	densityThreshold  int32
 	tintColor         int32
 	volumeTex         int32
+	depthCue          int32
 }
 
 const lineVertexShaderSource = `
@@ -563,6 +389,7 @@ func (gr *GPUVolumeRenderer) cacheUniforms() {
 		densityThreshold:  gl.GetUniformLocation(gr.program, gl.Str("densityThreshold\x00")),
 		tintColor:         gl.GetUniformLocation(gr.program, gl.Str("tintColor\x00")),
 		volumeTex:         gl.GetUniformLocation(gr.program, gl.Str("volumeTex\x00")),
+		depthCue:          gl.GetUniformLocation(gr.program, gl.Str("depthCue\x00")),
 	}
 }
 
@@ -777,6 +604,14 @@ func (gr *GPUVolumeRenderer) SetLighting(ambient, diffuse, specular float64) {
 	gr.ambientIntensity = ambient
 	gr.diffuseIntensity = diffuse
 	gr.specularIntensity = specular
+	gr.needsRender = true
+	gr.mu.Unlock()
+}
+
+// SetDepthCue sets how much samples darken with ray depth (0 = off, 1 = black at the far side).
+func (gr *GPUVolumeRenderer) SetDepthCue(v float64) {
+	gr.mu.Lock()
+	gr.depthCue = v
 	gr.needsRender = true
 	gr.mu.Unlock()
 }
@@ -1317,6 +1152,7 @@ func (gr *GPUVolumeRenderer) renderInternal() *image.RGBA {
 	gl.Uniform1f(gr.uniforms.ambientIntensity, float32(gr.ambientIntensity))
 	gl.Uniform1f(gr.uniforms.diffuseIntensity, float32(gr.diffuseIntensity))
 	gl.Uniform1f(gr.uniforms.specularIntensity, float32(gr.specularIntensity))
+	gl.Uniform1f(gr.uniforms.depthCue, float32(gr.depthCue))
 
 	// Clipping
 	gl.Uniform4f(gr.uniforms.clipPlane, gr.clipPlane[0], gr.clipPlane[1], gr.clipPlane[2], gr.clipPlane[3])
@@ -1333,7 +1169,10 @@ func (gr *GPUVolumeRenderer) renderInternal() *image.RGBA {
 
 	// Enable Additive Blending for multi-volume
 	gl.Enable(gl.BLEND)
-	gl.BlendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
+	// The ray march outputs premultiplied colour (accum.rgb already carries
+	// alpha), so blend with ONE, not SRC_ALPHA, or every sample is darkened
+	// twice; on the dark theme background that left the volume near black.
+	gl.BlendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA)
 
 	// Render each volume
 	gl.BindVertexArray(gr.vao)
