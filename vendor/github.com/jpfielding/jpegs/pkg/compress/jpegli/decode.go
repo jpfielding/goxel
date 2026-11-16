@@ -1,9 +1,9 @@
-// Package jpegli implements a pure Go JPEG Lossless (ITU-T T.81 Annex H) decoder.
-// This handles DICOM Transfer Syntax 1.2.840.10008.1.2.4.70 (JPEG Lossless, First-Order Prediction).
+// Package jpegli implements a pure Go JPEG Lossless (ITU-T T.81 Annex H,
+// Process 14) codec for single-component images. This handles DICOM Transfer
+// Syntaxes 1.2.840.10008.1.2.4.57 and .70 (JPEG Lossless, selection value 1).
 package jpegli
 
 import (
-	"errors"
 	"fmt"
 	"image"
 	"io"
@@ -23,29 +23,52 @@ const (
 	MarkerCOM  = 0xFFFE // Comment
 )
 
-// Decoder decodes JPEG Lossless images.
+const (
+	markerRST0 = 0xFFD0
+	markerRST7 = 0xFFD7
+	markerDNL  = 0xFFDC
+	markerTEM  = 0xFF01
+)
+
+// profile selects the entropy-coded scan format a decode accepts.
+type profile int
+
+const (
+	// profileAuto decodes as T.81 and, when that fails on a stream the
+	// pre-conformance encoder could have written, retries the frozen legacy
+	// format (see legacy.go).
+	profileAuto profile = iota
+	// profileT81 accepts only ITU-T T.81 conformant streams.
+	profileT81
+	// profileLegacy accepts only the frozen pre-conformance format.
+	profileLegacy
+)
+
+// Decoder holds the state of one JPEG Lossless decode.
 type Decoder struct {
-	r io.Reader
+	data []byte
+	pos  int // next unread byte of data
 
 	// Frame parameters
-	precision  int // bits per sample (typically 8, 12, or 16)
+	precision  int // P, bits per sample (2..16)
 	height     int
 	width      int
 	components int
+	compInfo   []componentInfo
 
-	// Component info
-	compInfo []componentInfo
-
-	// Huffman tables (indexed by table class and ID)
-	// Class 0 = DC tables (used for lossless)
+	// Huffman tables indexed by DC table ID; lossless uses only DC tables.
 	dcTables [4]*huffmanTable
 
 	// Scan parameters
-	predictor  int // 1-7
-	pointTrans int // point transform (right shift)
+	predictor  int // Ss, 1..7
+	pointTrans int // Al = Pt, point transform
 
-	// Restart interval
+	// Restart interval Ri in samples (one sample per MCU); 0 = none.
 	restartInterval int
+
+	// legacyMark records that the T.81 scan met SSSS=16 and the next 16
+	// bits were 0x7FFF, as in every legacy SSSS=16 stream (see decodeAuto).
+	legacyMark bool
 }
 
 type componentInfo struct {
@@ -60,149 +83,207 @@ type huffmanTable struct {
 	values []byte     // HUFFVAL: symbol values
 	codes  []uint16   // Computed: Huffman codes
 	sizes  []int      // Computed: code sizes
-	lookup [256]int16 // Fast lookup for 8-bit codes
+	lookup [256]int16 // size<<8 | value for codes of up to 8 bits, else -1
+
+	// Canonical decode tables (T.81 F.2.2.3), indexed by code length.
+	mincode [17]int32
+	maxcode [17]int32 // -1 when there are no codes of that length
+	valptr  [17]int
 }
 
-// Decode reads a JPEG Lossless image from r and returns an image.Image.
+// Decode reads a JPEG Lossless image from r and returns an image.Image:
+// *image.Gray for precision <= 8, otherwise *image.Gray16. Samples are
+// returned at full precision (shifted left by the point transform).
+//
+// Supported: one component, precision 2..16, predictors 1..7, any point
+// transform, any valid DC Huffman table, restart intervals that are a
+// multiple of the row width. The stream must contain every sample and end
+// with EOI; anything less is an error (ErrTruncated), never a partial image.
+//
+// 16-bit streams written by this package before it became T.81 conformant
+// are still readable: a stream whose SSSS=16 codes carry the legacy appended
+// bits is decoded with the frozen legacy decoder (see decodeAuto, legacy.go).
 func Decode(r io.Reader) (image.Image, error) {
-	d := &Decoder{r: r}
-	return d.decode()
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return nil, fmt.Errorf("jpegli: reading stream: %w", err)
+	}
+	return decode(data, profileAuto)
 }
 
-func (d *Decoder) decode() (image.Image, error) {
-	// Read SOI marker
-	if err := d.expectMarker(MarkerSOI); err != nil {
-		return nil, fmt.Errorf("expected SOI: %w", err)
+func decode(data []byte, p profile) (image.Image, error) {
+	d := &Decoder{data: data}
+	if err := d.readHeaders(); err != nil {
+		return nil, err
+	}
+	ht := d.dcTables[d.compInfo[0].tableIndex]
+
+	var img image.Image
+	var pix []byte
+	wide := d.precision > 8
+	rect := image.Rect(0, 0, d.width, d.height)
+	if wide {
+		m := image.NewGray16(rect)
+		img, pix = m, m.Pix
+	} else {
+		m := image.NewGray(rect)
+		img, pix = m, m.Pix
 	}
 
-	// Read markers until SOS
-	for {
-		marker, err := d.readMarker()
-		if err != nil {
-			return nil, err
-		}
-
-		switch marker {
-		case MarkerSOF3:
-			if err := d.readSOF(); err != nil {
-				return nil, err
-			}
-		case MarkerDHT:
-			if err := d.readDHT(); err != nil {
-				return nil, err
-			}
-		case MarkerSOS:
-			return d.decodeScan()
-		case MarkerDRI:
-			if err := d.readDRI(); err != nil {
-				return nil, err
-			}
-		case MarkerAPP0, MarkerCOM:
-			// Skip APP and COM markers
-			if err := d.skipMarkerData(); err != nil {
-				return nil, err
-			}
-		case MarkerEOI:
-			return nil, errors.New("unexpected EOI before scan data")
-		default:
-			// Skip unknown markers
-			if marker >= 0xFFE0 && marker <= 0xFFEF { // APP markers
-				if err := d.skipMarkerData(); err != nil {
-					return nil, err
-				}
-			} else if marker >= 0xFFC0 && marker <= 0xFFCF { // SOF markers
-				return nil, fmt.Errorf("unsupported SOF marker: 0x%04X", marker)
-			} else {
-				if err := d.skipMarkerData(); err != nil {
-					return nil, err
-				}
-			}
-		}
+	var err error
+	switch p {
+	case profileT81:
+		_, err = d.decodeScan(ht, pix, wide)
+	case profileLegacy:
+		err = d.decodeLegacyScan(ht, pix)
+	default:
+		err = d.decodeAuto(ht, pix, wide)
 	}
+	if err != nil {
+		return nil, err
+	}
+	return img, nil
 }
 
-func (d *Decoder) expectMarker(expected int) error {
-	var buf [2]byte
-	if _, err := io.ReadFull(d.r, buf[:]); err != nil {
+// decodeAuto decodes a scan of unknown vintage. The legacy format differs
+// from T.81 only after an SSSS=16 code, where it appends 16 bits that are
+// always 0x7FFF. Until the first SSSS=16 both decoders read the same bits,
+// so a legacy stream is one whose T.81 decode meets SSSS=16 followed by
+// 0x7FFF (d.legacyMark) and whose headers match the legacy encoder
+// (legacyEligible). Only then is the legacy decode tried, and it is
+// preferred whenever it succeeds (every SSSS=16 followed by 0x7FFF, 1-bit
+// padding, EOI), even if the T.81 decode succeeded too: a legacy stream
+// misread as T.81 desyncs but can still end cleanly by chance, while a T.81
+// stream that passes all the legacy checks is far rarer. TestLegacyDetection
+// measures both rates. Otherwise the T.81 result or error stands.
+func (d *Decoder) decodeAuto(ht *huffmanTable, pix []byte, wide bool) error {
+	scanStart := d.pos
+	_, err := d.decodeScan(ht, pix, wide)
+	if !d.legacyMark || !d.legacyEligible(ht) {
 		return err
 	}
-	marker := int(buf[0])<<8 | int(buf[1])
-	if marker != expected {
-		return fmt.Errorf("expected marker 0x%04X, got 0x%04X", expected, marker)
+	d.pos = scanStart
+	if lerr := d.decodeLegacyScan(ht, pix); lerr == nil {
+		slog.Debug("jpegli: decoded legacy SSSS=16 stream")
+		return nil
 	}
-	return nil
+	if err == nil {
+		// Legacy failed after overwriting pix: decode the T.81 result again.
+		d.pos = scanStart
+		_, err = d.decodeScan(ht, pix, wide)
+	}
+	return err
 }
 
-func (d *Decoder) readMarker() (int, error) {
-	var buf [2]byte
-	if _, err := io.ReadFull(d.r, buf[:]); err != nil {
-		return 0, err
+// readHeaders parses SOI and the marker segments up to and including SOS,
+// leaving d.pos at the first byte of entropy-coded data.
+func (d *Decoder) readHeaders() error {
+	m, err := d.readMarker()
+	if err != nil {
+		return err
 	}
-	if buf[0] != 0xFF {
-		return 0, fmt.Errorf("expected marker, got 0x%02X", buf[0])
+	if m != MarkerSOI {
+		return fmt.Errorf("%w: expected SOI marker, got 0x%04X", ErrInvalidData, m)
 	}
-	// Skip fill bytes
-	for buf[1] == 0xFF {
-		if _, err := io.ReadFull(d.r, buf[1:]); err != nil {
-			return 0, err
+	for {
+		m, err := d.readMarker()
+		if err != nil {
+			return err
+		}
+		switch {
+		case m == MarkerSOF3:
+			err = d.readSOF()
+		case m == MarkerDHT:
+			err = d.readDHT()
+		case m == MarkerDRI:
+			err = d.readDRI()
+		case m == MarkerSOS:
+			return d.readSOS()
+		case m == MarkerEOI:
+			return fmt.Errorf("%w: EOI before scan data", ErrInvalidData)
+		case m >= 0xFFC0 && m <= 0xFFCF:
+			return fmt.Errorf("%w: SOF marker 0x%04X (only SOF3 lossless Huffman)", ErrUnsupported, m)
+		case m >= markerRST0 && m <= MarkerSOI, m == markerTEM:
+			return fmt.Errorf("%w: unexpected marker 0x%04X before scan", ErrInvalidData, m)
+		default: // APPn, COM, DQT and other segments carry nothing lossless needs
+			_, err = d.readSegment(fmt.Sprintf("marker 0x%04X", m))
+		}
+		if err != nil {
+			return err
 		}
 	}
-	return int(buf[0])<<8 | int(buf[1]), nil
+}
+
+func (d *Decoder) truncated(context string) error {
+	return &TruncatedError{Offset: min(d.pos, len(d.data)), Context: context}
+}
+
+// readMarker reads a marker, skipping 0xFF fill bytes (T.81 B.1.1.2).
+func (d *Decoder) readMarker() (int, error) {
+	if d.pos >= len(d.data) {
+		return 0, d.truncated("marker")
+	}
+	if b := d.data[d.pos]; b != 0xFF {
+		return 0, fmt.Errorf("%w: expected marker at offset %d, got 0x%02X", ErrInvalidData, d.pos, b)
+	}
+	for d.pos < len(d.data) && d.data[d.pos] == 0xFF {
+		d.pos++
+	}
+	if d.pos >= len(d.data) {
+		return 0, d.truncated("marker")
+	}
+	m := 0xFF00 | int(d.data[d.pos])
+	d.pos++
+	return m, nil
 }
 
 // readSegment reads a marker segment's 2-byte length and returns its payload
 // (length excluding the length field itself). Lengths below 2 are rejected.
 func (d *Decoder) readSegment(name string) ([]byte, error) {
-	var lenBuf [2]byte
-	if _, err := io.ReadFull(d.r, lenBuf[:]); err != nil {
-		return nil, fmt.Errorf("jpegli: reading %s length: %w", name, err)
+	if len(d.data)-d.pos < 2 {
+		return nil, d.truncated(name + " length")
 	}
-	length := int(lenBuf[0])<<8 | int(lenBuf[1])
+	length := int(d.data[d.pos])<<8 | int(d.data[d.pos+1])
 	if length < 2 {
-		return nil, fmt.Errorf("jpegli: %s segment length %d < 2", name, length)
+		return nil, fmt.Errorf("%w: %s segment length %d < 2", ErrInvalidData, name, length)
 	}
-	data := make([]byte, length-2)
-	if _, err := io.ReadFull(d.r, data); err != nil {
-		return nil, fmt.Errorf("jpegli: reading %s payload: %w", name, err)
+	if len(d.data)-d.pos < length {
+		return nil, d.truncated(name + " payload")
 	}
-	return data, nil
-}
-
-func (d *Decoder) skipMarkerData() error {
-	var lenBuf [2]byte
-	if _, err := io.ReadFull(d.r, lenBuf[:]); err != nil {
-		return err
-	}
-	length := int(lenBuf[0])<<8 | int(lenBuf[1])
-	if length < 2 {
-		return fmt.Errorf("jpegli: marker segment length %d < 2", length)
-	}
-	if length > 2 {
-		if _, err := io.CopyN(io.Discard, d.r, int64(length-2)); err != nil {
-			return fmt.Errorf("jpegli: skipping marker segment: %w", err)
-		}
-	}
-	return nil
+	payload := d.data[d.pos+2 : d.pos+length]
+	d.pos += length
+	return payload, nil
 }
 
 func (d *Decoder) readSOF() error {
-	data, err := d.readSegment("SOF")
+	data, err := d.readSegment("SOF3")
 	if err != nil {
 		return err
 	}
+	if d.compInfo != nil {
+		return fmt.Errorf("%w: second SOF3 segment", ErrInvalidData)
+	}
 	if len(data) < 6 {
-		return fmt.Errorf("jpegli: SOF segment too short (%d bytes)", len(data))
+		return fmt.Errorf("%w: SOF3 segment too short (%d bytes)", ErrInvalidData, len(data))
 	}
 
 	d.precision = int(data[0])
 	d.height = int(data[1])<<8 | int(data[2])
 	d.width = int(data[3])<<8 | int(data[4])
 	d.components = int(data[5])
+	// T.81 B.2.2: X > 0; Y = 0 defers the height to a DNL marker, which this
+	// codec does not support.
+	if d.width == 0 || d.height == 0 {
+		return fmt.Errorf("%w: dimensions %dx%d (width and height must be > 0)", ErrInvalidParameter, d.width, d.height)
+	}
 	if d.precision < 2 || d.precision > 16 {
-		return fmt.Errorf("jpegli: invalid precision %d", d.precision)
+		return fmt.Errorf("%w: precision %d (allowed 2..16)", ErrInvalidParameter, d.precision)
+	}
+	if d.components != 1 {
+		return fmt.Errorf("%w: %d components (only single-component frames)", ErrUnsupported, d.components)
 	}
 	if len(data) < 6+d.components*3 {
-		return fmt.Errorf("jpegli: SOF segment length %d too short for %d components", len(data), d.components)
+		return fmt.Errorf("%w: SOF3 segment length %d too short for %d components", ErrInvalidData, len(data), d.components)
 	}
 	bytesPerSample := 1
 	if d.precision > 8 {
@@ -213,7 +294,7 @@ func (d *Decoder) readSOF() error {
 	}
 
 	d.compInfo = make([]componentInfo, d.components)
-	for i := 0; i < d.components; i++ {
+	for i := range d.compInfo {
 		offset := 6 + i*3
 		d.compInfo[i] = componentInfo{
 			id:        int(data[offset]),
@@ -229,7 +310,6 @@ func (d *Decoder) readSOF() error {
 		slog.Int("width", d.width),
 		slog.Int("height", d.height),
 		slog.Int("components", d.components))
-
 	return nil
 }
 
@@ -247,13 +327,13 @@ func (d *Decoder) readDHT() error {
 		offset++
 
 		if tableClass > 1 {
-			return fmt.Errorf("jpegli: DHT invalid table class %d", tableClass)
+			return fmt.Errorf("%w: DHT table class %d", ErrInvalidData, tableClass)
 		}
 		if tableID > 3 {
-			return fmt.Errorf("jpegli: DHT invalid table ID %d", tableID)
+			return fmt.Errorf("%w: DHT table ID %d", ErrInvalidData, tableID)
 		}
 		if len(data)-offset < 16 {
-			return fmt.Errorf("jpegli: DHT truncated BITS (%d bytes left, need 16)", len(data)-offset)
+			return fmt.Errorf("%w: DHT BITS truncated (%d bytes left, need 16)", ErrInvalidData, len(data)-offset)
 		}
 
 		var counts [17]int
@@ -265,10 +345,10 @@ func (d *Decoder) readDHT() error {
 		offset += 16
 
 		if totalCodes > 256 {
-			return fmt.Errorf("jpegli: DHT declares %d symbols (max 256)", totalCodes)
+			return fmt.Errorf("%w: DHT declares %d symbols (max 256)", ErrInvalidData, totalCodes)
 		}
 		if len(data)-offset < totalCodes {
-			return fmt.Errorf("jpegli: DHT declares %d symbols but only %d bytes remain", totalCodes, len(data)-offset)
+			return fmt.Errorf("%w: DHT declares %d symbols but only %d bytes remain", ErrInvalidData, totalCodes, len(data)-offset)
 		}
 		vals := data[offset : offset+totalCodes]
 		offset += totalCodes
@@ -279,21 +359,21 @@ func (d *Decoder) readDHT() error {
 		}
 
 		if totalCodes == 0 {
-			return errors.New("jpegli: DHT table defines no codes")
+			return fmt.Errorf("%w: DHT table defines no codes", ErrInvalidData)
 		}
 		if !bitsValid(&counts) {
-			return errors.New("jpegli: DHT code lengths are oversubscribed")
+			return fmt.Errorf("%w: DHT code lengths are oversubscribed", ErrInvalidData)
 		}
 		for _, v := range vals {
 			if v > 16 {
-				return fmt.Errorf("jpegli: DHT symbol %d exceeds max difference category 16", v)
+				return fmt.Errorf("%w: DHT symbol %d exceeds max difference category 16", ErrInvalidData, v)
 			}
 		}
 
 		ht := &huffmanTable{bits: counts}
 		ht.values = make([]byte, totalCodes)
 		copy(ht.values, vals)
-		d.generateHuffmanCodes(ht)
+		generateHuffmanCodes(ht)
 
 		slog.Debug("jpegli: DHT parsed",
 			slog.Int("tableID", tableID),
@@ -301,7 +381,6 @@ func (d *Decoder) readDHT() error {
 
 		d.dcTables[tableID] = ht
 	}
-
 	return nil
 }
 
@@ -319,8 +398,9 @@ func bitsValid(counts *[17]int) bool {
 	return true
 }
 
-func (d *Decoder) generateHuffmanCodes(ht *huffmanTable) {
-	// Count total symbols
+// generateHuffmanCodes derives the canonical codes (T.81 C.2), the 8-bit
+// fast lookup and the F.2.2.3 decode tables from ht.bits and ht.values.
+func generateHuffmanCodes(ht *huffmanTable) {
 	var totalCodes int
 	for i := 1; i <= 16; i++ {
 		totalCodes += ht.bits[i]
@@ -329,7 +409,6 @@ func (d *Decoder) generateHuffmanCodes(ht *huffmanTable) {
 	ht.codes = make([]uint16, totalCodes)
 	ht.sizes = make([]int, totalCodes)
 
-	// Generate sizes
 	k := 0
 	for i := 1; i <= 16; i++ {
 		for j := 0; j < ht.bits[i]; j++ {
@@ -338,7 +417,6 @@ func (d *Decoder) generateHuffmanCodes(ht *huffmanTable) {
 		}
 	}
 
-	// Generate codes
 	code := uint16(0)
 	si := ht.sizes[0]
 	for k := 0; k < totalCodes; k++ {
@@ -350,19 +428,27 @@ func (d *Decoder) generateHuffmanCodes(ht *huffmanTable) {
 		code++
 	}
 
-	// Build lookup table for fast 8-bit decoding
+	k = 0
+	for l := 1; l <= 16; l++ {
+		if ht.bits[l] == 0 {
+			ht.maxcode[l] = -1
+			continue
+		}
+		ht.valptr[l] = k
+		ht.mincode[l] = int32(ht.codes[k])
+		k += ht.bits[l]
+		ht.maxcode[l] = int32(ht.codes[k-1])
+	}
+
 	for i := range ht.lookup {
-		ht.lookup[i] = -1 // Invalid
+		ht.lookup[i] = -1
 	}
 	for k := 0; k < totalCodes; k++ {
 		size := ht.sizes[k]
 		if size <= 8 {
-			// Extend code to 8 bits
-			code := ht.codes[k] << (8 - size)
-			count := 1 << (8 - size)
-			for i := 0; i < count; i++ {
-				// Pack size in high byte, value in low byte
-				ht.lookup[int(code)+i] = int16(size)<<8 | int16(ht.values[k])
+			code := int(ht.codes[k]) << (8 - size)
+			for i := 0; i < 1<<(8-size); i++ {
+				ht.lookup[code+i] = int16(size)<<8 | int16(ht.values[k])
 			}
 		}
 	}
@@ -374,7 +460,7 @@ func (d *Decoder) readDRI() error {
 		return err
 	}
 	if len(data) != 2 {
-		return fmt.Errorf("jpegli: DRI payload is %d bytes, want 2", len(data))
+		return fmt.Errorf("%w: DRI payload is %d bytes, want 2", ErrInvalidData, len(data))
 	}
 	d.restartInterval = int(data[0])<<8 | int(data[1])
 	return nil
@@ -382,35 +468,32 @@ func (d *Decoder) readDRI() error {
 
 func (d *Decoder) readSOS() error {
 	if len(d.compInfo) == 0 {
-		return errors.New("jpegli: SOS before SOF")
+		return fmt.Errorf("%w: SOS before SOF3", ErrInvalidData)
 	}
 	data, err := d.readSegment("SOS")
 	if err != nil {
 		return err
 	}
 	if len(data) < 1 {
-		return errors.New("jpegli: SOS segment empty")
+		return fmt.Errorf("%w: SOS segment empty", ErrInvalidData)
 	}
 
 	ns := int(data[0])
 	if ns < 1 || ns > len(d.compInfo) {
-		return fmt.Errorf("jpegli: SOS component count %d invalid (frame has %d)", ns, len(d.compInfo))
+		return fmt.Errorf("%w: SOS component count %d (frame has %d)", ErrInvalidData, ns, len(d.compInfo))
 	}
 	if len(data) != 1+2*ns+3 {
-		return fmt.Errorf("jpegli: SOS payload is %d bytes, want %d for %d components", len(data), 1+2*ns+3, ns)
+		return fmt.Errorf("%w: SOS payload is %d bytes, want %d for %d components", ErrInvalidData, len(data), 1+2*ns+3, ns)
 	}
 
-	// Component selectors and table mappings
 	offset := 1
 	for i := 0; i < ns; i++ {
 		selector := int(data[offset])
 		td := int(data[offset+1] >> 4)
 		offset += 2
 		if td > 3 {
-			return fmt.Errorf("jpegli: SOS DC table selector %d out of range", td)
+			return fmt.Errorf("%w: SOS DC table selector %d (allowed 0..3)", ErrInvalidParameter, td)
 		}
-
-		// Find component by selector ID
 		found := false
 		for j := range d.compInfo {
 			if d.compInfo[j].id == selector {
@@ -420,27 +503,66 @@ func (d *Decoder) readSOS() error {
 			}
 		}
 		if !found {
-			return fmt.Errorf("jpegli: SOS component selector %d matches no frame component", selector)
+			return fmt.Errorf("%w: SOS component selector %d matches no frame component", ErrInvalidData, selector)
 		}
 	}
-
-	// Ss = predictor selection in lossless
-	d.predictor = int(data[offset])
-	if d.predictor > 7 {
-		return fmt.Errorf("jpegli: SOS invalid predictor %d", d.predictor)
+	if d.dcTables[d.compInfo[0].tableIndex] == nil {
+		return fmt.Errorf("%w: SOS selects undefined DC Huffman table %d", ErrInvalidData, d.compInfo[0].tableIndex)
 	}
-	offset += 2 // skip Se (always 0 for lossless)
 
-	// Al = point transform
-	d.pointTrans = int(data[offset]) & 0x0F
-	if d.pointTrans >= d.precision {
-		return fmt.Errorf("jpegli: SOS point transform %d >= precision %d", d.pointTrans, d.precision)
+	// T.81 Table B.3, lossless: Ss = predictor 1..7, Se = 0, Ah = 0,
+	// Al = point transform < P.
+	ss, se, ah, al := int(data[offset]), int(data[offset+1]), int(data[offset+2]>>4), int(data[offset+2]&0x0F)
+	switch {
+	case ss < 1 || ss > 7:
+		return fmt.Errorf("%w: predictor (Ss) %d (allowed 1..7)", ErrInvalidParameter, ss)
+	case se != 0:
+		return fmt.Errorf("%w: Se %d (must be 0 for lossless)", ErrInvalidParameter, se)
+	case ah != 0:
+		return fmt.Errorf("%w: Ah %d (must be 0 for lossless)", ErrInvalidParameter, ah)
+	case al >= d.precision:
+		return fmt.Errorf("%w: point transform %d >= precision %d", ErrInvalidParameter, al, d.precision)
+	}
+	d.predictor, d.pointTrans = ss, al
+
+	// T.81 H.1.1: one sample per MCU, and Ri must be a multiple of the
+	// samples per line, so restarts fall on row boundaries.
+	if d.restartInterval%d.width != 0 {
+		return fmt.Errorf("%w: restart interval %d is not a multiple of width %d", ErrInvalidData, d.restartInterval, d.width)
 	}
 
 	slog.Debug("jpegli: SOS parsed",
 		slog.Int("predictor", d.predictor),
 		slog.Int("pointTrans", d.pointTrans),
 		slog.Int("numComponents", ns))
-
 	return nil
+}
+
+// readTrailer parses the markers after the scan, starting at d.pos (the
+// marker that ended the entropy-coded data). APPn and COM segments may
+// precede EOI; anything after EOI is ignored (DICOM pads fragments).
+func (d *Decoder) readTrailer() error {
+	for {
+		if d.pos >= len(d.data) {
+			return d.truncated("EOI")
+		}
+		m, err := d.readMarker()
+		if err != nil {
+			return err
+		}
+		switch {
+		case m == MarkerEOI:
+			return nil
+		case m >= markerRST0 && m <= markerRST7:
+			return fmt.Errorf("%w: restart marker 0x%04X after the last sample", ErrInvalidData, m)
+		case m == MarkerSOS, m == markerDNL:
+			return fmt.Errorf("%w: marker 0x%04X after the scan (single scan only)", ErrUnsupported, m)
+		case m >= 0xFFE0 && m <= 0xFFEF, m == MarkerCOM:
+			if _, err := d.readSegment(fmt.Sprintf("marker 0x%04X", m)); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("%w: marker 0x%04X between scan and EOI", ErrInvalidData, m)
+		}
+	}
 }
