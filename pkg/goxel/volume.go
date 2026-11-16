@@ -61,6 +61,11 @@ type VolumeRenderer struct {
 	// DragPans, when set and true, makes a plain drag pan instead of orbit
 	// (the compact layouts' Orbit | Pan toggle).
 	DragPans func() bool
+
+	// Overlay, when set, returns the slice-plane outline (corners in the
+	// renderer's box space, [0,1]x[0,1]x[0,scaleZ]; nil for none) and the
+	// corner readout ("" for none). Drawn on the GPU path only.
+	Overlay func() (corners [][3]float64, readout string)
 }
 
 type AlignParams struct {
@@ -494,10 +499,20 @@ func (vr *VolumeRenderer) CreateRenderer() fyne.WidgetRenderer {
 		vr.img.ScaleMode = canvas.ImageScalePixels
 	}
 
-	return &volumeWidgetRenderer{
-		vr:  vr,
-		img: vr.img,
+	r := &volumeWidgetRenderer{
+		vr:      vr,
+		img:     vr.img,
+		readout: canvas.NewText("", colAccent),
 	}
+	r.readout.TextSize = 12.5
+	r.readout.Alignment = fyne.TextAlignTrailing
+	for i := range r.edges {
+		l := canvas.NewLine(color.NRGBA{105, 211, 191, 180})
+		l.StrokeWidth = 1
+		l.Hide()
+		r.edges[i] = l
+	}
+	return r
 }
 
 // isBackgroundAt checks whether the given widget-relative position is over
@@ -669,6 +684,13 @@ func (vr *VolumeRenderer) LookAlong(axis int) {
 // IsGPU reports whether the GPU renderer is active (else the CPU fallback).
 func (vr *VolumeRenderer) IsGPU() bool { return vr.useGPU && vr.gpuRenderer != nil }
 
+// SetDepthCue sets how much samples darken with ray depth (0 = off).
+func (vr *VolumeRenderer) SetDepthCue(v float64) {
+	if vr.gpuRenderer != nil {
+		vr.gpuRenderer.SetDepthCue(v)
+	}
+}
+
 // Redraw renders the current state: queued on the GPU path, inline on CPU.
 func (vr *VolumeRenderer) Redraw() {
 	if vr.IsGPU() {
@@ -800,8 +822,74 @@ func (vr *VolumeRenderer) Destroy() {
 
 // volumeWidgetRenderer implements fyne.WidgetRenderer
 type volumeWidgetRenderer struct {
-	vr  *VolumeRenderer
-	img *canvas.Image
+	vr      *VolumeRenderer
+	img     *canvas.Image
+	edges   [4]*canvas.Line
+	readout *canvas.Text
+}
+
+// projectToImage maps a point in the renderer's box space to normalised
+// image coordinates with the same camera model as the ray-march shader.
+func (vr *VolumeRenderer) projectToImage(p [3]float64) (x, y float64, ok bool) {
+	g := vr.gpuRenderer
+	rotX, rotY := g.GetRotation()
+	zoom := g.GetZoom()
+	panX, panY := g.GetPan()
+	scaleZ := g.Params().ScaleZ
+	sinAz, cosAz := math.Sin(rotX), math.Cos(rotX)
+	sinEl, cosEl := math.Sin(rotY), math.Cos(rotY)
+	c := [3]float64{0.5 + panX, 0.5 + panY, scaleZ * 0.5}
+	cam := [3]float64{sinAz*cosEl*zoom + c[0], sinEl*zoom + c[1], cosAz*cosEl*zoom + c[2]}
+	f := [3]float64{c[0] - cam[0], c[1] - cam[1], c[2] - cam[2]}
+	fl := math.Sqrt(f[0]*f[0] + f[1]*f[1] + f[2]*f[2])
+	f = [3]float64{f[0] / fl, f[1] / fl, f[2] / fl}
+	r := [3]float64{cosAz, 0, -sinAz}
+	u := [3]float64{f[1]*r[2] - f[2]*r[1], f[2]*r[0] - f[0]*r[2], f[0]*r[1] - f[1]*r[0]}
+	if ul := math.Sqrt(u[0]*u[0] + u[1]*u[1] + u[2]*u[2]); ul > 0.001 {
+		u = [3]float64{u[0] / ul, u[1] / ul, u[2] / ul}
+	}
+	d := [3]float64{p[0] - cam[0], p[1] - cam[1], p[2] - cam[2]}
+	dot := func(a, b [3]float64) float64 { return a[0]*b[0] + a[1]*b[1] + a[2]*b[2] }
+	depth := dot(d, f)
+	if depth <= 1e-6 {
+		return 0, 0, false
+	}
+	const fov = 0.8 // the shader's half-angle tangent; the render is square
+	ux, uy := dot(d, r)/(depth*fov), dot(d, u)/(depth*fov)
+	return (ux + 1) / 2, (1 - uy) / 2, true
+}
+
+// layoutOverlay positions the slice-plane outline and readout over the image.
+func (r *volumeWidgetRenderer) layoutOverlay(size fyne.Size) {
+	for _, e := range r.edges {
+		e.Hide()
+	}
+	r.readout.Text = ""
+	if r.vr.Overlay == nil || !r.vr.IsGPU() {
+		return
+	}
+	corners, readout := r.vr.Overlay()
+	r.readout.Text = readout
+	r.readout.Color = colAccent
+	ts := fyne.MeasureText(readout, r.readout.TextSize, r.readout.TextStyle)
+	r.readout.Move(fyne.NewPos(size.Width-ts.Width-16, size.Height-ts.Height-14))
+	r.readout.Resize(ts)
+	if len(corners) != 4 {
+		return
+	}
+	at, shown := r.img.Position(), r.img.Size()
+	var pts [4]fyne.Position
+	for i, c := range corners {
+		x, y, ok := r.vr.projectToImage(c)
+		if !ok {
+			return
+		}
+		pts[i] = fyne.NewPos(at.X+float32(x)*shown.Width, at.Y+float32(y)*shown.Height)
+	}
+	for i, e := range r.edges {
+		e.Position1, e.Position2 = pts[i], pts[(i+1)%4]
+		e.Show()
+	}
 }
 
 func (r *volumeWidgetRenderer) Layout(size fyne.Size) {
@@ -825,6 +913,7 @@ func (r *volumeWidgetRenderer) Layout(size fyne.Size) {
 
 	r.img.Move(fyne.NewPos((viewW-renderW)/2, (viewH-renderH)/2))
 	r.img.Resize(fyne.NewSize(renderW, renderH))
+	r.layoutOverlay(size)
 }
 
 func (r *volumeWidgetRenderer) MinSize() fyne.Size {
@@ -844,11 +933,16 @@ func (r *volumeWidgetRenderer) Refresh() {
 	} else if r.vr.cpuRenderer != nil {
 		r.img.Image = r.vr.cpuRenderer.Rendered
 	}
+	r.layoutOverlay(r.vr.Size())
+	for _, e := range r.edges {
+		canvas.Refresh(e)
+	}
+	canvas.Refresh(r.readout)
 	canvas.Refresh(r.img)
 }
 
 func (r *volumeWidgetRenderer) Objects() []fyne.CanvasObject {
-	return []fyne.CanvasObject{r.img}
+	return []fyne.CanvasObject{r.img, r.edges[0], r.edges[1], r.edges[2], r.edges[3], r.readout}
 }
 
 func (r *volumeWidgetRenderer) Destroy() {

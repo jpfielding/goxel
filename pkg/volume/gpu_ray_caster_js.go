@@ -106,6 +106,7 @@ type GPUVolumeRenderer struct {
 	ambientIntensity  float64
 	diffuseIntensity  float64
 	specularIntensity float64
+	depthCue          float64
 
 	clipPlane  [4]float32
 	enableClip bool
@@ -237,7 +238,7 @@ func (gr *GPUVolumeRenderer) initGLResources() error {
 	for _, name := range []string{"camPos", "camForward", "camRight", "camUp", "fov", "aspectRatio",
 		"windowMin", "windowRange", "alphaScale", "stepSize", "scaleZ", "rescaleIntercept", "tintColor",
 		"densityThreshold", "ambientIntensity", "diffuseIntensity", "specularIntensity", "clipPlane",
-		"enableClip", "volumeTex", "transferTex"} {
+		"enableClip", "volumeTex", "transferTex", "depthCue"} {
 		gr.uniforms[name] = gl.Call("getUniformLocation", gr.program, name)
 	}
 
@@ -476,6 +477,14 @@ func (gr *GPUVolumeRenderer) GetDensityThreshold() float64 {
 func (gr *GPUVolumeRenderer) SetLighting(ambient, diffuse, specular float64) {
 	gr.mu.Lock()
 	gr.ambientIntensity, gr.diffuseIntensity, gr.specularIntensity = ambient, diffuse, specular
+	gr.needsRender = true
+	gr.mu.Unlock()
+}
+
+// SetDepthCue sets how much samples darken with ray depth (0 = off).
+func (gr *GPUVolumeRenderer) SetDepthCue(v float64) {
+	gr.mu.Lock()
+	gr.depthCue = v
 	gr.needsRender = true
 	gr.mu.Unlock()
 }
@@ -722,6 +731,7 @@ func (gr *GPUVolumeRenderer) Render() (result *image.RGBA) {
 	alpha := float32(gr.alphaScale)
 	density := float32(gr.densityThreshold)
 	amb, dif, spec := float32(gr.ambientIntensity), float32(gr.diffuseIntensity), float32(gr.specularIntensity)
+	depthCue := float32(gr.depthCue)
 	clip, enableClip := gr.clipPlane, gr.enableClip
 	bg := gr.bgColor
 	vols := append([]*ActiveVolume(nil), gr.volumes...)
@@ -772,6 +782,7 @@ func (gr *GPUVolumeRenderer) Render() (result *image.RGBA) {
 	gl.Call("uniform1f", u["ambientIntensity"], amb)
 	gl.Call("uniform1f", u["diffuseIntensity"], dif)
 	gl.Call("uniform1f", u["specularIntensity"], spec)
+	gl.Call("uniform1f", u["depthCue"], depthCue)
 	gl.Call("uniform4f", u["clipPlane"], clip[0], clip[1], clip[2], clip[3])
 	clipFlag := 0
 	if enableClip {

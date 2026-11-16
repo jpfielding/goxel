@@ -104,3 +104,13 @@ func TestFitDistance(t *testing.T) {
 	assert.InDelta(t, 1.01, fitDistance(0.40625), 0.01)
 	assert.Equal(t, 5.0, fitDistance(100))
 }
+
+func TestSlicePlaneCorners(t *testing.T) {
+	c := slicePlaneCorners(Axial, 0, 2, 0.5)
+	assert.Equal(t, [3]float64{0, 0, 0.125}, c[0])
+	assert.Equal(t, [3]float64{1, 1, 0.125}, c[2])
+	c = slicePlaneCorners(Coronal, 1, 2, 0.5)
+	assert.Equal(t, [3]float64{1, 0.75, 0.5}, c[2])
+	c = slicePlaneCorners(Sagittal, 1, 4, 2)
+	assert.Equal(t, [3]float64{0.375, 1, 2}, c[2])
+}

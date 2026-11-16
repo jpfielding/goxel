@@ -54,7 +54,10 @@ func (v *Viewer) toggleFocusVolume() {
 
 // slicePlaneTools: the slice-plane outline toggle and the cutaway pair.
 func (v *Viewer) slicePlaneTools() fyne.CanvasObject {
-	plane := newCheck("Slice plane", v.st.showSlicePlane, func(b bool) { v.st.showSlicePlane = b })
+	plane := newCheck("Slice plane", v.st.showSlicePlane, func(b bool) {
+		v.st.showSlicePlane = b
+		v.volumeRenderer.Refresh()
+	})
 	reverse := newCheck("Reverse cutaway", v.st.reverseCutaway, func(b bool) {
 		v.st.reverseCutaway = b
 		v.applyCutaway()
@@ -243,7 +246,8 @@ func (v *Viewer) lightingRows() fyne.CanvasObject {
 			v.applyLighting()
 		}, nil).obj
 	}
-	return container.NewVBox(row("Ambient", &v.st.ambient), row("Diffuse", &v.st.diffuse), row("Specular", &v.st.specular))
+	return container.NewVBox(row("Depth cue", &v.st.depthCue), row("Ambient", &v.st.ambient),
+		row("Diffuse", &v.st.diffuse), row("Specular", &v.st.specular))
 }
 
 // showPopupBelow shows content in a popup under anchor, at the given width.

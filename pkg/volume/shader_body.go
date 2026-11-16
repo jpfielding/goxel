@@ -53,6 +53,7 @@ uniform float diffuseIntensity;
 uniform float specularIntensity;
 uniform vec4 clipPlane;
 uniform bool enableClip;
+uniform float depthCue;
 
 // Ray-box intersection for box [0,1]x[0,1]x[0,scaleZ]
 vec2 intersectBox(vec3 origin, vec3 dir) {
@@ -160,6 +161,12 @@ void main() {
             } else {
                 // Flat region: ambient-only lighting
                 sampleColor.rgb *= ambientIntensity;
+            }
+
+            // Depth cue: darken samples further along the ray (0 = off).
+            if (depthCue > 0.0) {
+                float depthFrac = clamp((t - tNear) / max(tFar - tNear, 1e-4), 0.0, 1.0);
+                sampleColor.rgb *= 1.0 - depthCue * depthFrac;
             }
 
             // Smoother opacity curve (cube root for softer falloff, then square for surfaces)

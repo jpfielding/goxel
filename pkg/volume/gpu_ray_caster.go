@@ -84,6 +84,7 @@ type GPUVolumeRenderer struct {
 	ambientIntensity  float64 // Ambient lighting coefficient (0-1)
 	diffuseIntensity  float64 // Diffuse lighting coefficient (0-1)
 	specularIntensity float64 // Specular lighting coefficient (0-1)
+	depthCue          float64 // Darkening with ray depth (0 = off)
 
 	// Clipping Plane
 	clipPlane  [4]float32
@@ -145,6 +146,7 @@ type volumeUniforms struct {
 	densityThreshold  int32
 	tintColor         int32
 	volumeTex         int32
+	depthCue          int32
 }
 
 const lineVertexShaderSource = `
@@ -387,6 +389,7 @@ func (gr *GPUVolumeRenderer) cacheUniforms() {
 		densityThreshold:  gl.GetUniformLocation(gr.program, gl.Str("densityThreshold\x00")),
 		tintColor:         gl.GetUniformLocation(gr.program, gl.Str("tintColor\x00")),
 		volumeTex:         gl.GetUniformLocation(gr.program, gl.Str("volumeTex\x00")),
+		depthCue:          gl.GetUniformLocation(gr.program, gl.Str("depthCue\x00")),
 	}
 }
 
@@ -601,6 +604,14 @@ func (gr *GPUVolumeRenderer) SetLighting(ambient, diffuse, specular float64) {
 	gr.ambientIntensity = ambient
 	gr.diffuseIntensity = diffuse
 	gr.specularIntensity = specular
+	gr.needsRender = true
+	gr.mu.Unlock()
+}
+
+// SetDepthCue sets how much samples darken with ray depth (0 = off, 1 = black at the far side).
+func (gr *GPUVolumeRenderer) SetDepthCue(v float64) {
+	gr.mu.Lock()
+	gr.depthCue = v
 	gr.needsRender = true
 	gr.mu.Unlock()
 }
@@ -1141,6 +1152,7 @@ func (gr *GPUVolumeRenderer) renderInternal() *image.RGBA {
 	gl.Uniform1f(gr.uniforms.ambientIntensity, float32(gr.ambientIntensity))
 	gl.Uniform1f(gr.uniforms.diffuseIntensity, float32(gr.diffuseIntensity))
 	gl.Uniform1f(gr.uniforms.specularIntensity, float32(gr.specularIntensity))
+	gl.Uniform1f(gr.uniforms.depthCue, float32(gr.depthCue))
 
 	// Clipping
 	gl.Uniform4f(gr.uniforms.clipPlane, gr.clipPlane[0], gr.clipPlane[1], gr.clipPlane[2], gr.clipPlane[3])

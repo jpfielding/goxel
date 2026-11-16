@@ -77,6 +77,7 @@ func NewViewer(a fyne.App) *Viewer {
 
 	v.volumeRenderer = NewVolumeRenderer()
 	v.volumeRenderer.DragPans = func() bool { return v.st.dragPans }
+	v.volumeRenderer.Overlay = v.slicePlaneOverlay
 
 	v.content = container.NewStack()
 	v.root = container.New(&responsiveLayout{v: v}, v.content)
@@ -149,6 +150,7 @@ func (v *Viewer) sync() {
 	for _, f := range v.syncers {
 		f()
 	}
+	v.volumeRenderer.Refresh() // slice-plane outline and readout
 }
 
 func (v *Viewer) onSync(f func()) { v.syncers = append(v.syncers, f) }
@@ -340,6 +342,7 @@ func (v *Viewer) applyAll3D() {
 	vr.SetAlphaScale(v.st.opacity)
 	vr.SetDensityThreshold(v.st.density)
 	vr.SetLighting(v.st.ambient, v.st.diffuse, v.st.specular)
+	vr.SetDepthCue(v.st.depthCue)
 	vr.SetQuality(int(v.st.quality))
 	v.applyPalette()
 	v.applyCutaway()
@@ -372,6 +375,7 @@ func (v *Viewer) applyDensity() {
 
 func (v *Viewer) applyLighting() {
 	v.volumeRenderer.SetLighting(v.st.ambient, v.st.diffuse, v.st.specular)
+	v.volumeRenderer.SetDepthCue(v.st.depthCue)
 	v.redraw3D()
 }
 
@@ -498,4 +502,40 @@ func spacingOr1(s float64) float64 {
 		return 1
 	}
 	return s
+}
+
+// slicePlaneOverlay outlines the 2D slice in the 3D view and names it in the
+// corner, as roxel does. It never implies correspondence for a 2D source
+// that is not a 3D volume (projections) or for the composite projection.
+func (v *Viewer) slicePlaneOverlay() ([][3]float64, string) {
+	if !v.cutawayAvailable() || !(v.st.showSlicePlane || v.st.cutaway) {
+		return nil, ""
+	}
+	what := "Slice plane"
+	if v.st.cutaway {
+		what = "Cutaway"
+		if v.st.reverseCutaway {
+			what = "Cutaway, reversed"
+		}
+	}
+	count := v.dicox.MaxSlice() + 1
+	readout := fmt.Sprintf("%s  ·  %s %d / %d", what, orientationLabels[v.st.orientation], v.st.sliceIndex+1, count)
+	if !v.st.showSlicePlane {
+		return nil, readout
+	}
+	return slicePlaneCorners(v.st.orientation, v.st.sliceIndex, count, v.volumeRenderer.scaleZ), readout
+}
+
+// slicePlaneCorners is the slice's rectangle in box space [0,1]x[0,1]x[0,scaleZ].
+func slicePlaneCorners(o ViewOrientation, slice, count int, scaleZ float64) [][3]float64 {
+	f := (float64(slice) + 0.5) / float64(max(count, 1))
+	switch o {
+	case Coronal:
+		return [][3]float64{{0, f, 0}, {1, f, 0}, {1, f, scaleZ}, {0, f, scaleZ}}
+	case Sagittal:
+		return [][3]float64{{f, 0, 0}, {f, 1, 0}, {f, 1, scaleZ}, {f, 0, scaleZ}}
+	default:
+		z := f * scaleZ
+		return [][3]float64{{0, 0, z}, {1, 0, z}, {1, 1, z}, {0, 1, z}}
+	}
 }
