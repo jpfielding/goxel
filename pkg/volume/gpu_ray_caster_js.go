@@ -44,7 +44,7 @@ const (
 	glFramebufferOK     = 0x8CD5
 	glColorBufferBit    = 0x4000
 	glBlend             = 0x0BE2
-	glSrcAlpha          = 0x0302
+	glOne               = 1
 	glOneMinusSrcAlpha  = 0x0303
 	glTriangles         = 0x0004
 	glVertexShader      = 0x8B31
@@ -784,7 +784,7 @@ func (gr *GPUVolumeRenderer) Render() (result *image.RGBA) {
 	gl.Call("uniform1i", u["transferTex"], 1)
 
 	gl.Call("enable", glBlend)
-	gl.Call("blendFunc", glSrcAlpha, glOneMinusSrcAlpha)
+	gl.Call("blendFunc", glOne, glOneMinusSrcAlpha) // premultiplied, as on desktop
 	gl.Call("bindVertexArray", gr.vao)
 	for _, vol := range vols {
 		if vol.Texture.IsUndefined() {

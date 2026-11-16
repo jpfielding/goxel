@@ -75,27 +75,25 @@ func (v *Viewer) LoadSample() {
 // loadBuffer reads bytes with read, parses them, and installs the study on
 // the UI goroutine. It must run on its own goroutine: read blocks on promises.
 func (v *Viewer) loadBuffer(name string, read func() ([]byte, error)) {
-	data, err := read()
-	if err != nil {
-		v.reportLoadError(err)
+	started := make(chan bool, 1)
+	fyne.Do(func() { started <- v.beginLoad(name) })
+	if !<-started {
 		return
 	}
-	slog.Info("Loading buffer", "name", name, "bytes", len(data))
-	scan, err := LoadBytes(name, data)
-	if err != nil {
-		v.reportLoadError(err)
-		return
-	}
-	fyne.Do(func() {
-		if err := v.SetScanData(scan); err != nil {
-			dialog.ShowError(err, v.win)
+	scan, err := func() (*ScanCollection, error) {
+		data, err := read()
+		if err != nil {
+			return nil, err
 		}
-	})
+		slog.Info("Loading buffer", "name", name, "bytes", len(data))
+		return LoadBytes(name, data)
+	}()
+	fyne.Do(func() { v.finishLoad(name, scan, err) })
 }
 
-func (v *Viewer) reportLoadError(err error) {
-	slog.Error("Load failed", "error", err)
-	fyne.Do(func() { dialog.ShowError(err, v.win) })
+// hasTouch reports whether the browser has a touch screen.
+func hasTouch() bool {
+	return js.Global().Get("navigator").Get("maxTouchPoints").Int() > 0
 }
 
 // await blocks the calling goroutine until promise settles.

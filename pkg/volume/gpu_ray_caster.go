@@ -1157,7 +1157,10 @@ func (gr *GPUVolumeRenderer) renderInternal() *image.RGBA {
 
 	// Enable Additive Blending for multi-volume
 	gl.Enable(gl.BLEND)
-	gl.BlendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
+	// The ray march outputs premultiplied colour (accum.rgb already carries
+	// alpha), so blend with ONE, not SRC_ALPHA, or every sample is darkened
+	// twice; on the dark theme background that left the volume near black.
+	gl.BlendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA)
 
 	// Render each volume
 	gl.BindVertexArray(gr.vao)

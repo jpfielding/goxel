@@ -7,85 +7,124 @@ import (
 	"fyne.io/fyne/v2/theme"
 )
 
-// ProSightTheme implements a dark professional theme matching the ProSight workstation
-type ProSightTheme struct{}
-
-var _ fyne.Theme = (*ProSightTheme)(nil)
-
-// Color definitions
+// Palette tokens, matching roxel's dark theme.
 var (
-	// Background colors
-	colorBackground      = color.NRGBA{R: 26, G: 26, B: 46, A: 255} // #1a1a2e
-	colorBackgroundLight = color.NRGBA{R: 38, G: 38, B: 66, A: 255} // #262642
-
-	// Accent colors
-	colorPrimary = color.NRGBA{R: 124, G: 58, B: 237, A: 255} // #7c3aed purple
-
-	// Text colors
-	colorTextLight = color.NRGBA{R: 224, G: 224, B: 224, A: 255} // #e0e0e0
-
-	// Button colors
-	colorDanger  = color.NRGBA{R: 239, G: 68, B: 68, A: 255}  // #ef4444 red
-	colorWarning = color.NRGBA{R: 236, G: 72, B: 153, A: 255} // #ec4899 pink
-	colorSuccess = color.NRGBA{R: 34, G: 197, B: 94, A: 255}  // #22c55e green
-
-	// Borders
-	colorBorder   = color.NRGBA{R: 75, G: 75, B: 100, A: 255}
-	colorDisabled = color.NRGBA{R: 100, G: 100, B: 120, A: 255}
+	colBG       = color.NRGBA{16, 22, 29, 255}
+	colPanel    = color.NRGBA{23, 31, 40, 255}
+	colText     = color.NRGBA{222, 231, 239, 255}
+	colHeading  = color.NRGBA{244, 248, 251, 255}
+	colMuted    = color.NRGBA{184, 196, 208, 255}
+	colAccent   = color.NRGBA{105, 211, 191, 255}
+	colDanger   = color.NRGBA{246, 151, 141, 255}
+	colSelected = color.NRGBA{36, 81, 80, 255}
+	colOutline  = color.NRGBA{124, 148, 168, 255}
+	colRail     = color.NRGBA{104, 126, 146, 255}
+	colThumb    = color.NRGBA{236, 242, 247, 255}
+	colHairline = color.NRGBA{48, 62, 76, 255}
+	colWell     = color.NRGBA{0, 0, 0, 255}
+	colControl  = color.NRGBA{38, 52, 66, 255}
+	colHover    = color.NRGBA{52, 70, 86, 255}
+	colOpenCard = color.NRGBA{27, 47, 52, 255}
 )
 
-func (t *ProSightTheme) Color(name fyne.ThemeColorName, variant fyne.ThemeVariant) color.Color {
-	switch name {
-	case theme.ColorNameBackground:
-		return colorBackground
-	case theme.ColorNameButton:
-		return colorBackgroundLight
-	case theme.ColorNameDisabledButton, theme.ColorNameDisabled:
-		return colorDisabled
-	case theme.ColorNameError:
-		return colorDanger
-	case theme.ColorNameFocus, theme.ColorNamePrimary, theme.ColorNameSelection, theme.ColorNamePressed:
-		return colorPrimary
-	case theme.ColorNameForeground:
-		return colorTextLight
-	case theme.ColorNameHover, theme.ColorNameInputBackground, theme.ColorNameMenuBackground:
-		return colorBackgroundLight
-	case theme.ColorNameInputBorder, theme.ColorNameScrollBar, theme.ColorNameSeparator:
-		return colorBorder
-	case theme.ColorNameOverlayBackground:
-		return colorBackground
-	case theme.ColorNamePlaceHolder:
-		return colorDisabled
-	case theme.ColorNameSuccess:
-		return colorSuccess
-	case theme.ColorNameWarning:
-		return colorWarning
-	case theme.ColorNameShadow:
-		return color.NRGBA{A: 100}
-	}
-	return theme.DefaultTheme().Color(name, variant)
+// goxelTheme is the one Fyne theme: dark only, with larger type and touch
+// targets when the layout is compact.
+type goxelTheme struct {
+	compact bool
 }
 
-func (t *ProSightTheme) Font(style fyne.TextStyle) fyne.Resource {
+var _ fyne.Theme = (*goxelTheme)(nil)
+
+// NewTheme returns goxel's theme in its desktop sizes.
+func NewTheme() fyne.Theme { return &goxelTheme{} }
+
+func (t *goxelTheme) Color(name fyne.ThemeColorName, _ fyne.ThemeVariant) color.Color {
+	switch name {
+	case theme.ColorNameBackground:
+		return colBG
+	case theme.ColorNameOverlayBackground, theme.ColorNameMenuBackground, theme.ColorNameHeaderBackground:
+		return colPanel
+	case theme.ColorNameForeground:
+		return colText
+	case theme.ColorNamePlaceHolder, theme.ColorNameDisabled:
+		return colMuted
+	case theme.ColorNamePrimary, theme.ColorNameFocus, theme.ColorNameHyperlink:
+		return colAccent
+	case theme.ColorNameForegroundOnPrimary:
+		return colBG
+	case theme.ColorNameSelection, theme.ColorNamePressed:
+		return colSelected
+	// Segmented controls mark their selected segment with SuccessImportance.
+	case theme.ColorNameSuccess:
+		return colSelected
+	case theme.ColorNameForegroundOnSuccess:
+		return colHeading
+	case theme.ColorNameButton, theme.ColorNameInputBackground:
+		return colControl
+	case theme.ColorNameDisabledButton:
+		return colPanel
+	case theme.ColorNameHover:
+		return colHover
+	case theme.ColorNameInputBorder:
+		return colOutline
+	case theme.ColorNameSeparator:
+		return colHairline
+	case theme.ColorNameScrollBar:
+		return colRail
+	case theme.ColorNameError, theme.ColorNameForegroundOnError:
+		return colDanger
+	case theme.ColorNameShadow:
+		return color.NRGBA{0, 0, 0, 90}
+	}
+	return theme.DefaultTheme().Color(name, theme.VariantDark)
+}
+
+func (t *goxelTheme) Font(style fyne.TextStyle) fyne.Resource {
 	return theme.DefaultTheme().Font(style)
 }
 
-func (t *ProSightTheme) Icon(name fyne.ThemeIconName) fyne.Resource {
+func (t *goxelTheme) Icon(name fyne.ThemeIconName) fyne.Resource {
 	return theme.DefaultTheme().Icon(name)
 }
 
-func (t *ProSightTheme) Size(name fyne.ThemeSizeName) float32 {
+func (t *goxelTheme) Size(name fyne.ThemeSizeName) float32 {
 	switch name {
-	case theme.SizeNamePadding:
-		return 6
-	case theme.SizeNameInnerPadding:
-		return 4
 	case theme.SizeNameText:
-		return 13
+		if t.compact {
+			return 16
+		}
+		return 13.5
+	case theme.SizeNameCaptionText:
+		if t.compact {
+			return 13
+		}
+		return 12
+	case theme.SizeNameSubHeadingText:
+		if t.compact {
+			return 18
+		}
+		return 17
 	case theme.SizeNameHeadingText:
-		return 20
-	case theme.SizeNameInputRadius, theme.SizeNameSelectionRadius:
+		return 21
+	case theme.SizeNamePadding:
 		return 4
+	case theme.SizeNameInnerPadding:
+		if t.compact {
+			return 12
+		}
+		return 8
+	case theme.SizeNameInputRadius, theme.SizeNameSelectionRadius:
+		return 5
+	case theme.SizeNameSeparatorThickness:
+		return 1
 	}
 	return theme.DefaultTheme().Size(name)
 }
+
+// markSVG is goxel's hexagon mark (the same shape roxel uses), in ACCENT.
+const markSVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<polygon points="32,4 56,18 56,46 32,60 8,46 8,18" fill="none" stroke="#69d3bf" stroke-width="5" stroke-linejoin="round"/>
+<polygon points="32,20 42,26 42,38 32,44 22,38 22,26" fill="#69d3bf"/>
+</svg>`
+
+var markResource = fyne.NewStaticResource("goxel-mark.svg", []byte(markSVG))

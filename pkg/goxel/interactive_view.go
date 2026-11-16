@@ -9,14 +9,19 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
-// Interactive2DView wraps the 2D image and handles ROI annotation
+// Interactive2DView shows the 2D slice centred in a black well. Zoom scales
+// the fitted image; a drag pans it, or draws an ROI when annotating.
 type Interactive2DView struct {
 	widget.BaseWidget
 	image     *canvas.Image
+	well      *canvas.Rectangle
 	overlay   *canvas.Rectangle // The box being drawn
 	isDrawing bool
 	startPos  fyne.Position
 	endPos    fyne.Position
+
+	zoom       float32 // 1 = fit
+	panX, panY float32
 
 	OnAnnotationAdded func(x, y, w, h float32)
 	viewer            *Viewer // Reference to check annotation mode
@@ -25,8 +30,10 @@ type Interactive2DView struct {
 func NewInteractive2DView(img *canvas.Image, v *Viewer) *Interactive2DView {
 	iv := &Interactive2DView{
 		image:   img,
+		well:    canvas.NewRectangle(colWell),
 		overlay: canvas.NewRectangle(color.RGBA{255, 0, 0, 100}),
 		viewer:  v,
+		zoom:    1,
 	}
 	iv.overlay.Hide()
 	iv.overlay.StrokeWidth = 2
@@ -35,13 +42,29 @@ func NewInteractive2DView(img *canvas.Image, v *Viewer) *Interactive2DView {
 	return iv
 }
 
+// SetZoom sets the zoom in percent (100 = fit) and recentres when fitting.
+func (iv *Interactive2DView) SetZoom(percent float64) {
+	iv.zoom = float32(percent / 100)
+	if iv.zoom <= 1 {
+		iv.panX, iv.panY = 0, 0
+	}
+	iv.Refresh()
+}
+
 func (iv *Interactive2DView) CreateRenderer() fyne.WidgetRenderer {
 	iv.image.FillMode = canvas.ImageFillStretch
 	return &interactive2DRenderer{iv: iv}
 }
 
+func (iv *Interactive2DView) annotating() bool {
+	return iv.viewer != nil && iv.viewer.isAnnotating
+}
+
 func (iv *Interactive2DView) Dragged(e *fyne.DragEvent) {
-	if !iv.viewer.isAnnotating {
+	if !iv.annotating() {
+		iv.panX += e.Dragged.DX
+		iv.panY += e.Dragged.DY
+		iv.Refresh()
 		return
 	}
 	iv.endPos = e.PointEvent.Position
@@ -49,38 +72,30 @@ func (iv *Interactive2DView) Dragged(e *fyne.DragEvent) {
 }
 
 func (iv *Interactive2DView) DragEnd() {
-	if !iv.viewer.isAnnotating || !iv.isDrawing {
+	if !iv.annotating() || !iv.isDrawing {
 		return
 	}
 	iv.isDrawing = false
 	iv.viewer.isAnnotating = false // Exit mode after one annotation
 
-	// Normalize coordinates
-	x1 := float32(iv.startPos.X)
-	y1 := float32(iv.startPos.Y)
-	x2 := float32(iv.endPos.X)
-	y2 := float32(iv.endPos.Y)
-
+	x1, y1 := iv.startPos.X, iv.startPos.Y
+	x2, y2 := iv.endPos.X, iv.endPos.Y
 	if x1 > x2 {
 		x1, x2 = x2, x1
 	}
 	if y1 > y2 {
 		y1, y2 = y2, y1
 	}
-
-	w := x2 - x1
-	h := y2 - y1
-
+	w, h := x2-x1, y2-y1
 	if w > 5 && h > 5 && iv.OnAnnotationAdded != nil {
 		iv.OnAnnotationAdded(x1, y1, w, h)
 	}
-
 	iv.overlay.Hide()
 	iv.Refresh()
 }
 
 func (iv *Interactive2DView) MouseDown(e *desktop.MouseEvent) {
-	if !iv.viewer.isAnnotating {
+	if !iv.annotating() {
 		return
 	}
 	if e.Button == desktop.MouseButtonPrimary {
@@ -92,8 +107,23 @@ func (iv *Interactive2DView) MouseDown(e *desktop.MouseEvent) {
 	}
 }
 
-func (iv *Interactive2DView) MouseUp(e *desktop.MouseEvent) {
-	// Handled by DragEnd usually, but if no drag occurred?
+func (iv *Interactive2DView) MouseUp(*desktop.MouseEvent) {}
+
+// imageSize is the slice's pixel size for the current orientation.
+func (iv *Interactive2DView) imageSize() (float32, float32) {
+	if iv.viewer != nil && iv.viewer.dicox != nil {
+		b := iv.viewer.dicox.Bounds()
+		if b.Dx() > 0 && b.Dy() > 0 {
+			return float32(b.Dx()), float32(b.Dy())
+		}
+	}
+	if iv.image.Image != nil {
+		b := iv.image.Image.Bounds()
+		if b.Dx() > 0 && b.Dy() > 0 {
+			return float32(b.Dx()), float32(b.Dy())
+		}
+	}
+	return 1, 1
 }
 
 type interactive2DRenderer struct {
@@ -101,110 +131,42 @@ type interactive2DRenderer struct {
 }
 
 func (r *interactive2DRenderer) Layout(size fyne.Size) {
-	// Aspect Fit, Top Aligned
-	// We need the intrinsic aspect ratio.
-	// canvas.Image doesn't expose it easily unless we check the underlying Image?
-	// We can get aspect from r.iv.viewer.dicox.
-	// Or try to rely on image bounds.
+	iv := r.iv
+	iv.well.Move(fyne.NewPos(0, 0))
+	iv.well.Resize(size)
 
-	aspect := float32(1.0)
-	if r.iv.viewer.dicox != nil && r.iv.viewer.dicox.Width() > 0 {
-		// DICOX aspect depends on orientation.
-		// Width/Height/Depth changes.
-		// Best source is the image itself?
-		// BaseWidget.Size() is current size.
-		// Let's use 1.0 default if unknown.
+	imgW, imgH := iv.imageSize()
+	scale := min(size.Width/imgW, size.Height/imgH) * iv.zoom
+	w, h := imgW*scale, imgH*scale
+	iv.image.Move(fyne.NewPos((size.Width-w)/2+iv.panX, (size.Height-h)/2+iv.panY))
+	iv.image.Resize(fyne.NewSize(w, h))
 
-		// Actually, canvas.ImageFromImage sets the Resource.
-		// We can check r.iv.image.Image.Bounds().
-	}
-
-	// Better approach:
-	// Let's calculate aspect from the dicox orientation.
-	// This requires access to dicox state which might race?
-	// Layout is called on main thread, safe.
-
-	imgW := float32(100)
-	imgH := float32(100)
-
-	// Try to get actual size
-	if r.iv.viewer != nil && r.iv.viewer.dicox != nil {
-		orient := r.iv.viewer.dicox.Orientation()
-		d := r.iv.viewer.dicox
-		switch orient {
-		case Axial:
-			imgW = float32(d.Width())
-			imgH = float32(d.Height())
-		case Coronal:
-			imgW = float32(d.Width())
-			imgH = float32(d.Depth())
-		case Sagittal:
-			imgW = float32(d.Depth())  // Y?
-			imgH = float32(d.Height()) // Z?
-			// Actually Sagittal is usually Depth x Height
-			imgW = float32(d.Height())
-			imgH = float32(d.Depth())
-		}
-		// Fallback simple names: Columns, Rows implies XY
-	} else if r.iv.image.Image != nil {
-		b := r.iv.image.Image.Bounds()
-		imgW = float32(b.Dx())
-		imgH = float32(b.Dy())
-	}
-
-	if imgW == 0 || imgH == 0 {
-		imgW, imgH = 1, 1
-	}
-
-	aspect = imgW / imgH
-
-	viewW := size.Width
-	viewH := size.Height
-
-	// Scale to fit width
-	renderW := viewW
-	renderH := viewW / aspect
-
-	// If height too big, fit height
-	if renderH > viewH {
-		renderH = viewH
-		renderW = viewH * aspect
-	}
-
-	// Position Top-Left (0,0)
-	r.iv.image.Move(fyne.NewPos(0, 0))
-	r.iv.image.Resize(fyne.NewSize(renderW, renderH))
-
-	// Update overlay logic to clip?
-	if r.iv.isDrawing {
-		x1 := float32(r.iv.startPos.X)
-		y1 := float32(r.iv.startPos.Y)
-		x2 := float32(r.iv.endPos.X)
-		y2 := float32(r.iv.endPos.Y)
-
+	if iv.isDrawing {
+		x1, y1 := iv.startPos.X, iv.startPos.Y
+		x2, y2 := iv.endPos.X, iv.endPos.Y
 		if x1 > x2 {
 			x1, x2 = x2, x1
 		}
 		if y1 > y2 {
 			y1, y2 = y2, y1
 		}
-
-		r.iv.overlay.Move(fyne.NewPos(x1, y1))
-		r.iv.overlay.Resize(fyne.NewSize(x2-x1, y2-y1))
+		iv.overlay.Move(fyne.NewPos(x1, y1))
+		iv.overlay.Resize(fyne.NewSize(x2-x1, y2-y1))
 	}
 }
 
 func (r *interactive2DRenderer) MinSize() fyne.Size {
-	return r.iv.image.MinSize()
+	return fyne.NewSize(120, 120)
 }
 
 func (r *interactive2DRenderer) Refresh() {
+	r.Layout(r.iv.Size())
 	r.iv.image.Refresh()
 	canvas.Refresh(r.iv.overlay)
 }
 
 func (r *interactive2DRenderer) Objects() []fyne.CanvasObject {
-	return []fyne.CanvasObject{r.iv.image, r.iv.overlay}
+	return []fyne.CanvasObject{r.iv.well, r.iv.image, r.iv.overlay}
 }
 
 func (r *interactive2DRenderer) Destroy() {}

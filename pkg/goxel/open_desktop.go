@@ -41,3 +41,6 @@ const canOpenFolder = true
 
 // LoadSample is unavailable on desktop; the sample lives in the repository.
 func (v *Viewer) LoadSample() {}
+
+// hasTouch reports a touch screen; the desktop build assumes a mouse.
+func hasTouch() bool { return false }

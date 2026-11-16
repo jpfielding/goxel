@@ -57,6 +57,10 @@ type VolumeRenderer struct {
 
 	// Ensures Destroy is only called once
 	destroyOnce sync.Once
+
+	// DragPans, when set and true, makes a plain drag pan instead of orbit
+	// (the compact layouts' Orbit | Pan toggle).
+	DragPans func() bool
 }
 
 type AlignParams struct {
@@ -507,13 +511,13 @@ func (vr *VolumeRenderer) isBackgroundAt(pos fyne.Position) bool {
 		return false
 	}
 	bounds := rendered.Bounds()
-	widgetSize := vr.Size()
-	if widgetSize.Width <= 0 || widgetSize.Height <= 0 {
+	shown, at := vr.img.Size(), vr.img.Position()
+	if shown.Width <= 0 || shown.Height <= 0 {
 		return false
 	}
-	// Map widget coordinates to image coordinates
-	imgX := int(float64(pos.X) / float64(widgetSize.Width) * float64(bounds.Dx()))
-	imgY := int(float64(pos.Y) / float64(widgetSize.Height) * float64(bounds.Dy()))
+	// Map widget coordinates to image coordinates (the image is centred).
+	imgX := int(float64(pos.X-at.X) / float64(shown.Width) * float64(bounds.Dx()))
+	imgY := int(float64(pos.Y-at.Y) / float64(shown.Height) * float64(bounds.Dy()))
 	if imgX < bounds.Min.X || imgX >= bounds.Max.X || imgY < bounds.Min.Y || imgY >= bounds.Max.Y {
 		return true // Out of bounds = background
 	}
@@ -544,8 +548,9 @@ func (vr *VolumeRenderer) isBackgroundAt(pos fyne.Position) bool {
 // Dragged handles mouse drag for rotation (on volume) or pan (on background)
 func (vr *VolumeRenderer) Dragged(e *fyne.DragEvent) {
 	if vr.useGPU && vr.gpuRenderer != nil {
-		// Check if dragging on background (empty space) → pan
-		if vr.isBackgroundAt(e.Position) {
+		// Pan with Shift held (desktop), when the Pan toggle is on, or when
+		// dragging on empty background (the only option without modifiers).
+		if vr.wantsPan(e.Position) {
 			// Pan: translate the look-at center in screen space
 			zoom := vr.gpuRenderer.GetZoom()
 			panScale := 0.002 * zoom // Scale pan speed by zoom distance
@@ -583,6 +588,97 @@ func (vr *VolumeRenderer) Dragged(e *fyne.DragEvent) {
 		}
 	} else if vr.cpuRenderer != nil {
 		vr.cpuRenderer.Dragged(e)
+	}
+}
+
+// wantsPan reports whether a drag at pos should pan rather than orbit.
+func (vr *VolumeRenderer) wantsPan(pos fyne.Position) bool {
+	if vr.DragPans != nil && vr.DragPans() {
+		return true
+	}
+	if d, ok := fyne.CurrentApp().Driver().(desktop.Driver); ok && d.CurrentKeyModifiers()&fyne.KeyModifierShift != 0 {
+		return true
+	}
+	return vr.isBackgroundAt(pos)
+}
+
+// Orbit rotates the camera by the given angles (radians).
+func (vr *VolumeRenderer) Orbit(dAz, dEl float64) {
+	if vr.gpuRenderer == nil {
+		return
+	}
+	rx, ry := vr.gpuRenderer.GetRotation()
+	vr.gpuRenderer.SetRotation(math.Mod(rx+dAz+2*math.Pi, 2*math.Pi), math.Mod(ry+dEl+2*math.Pi, 2*math.Pi))
+	vr.TriggerRender()
+}
+
+// PanPixels pans the camera as a drag of (dx, dy) screen pixels would.
+func (vr *VolumeRenderer) PanPixels(dx, dy float64) {
+	if vr.gpuRenderer == nil {
+		return
+	}
+	panScale := 0.002 * vr.gpuRenderer.GetZoom()
+	vr.gpuRenderer.AdjustPan(-dx*panScale, dy*panScale)
+	vr.TriggerRender()
+}
+
+// ZoomBy multiplies the camera distance by f (f < 1 zooms in).
+func (vr *VolumeRenderer) ZoomBy(f float64) {
+	if vr.gpuRenderer == nil {
+		return
+	}
+	vr.gpuRenderer.SetZoom(math.Max(0.5, math.Min(5, vr.gpuRenderer.GetZoom()*f)))
+	vr.TriggerRender()
+}
+
+// fitDistance is the camera distance at which the volume box [1 x 1 x
+// scaleZ] fits the view: its bounding sphere against the shader's 0.8
+// half-angle tangent, with a little margin.
+func fitDistance(scaleZ float64) float64 {
+	r := 0.5 * math.Sqrt(2+scaleZ*scaleZ)
+	return math.Max(0.5, math.Min(5, r/0.8*1.1))
+}
+
+// FitView centres the volume and fits it to the view, keeping the angle.
+func (vr *VolumeRenderer) FitView() {
+	if vr.gpuRenderer == nil {
+		vr.ResetView()
+		return
+	}
+	vr.gpuRenderer.SetPan(0, 0)
+	vr.gpuRenderer.SetZoom(fitDistance(vr.gpuRenderer.Params().ScaleZ))
+	vr.TriggerRender()
+}
+
+// LookAlong points the camera down volume axis 0 (X), 1 (Y) or 2 (Z), then fits.
+func (vr *VolumeRenderer) LookAlong(axis int) {
+	if vr.gpuRenderer == nil {
+		return
+	}
+	switch axis {
+	case 0:
+		vr.gpuRenderer.SetRotation(math.Pi/2, 0)
+	case 1:
+		vr.gpuRenderer.SetRotation(0, math.Pi/2-0.01)
+	default:
+		vr.gpuRenderer.SetRotation(0, 0)
+	}
+	vr.FitView()
+}
+
+// IsGPU reports whether the GPU renderer is active (else the CPU fallback).
+func (vr *VolumeRenderer) IsGPU() bool { return vr.useGPU && vr.gpuRenderer != nil }
+
+// Redraw renders the current state: queued on the GPU path, inline on CPU.
+func (vr *VolumeRenderer) Redraw() {
+	if vr.IsGPU() {
+		vr.TriggerRender()
+		return
+	}
+	if vr.cpuRenderer != nil {
+		vr.cpuRenderer.NeedsRender = true
+		vr.cpuRenderer.Render()
+		vr.Refresh()
 	}
 }
 
@@ -637,9 +733,9 @@ func (vr *VolumeRenderer) Cursor() desktop.Cursor {
 	return desktop.DefaultCursor
 }
 
-// MinSize returns the minimum size
+// MinSize returns the minimum size; kept small so phone layouts can shrink.
 func (vr *VolumeRenderer) MinSize() fyne.Size {
-	return fyne.NewSize(300, 300)
+	return fyne.NewSize(120, 120)
 }
 
 // ResetView resets camera to default position
@@ -669,12 +765,17 @@ func (vr *VolumeRenderer) SetBackgroundColor(c color.Color) {
 	vr.TriggerRender()
 }
 
-// SetQuality sets the rendering quality mode (0=Fast, 1=Medium, 2=High)
+// SetQuality sets the rendering quality mode (0=Fast, 1=Medium, 2=High).
+// On the GPU path it sets the ray step size.
 func (vr *VolumeRenderer) SetQuality(mode int) {
 	if vr.cpuRenderer != nil {
 		vr.cpuRenderer.SetQuality(mode)
 	}
-	// GPU renderer doesn't have quality modes yet
+	if vr.gpuRenderer != nil {
+		p := vr.gpuRenderer.Params()
+		p.StepSize = renderQuality(mode).stepSize()
+		vr.gpuRenderer.SetParams(p)
+	}
 }
 
 // SetTransferFunction changes the colormap/transfer function used for rendering
@@ -704,7 +805,8 @@ type volumeWidgetRenderer struct {
 }
 
 func (r *volumeWidgetRenderer) Layout(size fyne.Size) {
-	// Top align aspect fit
+	// Aspect fit, centred: the clear colour matches the theme background, so
+	// the square render blends into the viewport.
 	aspect := float32(1.0)
 	if r.vr.dimX > 0 && r.vr.dimY > 0 {
 		aspect = float32(r.vr.dimX) / float32(r.vr.dimY)
@@ -721,12 +823,12 @@ func (r *volumeWidgetRenderer) Layout(size fyne.Size) {
 		renderW = viewH * aspect
 	}
 
-	r.img.Move(fyne.NewPos(0, 0))
+	r.img.Move(fyne.NewPos((viewW-renderW)/2, (viewH-renderH)/2))
 	r.img.Resize(fyne.NewSize(renderW, renderH))
 }
 
 func (r *volumeWidgetRenderer) MinSize() fyne.Size {
-	return fyne.NewSize(300, 300)
+	return fyne.NewSize(120, 120)
 }
 
 func (r *volumeWidgetRenderer) Refresh() {

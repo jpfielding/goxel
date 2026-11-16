@@ -3,336 +3,150 @@ package goxel
 import (
 	"image/color"
 	"log/slog"
+	"math"
+	"path/filepath"
 	"sort"
 )
 
-// SetScanData configures the viewer with data from a ScanCollection.
-// This is the unified entry point for all file/directory loading.
+// SetScanData installs a loaded study. It is the single entry point for all
+// file and folder loading, and must run on the UI goroutine.
 func (v *Viewer) SetScanData(scan *ScanCollection) error {
 	slog.Info("SetScanData", slog.String("path", scan.SourcePath),
 		slog.Int("volumes", len(scan.Volumes)),
 		slog.Int("findings", len(scan.Findings)))
 
-	// Get primary volume for 2D viewer setup
 	primary := scan.PrimaryVolume()
 	if primary == nil {
 		slog.Warn("No volumes found in scan")
 		return nil
 	}
-	slog.Info("Primary volume selected",
-		slog.String("name", primary.Name),
-		slog.Int("width", primary.Width),
-		slog.Int("height", primary.Height),
-		slog.Int("depth", primary.Depth),
-		slog.Float64("voxelX", primary.VoxelSizeX),
-		slog.Float64("voxelY", primary.VoxelSizeY),
-		slog.Float64("voxelZ", primary.VoxelSizeZ))
-
-	// Set viewer metadata
-	v.imageRows = primary.Height
-	v.imageCols = primary.Width
-	v.bitsAllocated = 16
-	v.pixelRepresentation = primary.PixelRep
-
-	// Convert primary volume to 3D int slice for DICOXImage
-	volumeData := make([][][]int, primary.Depth)
-	for z := 0; z < primary.Depth; z++ {
-		volumeData[z] = make([][]int, primary.Height)
-		sliceOffset := z * primary.Width * primary.Height
-		for y := 0; y < primary.Height; y++ {
-			volumeData[z][y] = make([]int, primary.Width)
-			rowOffset := y * primary.Width
-			for x := 0; x < primary.Width; x++ {
-				idx := sliceOffset + rowOffset + x
-				if idx < len(primary.Data) {
-					volumeData[z][y][x] = int(primary.Data[idx])
-				}
-			}
-		}
+	v.scan = scan
+	v.primary = primary
+	if v.st.loadedName == "" {
+		v.st.loadedPath = scan.SourcePath
+		v.st.loadedName = filepath.Base(scan.SourcePath)
 	}
 
-	// Apply window/level - clamp to int16 range before casting
-	wl := scan.WindowLevel
-	ww := scan.WindowWidth
-	if wl < 0 {
-		wl = 0
-	} else if wl > 32767 {
-		wl = 32767
-	}
-	if ww < 0 {
-		ww = 0
-	} else if ww > 32767 {
-		ww = 32767
-	}
-
-	v.dicox.SetWindowLevel(int(wl))
-	v.dicox.SetWindowWidth(int(ww))
-	v.dicox.SetVolume(volumeData, primary.Width, primary.Height, primary.Depth)
-
-	// Find first non-empty slice
-	firstNonEmptySlice := 0
-	for z := 0; z < primary.Depth; z++ {
-		sliceOffset := z * primary.Width * primary.Height
-		for i := sliceOffset; i < sliceOffset+primary.Width*primary.Height && i < len(primary.Data); i++ {
-			if primary.Data[i] != 0 {
-				firstNonEmptySlice = z
-				break
-			}
-		}
-		if firstNonEmptySlice != 0 {
-			break
-		}
-	}
-
-	// Default to Coronal view with slice 50 (or max if out of range)
-	v.dicox.SetOrientation(Coronal)
-	initialSlice := 50
-	maxSlice := primary.Height - 1 // Coronal scrolls Y dimension
-	if initialSlice > maxSlice {
-		initialSlice = maxSlice
-	}
-	if initialSlice < 0 {
-		initialSlice = 0
-	}
-	v.currentFrame = initialSlice
-	v.setFrame(v.currentFrame)
-
-	// Sort keys for deterministic color assignment
 	keys := make([]string, 0, len(scan.Volumes))
 	for k := range scan.Volumes {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 
-	// Convert all volumes to CompositeVolume format
 	v.compositeVolumes = make(map[string]*CompositeVolume)
+	var primaryKey string
 	for _, name := range keys {
 		vol := scan.Volumes[name]
-		frames := make([]Frame, vol.Depth)
-		sliceSize := vol.Width * vol.Height
-		for z := 0; z < vol.Depth; z++ {
-			offset := z * sliceSize
-			end := offset + sliceSize
-			if end > len(vol.Data) {
-				end = len(vol.Data)
-			}
-			frames[z] = Frame{Data: vol.Data[offset:end]}
-		}
-
-		pd := &PixelData{
-			IsEncapsulated: false,
-			Frames:         frames,
-		}
-
-		wl, ww := CalculateWindowFromData(vol.Data)
-
-		// Generate color based on index
-		// Use White (255, 255, 255) to allow the Transfer Function (ColorMap)
-		// to define the material coloring (Orange/Green/Blue based on density).
-		// Tinting overrides the transfer function, which we want to avoid for the main view.
-		var c color.RGBA = color.RGBA{255, 255, 255, 255}
-
-		// Defaults
-		alpha := 0.5
-		enabled := false
-
-		// Enable only the primary volume by default to avoid clutter/overlapping
 		if vol == primary {
-			enabled = true
+			primaryKey = name
 		}
-
+		wl, ww := CalculateWindowFromData(vol.Data)
 		v.compositeVolumes[name] = &CompositeVolume{
 			Name:             name,
 			SourcePath:       vol.SourcePath,
-			PixelData:        pd,
+			PixelData:        framesOf(vol.Data, vol.Width, vol.Height, vol.Depth),
 			Rows:             vol.Height,
 			Cols:             vol.Width,
 			PixelRep:         vol.PixelRep,
 			RescaleIntercept: vol.RescaleIntercept,
 			WindowCenter:     wl,
 			WindowWidth:      ww,
-			Enabled:          enabled,
-			Color:            c,
-			Alpha:            alpha,
+			Enabled:          vol == primary, // only the primary volume shows by default
+			Color:            color.RGBA{255, 255, 255, 255},
+			Alpha:            0.5,
 			VoxelSizeX:       vol.VoxelSizeX,
 			VoxelSizeY:       vol.VoxelSizeY,
 			VoxelSizeZ:       vol.VoxelSizeZ,
 		}
 	}
 
-	// Add finding overlays as composite volumes (disabled by default)
+	// Finding overlays become disabled composite entries with a bounding box.
 	for _, finding := range scan.Findings {
 		if finding.Overlay == nil {
 			continue
 		}
 		ov := finding.Overlay
-		findingName := "finding_" + finding.Name
-
-		frames := make([]Frame, ov.Depth)
-		sliceSize := ov.Width * ov.Height
-		for z := 0; z < ov.Depth; z++ {
-			offset := z * sliceSize
-			end := offset + sliceSize
-			if end > len(ov.Data) {
-				end = len(ov.Data)
-			}
-			frames[z] = Frame{Data: ov.Data[offset:end]}
-		}
-
-		pd := &PixelData{
-			IsEncapsulated: false,
-			Frames:         frames,
-		}
-
-		// Map BoundingBox - coordinates are already ROI-adjusted by the loader
-		bbox := &BoundingBox3D{
-			X:      finding.BBox.MinX,
-			Y:      finding.BBox.MinY,
-			Z:      finding.BBox.MinZ,
-			Width:  finding.BBox.MaxX - finding.BBox.MinX,
-			Height: finding.BBox.MaxY - finding.BBox.MinY,
-			Depth:  finding.BBox.MaxZ - finding.BBox.MinZ,
-		}
-
-		v.compositeVolumes[findingName] = &CompositeVolume{
-			Name:      findingName,
-			PixelData: pd,
+		name := "finding_" + finding.Name
+		v.compositeVolumes[name] = &CompositeVolume{
+			Name:      name,
+			PixelData: framesOf(ov.Data, ov.Width, ov.Height, ov.Depth),
 			Rows:      ov.Height,
 			Cols:      ov.Width,
-			PixelRep:  0,
-			Enabled:   false, // Disabled by default
-			Alpha:     0.1,   // Half opacity for findings
-			BBox:      bbox,
+			Alpha:     0.1,
+			BBox: &BoundingBox3D{
+				X: finding.BBox.MinX, Y: finding.BBox.MinY, Z: finding.BBox.MinZ,
+				Width:  finding.BBox.MaxX - finding.BBox.MinX,
+				Height: finding.BBox.MaxY - finding.BBox.MinY,
+				Depth:  finding.BBox.MaxZ - finding.BBox.MinZ,
+			},
 		}
 	}
 
-	// Map Projections for 2D viewing (exclude from main composite list to avoid clutter)
+	// Projections are 2D only.
 	v.projections = make(map[string]*CompositeVolume)
 	for name, proj := range scan.Projections {
-		frames := make([]Frame, 1)
-		frames[0] = Frame{Data: proj.Data}
-
-		pd := &PixelData{
-			IsEncapsulated: false,
-			Frames:         frames,
-		}
-
 		wl, ww := CalculateWindowFromData(proj.Data)
-
 		v.projections[name] = &CompositeVolume{
 			Name:         name,
-			PixelData:    pd,
+			PixelData:    &PixelData{Frames: []Frame{{Data: proj.Data}}},
 			Rows:         proj.Height,
 			Cols:         proj.Width,
-			PixelRep:     0,
 			WindowCenter: wl,
 			WindowWidth:  ww,
 			Enabled:      true,
-			Color:        color.RGBA{255, 255, 255, 255}, // White for 2D
+			Color:        color.RGBA{255, 255, 255, 255},
 		}
 	}
 
-	// Update metadata display with DICOM fields
-	if scan.PatientID != "" {
-		v.patientID.SetText(scan.PatientID)
-	}
-	if scan.PatientName != "" {
-		v.patientName.SetText(scan.PatientName)
-	}
-	if scan.StudyDate != "" {
-		v.studyDate.SetText(scan.StudyDate)
-	}
-	if scan.StudyTime != "" {
-		v.studyTime.SetText(scan.StudyTime)
-	}
-	if scan.StudyDescription != "" {
-		v.studyDescription.SetText(scan.StudyDescription)
-	}
-	if scan.SeriesDescription != "" {
-		v.seriesDescription.SetText(scan.SeriesDescription)
-	}
-	if scan.Modality != "" {
-		v.modality.SetText(scan.Modality)
-	}
-	if scan.InstitutionName != "" {
-		v.institutionName.SetText(scan.InstitutionName)
-	}
-	if scan.Manufacturer != "" {
-		v.manufacturer.SetText(scan.Manufacturer)
-	}
-	if scan.OperatorName != "" {
-		v.operatorName.SetText(scan.OperatorName)
-	}
+	// Display defaults for a new study (roxel's: axial, single slice, fit).
+	pc := v.compositeVolumes[primaryKey]
+	v.st.windowCenter3D, v.st.windowWidth3D = pc.WindowCenter, pc.WindowWidth
+	v.st.windowCenter2D = clampStored(scan.WindowLevel)
+	v.st.windowWidth2D = math.Max(1, clampStored(scan.WindowWidth))
+	v.st.orientation = Axial
+	v.st.composite = false
+	v.st.zoom2D = 100
+	v.st.cutaway = false
 
-	slog.Info("Scan data loaded via SetScanData",
+	v.dicox.SetWindowLevel(int(v.st.windowCenter2D))
+	v.dicox.SetWindowWidth(int(v.st.windowWidth2D))
+	v.dicox.SetCompositeMode(false)
+	v.dicox.SetAlphaScale(v.st.opacity)
+	v.interactiveView.SetZoom(100)
+	v.set2DSource(primaryKey)
+
+	v.volumeRenderer.SetScaleZ(scaleZFor(primary))
+	v.setup3DView()
+	v.volumeRenderer.FitView()
+
+	slog.Info("Scan data loaded",
+		slog.String("primary", primaryKey),
 		slog.Float64("windowLevel", scan.WindowLevel),
 		slog.Float64("windowWidth", scan.WindowWidth),
 		slog.Int("projections", len(v.projections)))
-
-	// Setup 3D view
-	v.setup3DView()
-
-	// Compute and set correct Z scale based on voxel spacing
-	// This ensures the volume isn't stretched in coronal/sagittal views
-	if v.volumeRenderer != nil && primary != nil {
-		voxelX := primary.VoxelSizeX
-		voxelY := primary.VoxelSizeY
-		voxelZ := primary.VoxelSizeZ
-
-		// Default to 1.0 if not specified
-		if voxelX <= 0 {
-			voxelX = 1.0
-		}
-		if voxelY <= 0 {
-			voxelY = 1.0
-		}
-		if voxelZ <= 0 {
-			voxelZ = 1.0
-		}
-
-		// Physical dimensions in mm
-		physicalX := float64(primary.Width) * voxelX
-		physicalY := float64(primary.Height) * voxelY
-		physicalZ := float64(primary.Depth) * voxelZ
-
-		// Normalize Z relative to X (shader has X=Y=1.0)
-		// scaleZ = physical_Z / physical_X
-		scaleZ := physicalZ / physicalX
-		if scaleZ < 0.1 {
-			scaleZ = 0.1 // Minimum to avoid degenerate volumes
-		}
-		if scaleZ > 10.0 {
-			scaleZ = 10.0 // Maximum to avoid extreme stretching
-		}
-
-		slog.Info("Volume aspect ratio computed",
-			slog.String("primaryVolume", primary.Name),
-			slog.Int("width", primary.Width),
-			slog.Int("height", primary.Height),
-			slog.Int("depth", primary.Depth),
-			slog.Float64("rawVoxelX", primary.VoxelSizeX),
-			slog.Float64("rawVoxelY", primary.VoxelSizeY),
-			slog.Float64("rawVoxelZ", primary.VoxelSizeZ),
-			slog.Float64("usedVoxelX", voxelX),
-			slog.Float64("usedVoxelY", voxelY),
-			slog.Float64("usedVoxelZ", voxelZ),
-			slog.Float64("physicalX_mm", physicalX),
-			slog.Float64("physicalY_mm", physicalY),
-			slog.Float64("physicalZ_mm", physicalZ),
-			slog.Float64("scaleZ", scaleZ))
-
-		v.volumeRenderer.SetScaleZ(scaleZ)
-		v.currentScaleZ = scaleZ
-		// Update the Z scale slider to reflect computed value
-		if v.zScaleSlider != nil {
-			v.zScaleSlider.SetValue(scaleZ)
-		}
-		v.volumeRenderer.Render()
-		v.volumeRenderer.Refresh()
-	}
-
-	// Refresh layout to populate 2D/3D views
-	v.updateLayout()
-
+	v.rebuild()
 	return nil
+}
+
+// framesOf splits a flat volume into per-slice frames without copying.
+func framesOf(data []uint16, w, h, d int) *PixelData {
+	frames := make([]Frame, d)
+	size := w * h
+	for z := 0; z < d; z++ {
+		start, end := min(z*size, len(data)), min((z+1)*size, len(data))
+		frames[z] = Frame{Data: data[start:end]}
+	}
+	return &PixelData{Frames: frames}
+}
+
+// scaleZFor is the box's Z extent relative to X, from the voxel spacing.
+func scaleZFor(vol *VolumeData) float64 {
+	vx, vz := spacingOr1(vol.VoxelSizeX), spacingOr1(vol.VoxelSizeZ)
+	s := float64(vol.Depth) * vz / (float64(vol.Width) * vx)
+	return math.Max(0.1, math.Min(10, s))
+}
+
+// clampStored limits a window value to the stored (uint16) range used by the 2D view.
+func clampStored(x float64) float64 {
+	return math.Max(0, math.Min(65535, x))
 }
