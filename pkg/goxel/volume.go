@@ -79,8 +79,13 @@ func NewVolumeRenderer() *VolumeRenderer {
 	}
 	vr.ExtendBaseWidget(vr)
 
-	// Try to initialize GPU renderer at high resolution
-	gpuRenderer, err := volume.NewGPUVolumeRenderer(1024, 1024)
+	// Try to initialize the GPU renderer. The browser reads every frame back
+	// through readPixels, so it renders at a lower resolution.
+	size := 1024
+	if fyne.CurrentDevice().IsBrowser() {
+		size = 768
+	}
+	gpuRenderer, err := volume.NewGPUVolumeRenderer(size, size)
 	if err != nil {
 		slog.Warn("GPU renderer unavailable, falling back to CPU", slog.Any("error", err))
 		vr.cpuRenderer = volume.NewCPUVolumeRenderer()
@@ -479,8 +484,10 @@ func (vr *VolumeRenderer) CreateRenderer() fyne.WidgetRenderer {
 	vr.img.FillMode = canvas.ImageFillStretch // Manual layout
 	vr.img.ScaleMode = canvas.ImageScaleFastest
 	if fyne.CurrentDevice().IsBrowser() {
-		// The browser driver rejects ImageScaleFastest ("Invalid canvas.ImageScale value").
-		vr.img.ScaleMode = canvas.ImageScaleSmooth
+		// The browser driver has no ImageScaleFastest ("Invalid canvas.ImageScale
+		// value"), and ImageScaleSmooth rescales every frame on the CPU with
+		// CatmullRom. ImageScalePixels hands the frame straight to the GPU.
+		vr.img.ScaleMode = canvas.ImageScalePixels
 	}
 
 	return &volumeWidgetRenderer{
