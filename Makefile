@@ -76,7 +76,7 @@ install-codex: # opena-ai codex.rs
 
 build-ctl: ## Builds the goxel ui
 	mkdir -p bin
-	CGO_ENABLED=0 go build \
+	go build \
 		-trimpath \
 		-ldflags "-s -w -X 'main.GitSHA=$(GIT_SHA)'" \
 		-o bin/goxel \

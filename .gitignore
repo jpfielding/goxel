@@ -1,7 +1,7 @@
 .DS_Store
-bin
-build
-tmp
+/bin
+/build
+/tmp
 *.so
 __debug_bin**
 # dont check in certs/keys/pems
