@@ -38,6 +38,9 @@ func (d *Decoder) decodeScan() (image.Image, error) {
 	if len(d.compInfo) > 0 {
 		tableIdx = d.compInfo[0].tableIndex
 	}
+	if tableIdx < 0 || tableIdx >= len(d.dcTables) {
+		return nil, fmt.Errorf("jpegli: Huffman table selector %d out of range", tableIdx)
+	}
 	ht := d.dcTables[tableIdx]
 	if ht == nil {
 		return nil, errors.New("missing Huffman table")
@@ -131,6 +134,10 @@ func (d *Decoder) decodeScan() (image.Image, error) {
 				}
 				slog.Error("decodeHuffman failed", slog.Int("x", x), slog.Int("y", y), slog.Int64("offset", offset), slog.Any("error", err))
 				return nil, err
+			}
+
+			if ssss > 16 {
+				return nil, fmt.Errorf("jpegli: invalid difference category %d at pixel (%d,%d)", ssss, x, y)
 			}
 
 			// Read additional bits for the difference value
@@ -266,6 +273,9 @@ func (d *Decoder) decodeHuffman(br *bitReader, ht *huffmanTable) (int, error) {
 	if lookup >= 0 {
 		size := int(lookup >> 8)
 		value := int(lookup & 0xFF)
+		if br.eof && size > br.bits {
+			return 0, io.EOF
+		}
 		br.consumeBits(size)
 		return value, nil
 	}
@@ -366,9 +376,8 @@ func (b *bitReader) readBit() (int, error) {
 		}
 	}
 	if b.bits < 1 {
-		// EOF reached. Pad with 0s.
-		b.totalBits++
-		return 0, nil
+		// EOF reached: no more entropy-coded data.
+		return 0, io.EOF
 	}
 	b.bits--
 	b.totalBits++
@@ -378,6 +387,9 @@ func (b *bitReader) readBit() (int, error) {
 func (b *bitReader) readBits(n int) (int, error) {
 	if n == 0 {
 		return 0, nil
+	}
+	if n > 16 {
+		return 0, fmt.Errorf("jpegli: cannot read %d bits at once", n)
 	}
 	for b.bits < n {
 		if err := b.fillBits(); err != nil {

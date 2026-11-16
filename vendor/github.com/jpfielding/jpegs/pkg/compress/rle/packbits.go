@@ -64,8 +64,11 @@ func encodePackBits(data []byte) []byte {
 // decodePackBits decodes PackBits compressed data
 func decodePackBits(data []byte, expectedLen int) ([]byte, error) {
 	var buf bytes.Buffer
+	// A PackBits run of 2 input bytes expands to at most 128 output bytes, so
+	// cap the pre-grow by what the input can produce, never by the caller's
+	// (possibly bogus) expectedLen alone.
 	if expectedLen > 0 {
-		buf.Grow(expectedLen)
+		buf.Grow(min(expectedLen, len(data)*64))
 	}
 
 	i := 0

@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"image"
 	"image/color"
 	"io"
@@ -221,10 +222,17 @@ func Decode(r io.Reader) (image.Image, error) {
 		return nil, err
 	}
 
+	if cr.SIZ.XSiz <= cr.SIZ.XOsiz || cr.SIZ.YSiz <= cr.SIZ.YOsiz || len(cr.SIZ.Components) == 0 {
+		return nil, fmt.Errorf("%w: invalid SIZ geometry", ErrInvalidFormat)
+	}
 	width := int(cr.SIZ.XSiz - cr.SIZ.XOsiz)
 	height := int(cr.SIZ.YSiz - cr.SIZ.YOsiz)
 	numComps := len(cr.SIZ.Components)
 	precision := cr.SIZ.Components[0].Precision
+	// Decoder holds numComps planes of int (8 bytes) plus the output image.
+	if err := checkDecodedSize(width, height, numComps, 8); err != nil {
+		return nil, err
+	}
 	decompLevels := int(cr.COD.DecompLevels)
 	useMCT := cr.COD.MCT != 0
 

@@ -7,7 +7,6 @@ Pure Go implementation of JPEG Lossless (ITU-T T.81 Annex H) encoder and decoder
 - **Lossless compression** using differential pulse code modulation (DPCM)
 - **Predictors 1-7** supported for optimal compression
 - **8-bit and 16-bit** grayscale images
-- **DICOS/DICOM compatible**: Transfer Syntax `1.2.840.10008.1.2.4.70`
 - **Pure Go**: No CGO dependencies
 
 ## Usage
@@ -15,7 +14,7 @@ Pure Go implementation of JPEG Lossless (ITU-T T.81 Annex H) encoder and decoder
 ### Encoding
 
 ```go
-import "github.com/jpfielding/goxel/pkg/compress/jpegli"
+import "github.com/jpfielding/jpegs/pkg/compress/jpegli"
 
 // Encode with default options (predictor 1)
 err := jpegli.Encode(writer, img, nil)
@@ -31,7 +30,7 @@ err := jpegli.Encode(writer, img, opts)
 ### Decoding
 
 ```go
-import "github.com/jpfielding/goxel/pkg/compress/jpegli"
+import "github.com/jpfielding/jpegs/pkg/compress/jpegli"
 
 img, err := jpegli.Decode(reader)
 ```
@@ -74,4 +73,3 @@ EOI  - End of Image (0xFFD9)
 ## References
 
 - ITU-T Rec. T.81 Annex H (JPEG Lossless Mode)
-- DICOM Transfer Syntax: 1.2.840.10008.1.2.4.70 (JPEG Lossless, First-Order Prediction)

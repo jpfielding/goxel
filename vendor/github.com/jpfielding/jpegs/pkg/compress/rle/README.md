@@ -1,13 +1,12 @@
-# DICOM RLE Codec
+# RLE Codec
 
-Pure Go implementation of DICOM RLE (Run Length Encoding) using PackBits compression.
+Pure Go implementation of RLE (Run Length Encoding) using PackBits compression.
 
 ## Features
 
 - **Lossless compression** using PackBits algorithm
 - **8-bit and 16-bit** grayscale images
 - **Byte-plane separation** for 16-bit images (improved compression)
-- **DICOS/DICOM compatible**: Transfer Syntax `1.2.840.10008.1.2.5`
 - **Pure Go**: No CGO dependencies
 
 ## Usage
@@ -15,7 +14,7 @@ Pure Go implementation of DICOM RLE (Run Length Encoding) using PackBits compres
 ### Encoding
 
 ```go
-import "github.com/jpfielding/goxel/pkg/compress/rle"
+import "github.com/jpfielding/jpegs/pkg/compress/rle"
 
 err := rle.Encode(writer, img)
 ```
@@ -23,7 +22,7 @@ err := rle.Encode(writer, img)
 ### Decoding
 
 ```go
-import "github.com/jpfielding/goxel/pkg/compress/rle"
+import "github.com/jpfielding/jpegs/pkg/compress/rle"
 
 // Width and height must be provided (not stored in RLE stream)
 img, err := rle.Decode(data, width, height)
@@ -31,7 +30,7 @@ img, err := rle.Decode(data, width, height)
 
 ## RLE Algorithm
 
-DICOM RLE uses the PackBits algorithm:
+RLE uses the PackBits algorithm:
 
 | Control Byte | Action |
 |--------------|--------|
@@ -54,7 +53,7 @@ This byte-plane separation improves compression because adjacent high bytes ofte
 | `*image.Gray` | 1 (8-bit pixels) |
 | `*image.Gray16` | 2 (high/low byte planes) |
 
-## DICOM RLE Format
+## RLE Format
 
 ```
 Header (64 bytes):
@@ -67,6 +66,4 @@ Segments:
 
 ## References
 
-- DICOM Part 5, Annex G (RLE Compression)
-- DICOM Transfer Syntax: 1.2.840.10008.1.2.5 (RLE Lossless)
 - Apple PackBits compression format

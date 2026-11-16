@@ -7,7 +7,6 @@ Pure Go implementation of JPEG 2000 Part-1 (ITU-T T.800 / ISO/IEC 15444-1) encod
 - **Lossless compression** using 5/3 reversible discrete wavelet transform (DWT)
 - **Multi-component support**: Gray, Gray16, RGB images
 - **Reversible Color Transform (RCT)** for RGB images
-- **DICOS/DICOM compatible**: Transfer Syntax `1.2.840.10008.1.2.4.90`
 - **Pure Go**: No CGO dependencies
 
 ## Usage
@@ -15,7 +14,7 @@ Pure Go implementation of JPEG 2000 Part-1 (ITU-T T.800 / ISO/IEC 15444-1) encod
 ### Encoding
 
 ```go
-import "github.com/jpfielding/goxel/pkg/compress/jpeg2k"
+import "github.com/jpfielding/jpegs/pkg/compress/jpeg2k"
 
 // Encode with default options
 var buf bytes.Buffer
@@ -34,7 +33,7 @@ err := jpeg2k.Encode(&buf, img, opts)
 ### Decoding
 
 ```go
-import "github.com/jpfielding/goxel/pkg/compress/jpeg2k"
+import "github.com/jpfielding/jpegs/pkg/compress/jpeg2k"
 
 // Decode image
 img, err := jpeg2k.Decode(reader)
@@ -50,7 +49,7 @@ The package registers with Go's image package for automatic format detection:
 ```go
 import (
     "image"
-    _ "github.com/jpfielding/goxel/pkg/compress/jpeg2k"
+    _ "github.com/jpfielding/jpegs/pkg/compress/jpeg2k"
 )
 
 // Auto-detects JPEG 2000 by SOC marker (0xFF4F)
@@ -97,4 +96,3 @@ EOC  - End of Codestream (0xFFD9)
 ## References
 
 - ITU-T Rec. T.800 | ISO/IEC 15444-1 (JPEG 2000 Part-1)
-- DICOM Transfer Syntax: 1.2.840.10008.1.2.4.90 (JPEG 2000 Lossless)
