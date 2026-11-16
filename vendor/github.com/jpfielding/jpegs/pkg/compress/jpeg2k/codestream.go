@@ -2,765 +2,518 @@ package jpeg2k
 
 import (
 	"encoding/binary"
-	"errors"
 	"fmt"
-	"io"
 )
 
-// Common errors
-var (
-	ErrInvalidMarker    = errors.New("invalid marker")
-	ErrInvalidSIZ       = errors.New("invalid SIZ marker")
-	ErrInvalidCOD       = errors.New("invalid COD marker")
-	ErrInvalidQCD       = errors.New("invalid QCD marker")
-	ErrInvalidSOT       = errors.New("invalid SOT marker")
-	ErrUnsupportedCodec = errors.New("unsupported codec feature")
+// Codestream markers (ITU-T T.800 Table A.2).
+const (
+	MarkerSOC = 0xFF4F // start of codestream
+	MarkerSIZ = 0xFF51 // image and tile size
+	MarkerCOD = 0xFF52 // coding style default
+	MarkerCOC = 0xFF53 // coding style component
+	MarkerTLM = 0xFF55 // tile-part lengths
+	MarkerPLM = 0xFF57 // packet length, main header
+	MarkerPLT = 0xFF58 // packet length, tile-part header
+	MarkerQCD = 0xFF5C // quantization default
+	MarkerQCC = 0xFF5D // quantization component
+	MarkerRGN = 0xFF5E // region of interest
+	MarkerPOC = 0xFF5F // progression order change
+	MarkerPPM = 0xFF60 // packed packet headers, main header
+	MarkerPPT = 0xFF61 // packed packet headers, tile-part header
+	MarkerCRG = 0xFF63 // component registration
+	MarkerCOM = 0xFF64 // comment
+	MarkerSOT = 0xFF90 // start of tile-part
+	MarkerSOD = 0xFF93 // start of data
+	MarkerEOC = 0xFFD9 // end of codestream
+
+	// MarkerSODLegacy is the (non-T.800) SOD code written by this package
+	// before v0.3.0 and by dicos.rs 1.0.0. Only legacy streams may use it.
+	MarkerSODLegacy = 0xFFD3
 )
 
-// CodestreamReader reads JPEG 2000 codestream structure
-type CodestreamReader struct {
-	r   *ByteReader
-	SIZ SIZMarker
-	COD CODMarker
-	QCD QCDMarker
+// COD Scod flags.
+const (
+	scodPrecincts = 0x01
+	scodSOP       = 0x02
+	scodEPH       = 0x04
+)
+
+// Profile constants.
+const (
+	bitDepth  = 16                  // unsigned 16-bit samples (RI)
+	guardBits = 2                   // G (T.800 E.1)
+	dcShift   = 1 << (bitDepth - 1) // DC level shift for unsigned samples
+)
+
+// qcdEpsilon is εb = RI + log2(gain_b) for reversible coding (T.800 E-10).
+func qcdEpsilon(kind bandKind) int {
+	_, _, gain := bandOffsets(kind)
+	return bitDepth + gain
 }
 
-// NewCodestreamReader creates a new codestream reader
-func NewCodestreamReader(r io.Reader) *CodestreamReader {
-	return &CodestreamReader{
-		r: NewByteReader(r),
+// qcdEpsilons lists SPqcd exponents in T.800 order: LL, then HL, LH, HH
+// for n = NL..1.
+func qcdEpsilons(levels int) []uint8 {
+	v := []uint8{uint8(qcdEpsilon(bandLL))}
+	for range levels {
+		v = append(v, uint8(qcdEpsilon(bandHL)), uint8(qcdEpsilon(bandLH)), uint8(qcdEpsilon(bandHH)))
 	}
+	return v
 }
 
-// ReadMainHeader reads the main header (SOC through first SOT or SOD)
-func (c *CodestreamReader) ReadMainHeader() error {
-	// Read SOC marker
-	marker, err := c.readMarker()
+// qcdIndex locates band kind at decomposition level in the QCD list.
+func qcdIndex(kind bandKind, level, levels int) int {
+	if kind == bandLL {
+		return 0
+	}
+	return int(kind) + 3*(levels-level) // HL=1, LH=2, HH=3
+}
+
+// sizComponent is one SIZ component entry.
+type sizComponent struct {
+	precision int // bit depth, 1..38
+	signed    bool
+	dx, dy    uint8 // XRsiz, YRsiz
+}
+
+// header is everything recovered from one bounds-checked walk of a
+// codestream. It is structurally valid but not yet checked against the
+// supported profile (see validateStandard and legacy.go).
+type header struct {
+	xsiz, ysiz, xosiz, yosiz     uint32
+	xtsiz, ytsiz, xtosiz, ytosiz uint32
+	comps                        []sizComponent
+
+	scod, progression  uint8
+	layers             uint16
+	mct, levels        uint8
+	cbw, cbh           uint8 // stored exponents (actual - 2)
+	cbStyle, transform uint8
+
+	guard uint8
+	exps  []uint8 // SPqcd exponents εb
+
+	sodLegacy bool // SOD was 0xFFD3
+	shortPsot bool // Psot = 12 + len (the pre-T.800 Go encoder)
+	payload   []byte
+}
+
+func (h *header) width() int  { return int(h.xsiz - h.xosiz) }
+func (h *header) height() int { return int(h.ysiz - h.yosiz) }
+
+// cursor is a bounds-checked big-endian reader over a byte slice.
+type cursor struct {
+	data []byte
+	pos  int
+}
+
+func errTruncated(what string) error {
+	return fmt.Errorf("%w: codestream truncated in %s", ErrInvalidData, what)
+}
+
+func (c *cursor) u8(what string) (uint8, error) {
+	if c.pos+1 > len(c.data) {
+		return 0, errTruncated(what)
+	}
+	c.pos++
+	return c.data[c.pos-1], nil
+}
+
+func (c *cursor) u16(what string) (uint16, error) {
+	if c.pos+2 > len(c.data) {
+		return 0, errTruncated(what)
+	}
+	c.pos += 2
+	return binary.BigEndian.Uint16(c.data[c.pos-2:]), nil
+}
+
+func (c *cursor) u32(what string) (uint32, error) {
+	if c.pos+4 > len(c.data) {
+		return 0, errTruncated(what)
+	}
+	c.pos += 4
+	return binary.BigEndian.Uint32(c.data[c.pos-4:]), nil
+}
+
+// segment reads a marker segment length and returns a cursor over exactly
+// its content, advancing c past it.
+func (c *cursor) segment(name string) (*cursor, error) {
+	n, err := c.u16(name + " length")
 	if err != nil {
-		return fmt.Errorf("reading SOC: %w", err)
+		return nil, err
 	}
-	if marker != MarkerSOC {
-		return fmt.Errorf("%w: expected SOC (0x%04X), got 0x%04X", ErrInvalidMarker, MarkerSOC, marker)
+	if n < 2 {
+		return nil, fmt.Errorf("%w: %s segment length %d < 2", ErrInvalidData, name, n)
 	}
+	end := c.pos + int(n) - 2
+	if end > len(c.data) {
+		return nil, errTruncated(name)
+	}
+	seg := &cursor{data: c.data[c.pos:end]}
+	c.pos = end
+	return seg, nil
+}
 
-	// Read marker segments until SOT or SOD
-	for {
-		marker, err = c.readMarker()
-		if err != nil {
-			return fmt.Errorf("reading marker: %w", err)
+// done errors if the segment has unread bytes.
+func (c *cursor) done(name string) error {
+	if c.pos != len(c.data) {
+		return fmt.Errorf("%w: %s segment has %d unexpected trailing bytes", ErrInvalidData, name, len(c.data)-c.pos)
+	}
+	return nil
+}
+
+func (h *header) readSIZ(c *cursor) error {
+	s, err := c.segment("SIZ")
+	if err != nil {
+		return err
+	}
+	if _, err = s.u16("SIZ"); err != nil { // Rsiz
+		return err
+	}
+	for _, f := range []*uint32{&h.xsiz, &h.ysiz, &h.xosiz, &h.yosiz, &h.xtsiz, &h.ytsiz, &h.xtosiz, &h.ytosiz} {
+		if *f, err = s.u32("SIZ"); err != nil {
+			return err
 		}
+	}
+	n, err := s.u16("SIZ")
+	if err != nil {
+		return err
+	}
+	if n == 0 || n > 16384 {
+		return fmt.Errorf("%w: SIZ Csiz %d", ErrInvalidData, n)
+	}
+	if len(s.data)+2 != 38+3*int(n) {
+		return fmt.Errorf("%w: SIZ length %d for %d components", ErrInvalidData, len(s.data)+2, n)
+	}
+	h.comps = make([]sizComponent, n)
+	for i := range h.comps {
+		ssiz, _ := s.u8("SIZ")
+		dx, _ := s.u8("SIZ")
+		dy, _ := s.u8("SIZ")
+		if ssiz&0x7F > 37 || dx == 0 || dy == 0 {
+			return fmt.Errorf("%w: SIZ component %d (Ssiz 0x%02X, sub-sampling %dx%d)", ErrInvalidData, i, ssiz, dx, dy)
+		}
+		h.comps[i] = sizComponent{precision: int(ssiz&0x7F) + 1, signed: ssiz&0x80 != 0, dx: dx, dy: dy}
+	}
+	switch {
+	case h.xsiz <= h.xosiz || h.ysiz <= h.yosiz:
+		return fmt.Errorf("%w: SIZ image area is empty (%d-%d x %d-%d)", ErrInvalidData, h.xsiz, h.xosiz, h.ysiz, h.yosiz)
+	case h.xtsiz == 0 || h.ytsiz == 0:
+		return fmt.Errorf("%w: SIZ tile size has a zero dimension", ErrInvalidData)
+	}
+	return nil
+}
 
-		switch marker {
+func (h *header) readCOD(c *cursor) error {
+	s, err := c.segment("COD")
+	if err != nil {
+		return err
+	}
+	if len(s.data) < 10 {
+		return errTruncated("COD")
+	}
+	h.scod, _ = s.u8("COD")
+	h.progression, _ = s.u8("COD")
+	h.layers, _ = s.u16("COD")
+	h.mct, _ = s.u8("COD")
+	h.levels, _ = s.u8("COD")
+	h.cbw, _ = s.u8("COD")
+	h.cbh, _ = s.u8("COD")
+	h.cbStyle, _ = s.u8("COD")
+	h.transform, _ = s.u8("COD")
+	switch {
+	case h.progression > 4:
+		return fmt.Errorf("%w: unknown progression order %d", ErrInvalidData, h.progression)
+	case h.transform > 1:
+		return fmt.Errorf("%w: unknown transform %d", ErrInvalidData, h.transform)
+	case h.levels > 32:
+		return fmt.Errorf("%w: %d decomposition levels exceed 32", ErrInvalidData, h.levels)
+	case h.cbw > 8 || h.cbh > 8 || h.cbw+h.cbh > 8:
+		return fmt.Errorf("%w: illegal code-block exponents (stored %d,%d)", ErrInvalidData, h.cbw, h.cbh)
+	}
+	// User precinct sizes, one byte per resolution, follow when signalled.
+	want := 10
+	if h.scod&scodPrecincts != 0 {
+		want += int(h.levels) + 1
+	}
+	if len(s.data) != want {
+		return fmt.Errorf("%w: COD length %d, want %d", ErrInvalidData, len(s.data)+2, want+2)
+	}
+	return nil
+}
+
+func (h *header) readQCD(c *cursor) error {
+	s, err := c.segment("QCD")
+	if err != nil {
+		return err
+	}
+	sqcd, err := s.u8("QCD")
+	if err != nil {
+		return err
+	}
+	h.guard = sqcd >> 5
+	if style := sqcd & 0x1F; style != 0 {
+		return fmt.Errorf("%w: only reversible (no quantization) QCD, style %d", ErrUnsupported, style)
+	}
+	h.exps = make([]uint8, 0, len(s.data)-1)
+	for s.pos < len(s.data) {
+		b, _ := s.u8("QCD")
+		h.exps = append(h.exps, b>>3)
+	}
+	return nil
+}
+
+func unsupportedMarker(name string) error {
+	return fmt.Errorf("%w: %s marker", ErrUnsupported, name)
+}
+
+// parseCodestream walks SOC, the main header, one SOT/SOD tile-part and EOC.
+func parseCodestream(data []byte) (*header, error) {
+	c := &cursor{data: data}
+	soc, err := c.u16("SOC")
+	if err != nil {
+		return nil, err
+	}
+	if soc != MarkerSOC {
+		return nil, fmt.Errorf("%w: missing SOC marker", ErrInvalidData)
+	}
+	h := &header{}
+	var haveSIZ, haveCOD, haveQCD bool
+	once := func(seen *bool, name string) error {
+		if *seen {
+			return fmt.Errorf("%w: duplicate %s marker", ErrInvalidData, name)
+		}
+		*seen = true
+		return nil
+	}
+	sotOff := -1
+	for sotOff < 0 {
+		off := c.pos
+		m, err := c.u16("main header")
+		if err != nil {
+			return nil, err
+		}
+		switch m {
 		case MarkerSIZ:
-			if err := c.readSIZ(); err != nil {
-				return err
+			if err = once(&haveSIZ, "SIZ"); err == nil {
+				err = h.readSIZ(c)
 			}
 		case MarkerCOD:
-			if err := c.readCOD(); err != nil {
-				return err
+			if err = once(&haveCOD, "COD"); err == nil {
+				err = h.readCOD(c)
 			}
-		case MarkerCOC:
-			// Skip component-specific coding style (use defaults)
-			length, err := c.r.ReadUint16()
-			if err != nil {
-				return err
-			}
-			c.r.Skip(int(length) - 2)
 		case MarkerQCD:
-			if err := c.readQCD(); err != nil {
-				return err
+			if err = once(&haveQCD, "QCD"); err == nil {
+				err = h.readQCD(c)
 			}
-		case MarkerQCC:
-			// Skip component-specific quantization
-			length, err := c.r.ReadUint16()
-			if err != nil {
-				return err
-			}
-			c.r.Skip(int(length) - 2)
-		case MarkerCOM:
-			// Skip comments
-			length, err := c.r.ReadUint16()
-			if err != nil {
-				return err
-			}
-			c.r.Skip(int(length) - 2)
 		case MarkerSOT:
-			// End of main header, return for tile processing
-			return nil
-		case MarkerSOD:
-			// Single-tile image with no SOT
-			return nil
+			sotOff = off
+		case MarkerCOC:
+			err = unsupportedMarker("COC")
+		case MarkerQCC:
+			err = unsupportedMarker("QCC")
+		case MarkerRGN:
+			err = unsupportedMarker("RGN")
+		case MarkerPOC:
+			err = unsupportedMarker("POC")
+		case MarkerPPM:
+			err = unsupportedMarker("PPM")
+		case MarkerPLM:
+			err = unsupportedMarker("PLM")
+		case MarkerCRG, MarkerCOM, MarkerTLM:
+			_, err = c.segment("informational")
 		default:
-			// Skip unknown markers
-			length, err := c.r.ReadUint16()
-			if err != nil {
-				return err
-			}
-			c.r.Skip(int(length) - 2)
+			err = fmt.Errorf("%w: unexpected marker 0x%04X in main header", ErrInvalidData, m)
 		}
-	}
-}
-
-// readMarker reads a 2-byte marker
-func (c *CodestreamReader) readMarker() (uint16, error) {
-	return c.r.ReadUint16()
-}
-
-// readSIZ reads the SIZ marker segment
-func (c *CodestreamReader) readSIZ() error {
-	length, err := c.r.ReadUint16()
-	if err != nil {
-		return err
-	}
-	if length < 41 { // Minimum SIZ length
-		return ErrInvalidSIZ
-	}
-
-	c.SIZ.Rsiz, err = c.r.ReadUint16()
-	if err != nil {
-		return err
-	}
-
-	c.SIZ.XSiz, err = c.r.ReadUint32()
-	if err != nil {
-		return err
-	}
-	c.SIZ.YSiz, err = c.r.ReadUint32()
-	if err != nil {
-		return err
-	}
-	c.SIZ.XOsiz, err = c.r.ReadUint32()
-	if err != nil {
-		return err
-	}
-	c.SIZ.YOsiz, err = c.r.ReadUint32()
-	if err != nil {
-		return err
-	}
-	c.SIZ.XTsiz, err = c.r.ReadUint32()
-	if err != nil {
-		return err
-	}
-	c.SIZ.YTsiz, err = c.r.ReadUint32()
-	if err != nil {
-		return err
-	}
-	c.SIZ.XTOsiz, err = c.r.ReadUint32()
-	if err != nil {
-		return err
-	}
-	c.SIZ.YTOsiz, err = c.r.ReadUint32()
-	if err != nil {
-		return err
-	}
-
-	numComps, err := c.r.ReadUint16()
-	if err != nil {
-		return err
-	}
-
-	c.SIZ.Components = make([]ComponentInfo, numComps)
-	for i := range c.SIZ.Components {
-		ssiz, err := c.r.ReadByte()
 		if err != nil {
-			return err
+			return nil, err
 		}
-		c.SIZ.Components[i].Signed = (ssiz & 0x80) != 0
-		c.SIZ.Components[i].Precision = int(ssiz&0x7F) + 1
+	}
+	switch {
+	case !haveSIZ:
+		return nil, fmt.Errorf("%w: missing SIZ marker", ErrInvalidData)
+	case !haveCOD:
+		return nil, fmt.Errorf("%w: missing COD marker", ErrInvalidData)
+	case !haveQCD:
+		return nil, fmt.Errorf("%w: missing QCD marker", ErrInvalidData)
+	}
 
-		xrsiz, err := c.r.ReadByte()
+	sot, err := c.segment("SOT")
+	if err != nil {
+		return nil, err
+	}
+	if len(sot.data) != 8 {
+		return nil, fmt.Errorf("%w: SOT length %d", ErrInvalidData, len(sot.data)+2)
+	}
+	isot, _ := sot.u16("SOT")
+	psot, _ := sot.u32("SOT")
+	tpsot, _ := sot.u8("SOT")
+	tnsot, _ := sot.u8("SOT")
+	switch {
+	case isot != 0:
+		return nil, fmt.Errorf("%w: tile index %d (single tile only)", ErrUnsupported, isot)
+	case tpsot != 0:
+		return nil, fmt.Errorf("%w: tile-part index %d (single tile-part only)", ErrUnsupported, tpsot)
+	case tnsot > 1:
+		return nil, fmt.Errorf("%w: %d tile-parts (single tile-part only)", ErrUnsupported, tnsot)
+	}
+
+	for start := -1; start < 0; {
+		m, err := c.u16("tile-part header")
 		if err != nil {
-			return err
+			return nil, err
 		}
-		c.SIZ.Components[i].XRsiz = int(xrsiz)
-
-		yrsiz, err := c.r.ReadByte()
+		switch m {
+		case MarkerSOD, MarkerSODLegacy:
+			h.sodLegacy = m == MarkerSODLegacy
+			start = c.pos
+		case MarkerCRG, MarkerCOM:
+			_, err = c.segment("informational")
+		case MarkerPPT:
+			err = unsupportedMarker("PPT")
+		case MarkerPLT:
+			err = unsupportedMarker("PLT")
+		default:
+			err = fmt.Errorf("%w: expected SOD after SOT, got 0x%04X", ErrInvalidData, m)
+		}
 		if err != nil {
-			return err
-		}
-		c.SIZ.Components[i].YRsiz = int(yrsiz)
-	}
-
-	return nil
-}
-
-// readCOD reads the COD marker segment
-func (c *CodestreamReader) readCOD() error {
-	length, err := c.r.ReadUint16()
-	if err != nil {
-		return err
-	}
-	if length < 12 {
-		return ErrInvalidCOD
-	}
-
-	c.COD.Scod, err = c.r.ReadByte()
-	if err != nil {
-		return err
-	}
-
-	progOrder, err := c.r.ReadByte()
-	if err != nil {
-		return err
-	}
-	c.COD.Progression = ProgressionOrder(progOrder)
-
-	c.COD.NumLayers, err = c.r.ReadUint16()
-	if err != nil {
-		return err
-	}
-
-	c.COD.MCT, err = c.r.ReadByte()
-	if err != nil {
-		return err
-	}
-
-	c.COD.DecompLevels, err = c.r.ReadByte()
-	if err != nil {
-		return err
-	}
-
-	cbWidth, err := c.r.ReadByte()
-	if err != nil {
-		return err
-	}
-	c.COD.CodeBlockWidthExp = cbWidth
-
-	cbHeight, err := c.r.ReadByte()
-	if err != nil {
-		return err
-	}
-	c.COD.CodeBlockHeightExp = cbHeight
-
-	c.COD.CodeBlockStyle, err = c.r.ReadByte()
-	if err != nil {
-		return err
-	}
-
-	transform, err := c.r.ReadByte()
-	if err != nil {
-		return err
-	}
-	c.COD.Transform = TransformType(transform)
-
-	// Read precinct sizes if specified
-	if c.COD.Scod&CodingStylePrecinctsUser != 0 {
-		remaining := int(length) - 12
-		c.COD.PrecinctSizes = make([]byte, remaining)
-		for i := 0; i < remaining; i++ {
-			c.COD.PrecinctSizes[i], err = c.r.ReadByte()
-			if err != nil {
-				return err
-			}
+			return nil, err
 		}
 	}
+	start := c.pos
 
-	return nil
-}
-
-// readQCD reads the QCD marker segment
-func (c *CodestreamReader) readQCD() error {
-	length, err := c.r.ReadUint16()
-	if err != nil {
-		return err
+	// The tile-part (Psot bytes from the SOT marker, T.800 A.4.2, or to EOC
+	// when Psot is 0) must be followed by EOC and nothing else.
+	endsEOC := func(at int) bool {
+		return at >= start && len(data)-at == 2 && binary.BigEndian.Uint16(data[at:]) == MarkerEOC
 	}
-	if length < 4 {
-		return ErrInvalidQCD
-	}
-
-	sqcd, err := c.r.ReadByte()
-	if err != nil {
-		return err
-	}
-	c.QCD.Sqcd = sqcd
-	c.QCD.GuardBits = (sqcd >> 5) & 0x07
-
-	// Quantization type from lower 5 bits
-	qStyle := sqcd & 0x1F
-
-	remaining := int(length) - 3 // length - sizeof(length) - sizeof(sqcd)
-
-	switch qStyle {
-	case 0: // No quantization (reversible)
-		// Each entry is 1 byte (exponent only)
-		c.QCD.StepSizes = make([]int16, remaining)
-		for i := 0; i < remaining; i++ {
-			exp, err := c.r.ReadByte()
-			if err != nil {
-				return err
-			}
-			c.QCD.StepSizes[i] = int16(exp >> 3) // Exponent in bits 3-7
+	end := len(data) - 2
+	switch {
+	case psot == 0:
+		if !endsEOC(end) {
+			return nil, fmt.Errorf("%w: Psot is 0 but the codestream does not end with EOC", ErrInvalidData)
 		}
-	case 1: // Scalar derived
-		// Single 2-byte entry
-		val, err := c.r.ReadUint16()
-		if err != nil {
-			return err
-		}
-		c.QCD.StepSizes = []int16{int16(val)}
-		c.r.Skip(remaining - 2)
-	case 2: // Scalar expounded
-		// Each entry is 2 bytes
-		numEntries := remaining / 2
-		c.QCD.StepSizes = make([]int16, numEntries)
-		for i := 0; i < numEntries; i++ {
-			val, err := c.r.ReadUint16()
-			if err != nil {
-				return err
-			}
-			c.QCD.StepSizes[i] = int16(val)
-		}
+	case uint64(sotOff)+uint64(psot) > uint64(len(data)):
+		return nil, fmt.Errorf("%w: Psot %d exceeds the codestream", ErrInvalidData, psot)
+	case endsEOC(sotOff + int(psot)):
+	case h.sodLegacy && endsEOC(sotOff+int(psot)+2):
+		h.shortPsot = true
 	default:
-		return fmt.Errorf("%w: unsupported quantization style %d", ErrInvalidQCD, qStyle)
+		return nil, fmt.Errorf("%w: tile-part is not followed by EOC (Psot %d, trailing data?)", ErrInvalidData, psot)
 	}
-
-	return nil
+	h.payload = data[start:end]
+	return h, nil
 }
 
-// ReadSOT reads a tile-part header and returns the SOT marker data
-func (c *CodestreamReader) ReadSOT() (*SOTMarker, error) {
-	length, err := c.r.ReadUint16()
-	if err != nil {
-		return nil, err
+// validateStandard applies the supported T.800 profile and returns Mb per
+// band. Everything legal but outside the profile is ErrUnsupported.
+func (h *header) validateStandard() (func(bandKind, int) int, error) {
+	unsupported := func(format string, a ...any) error {
+		return fmt.Errorf("%w: "+format, append([]any{ErrUnsupported}, a...)...)
 	}
-	if length != 10 {
-		return nil, ErrInvalidSOT
+	invalid := func(format string, a ...any) error {
+		return fmt.Errorf("%w: "+format, append([]any{ErrInvalidData}, a...)...)
 	}
-
-	sot := &SOTMarker{}
-	sot.TileIndex, err = c.r.ReadUint16()
-	if err != nil {
-		return nil, err
+	switch {
+	case h.sodLegacy || h.shortPsot:
+		return nil, invalid("non-T.800 SOD marker or tile-part length (legacy stream?)")
+	case len(h.comps) != 1:
+		return nil, unsupported("%d components (single component only)", len(h.comps))
+	case h.comps[0].signed || h.comps[0].precision != bitDepth:
+		return nil, unsupported("%d-bit signed=%v samples (unsigned 16-bit only)", h.comps[0].precision, h.comps[0].signed)
+	case h.comps[0].dx != 1 || h.comps[0].dy != 1:
+		return nil, unsupported("component sub-sampling %dx%d", h.comps[0].dx, h.comps[0].dy)
+	case h.xosiz != 0 || h.yosiz != 0 || h.xtosiz != 0 || h.ytosiz != 0:
+		return nil, unsupported("non-zero grid origins")
+	case h.xtsiz < h.xsiz || h.ytsiz < h.ysiz:
+		return nil, unsupported("multi-tile images")
+	case h.scod&(scodPrecincts|scodSOP|scodEPH) != 0:
+		return nil, unsupported("COD precinct/SOP/EPH flags 0x%02X", h.scod)
+	case h.progression != 0:
+		return nil, unsupported("progression order %d (LRCP only)", h.progression)
+	case h.layers != 1:
+		return nil, unsupported("%d quality layers (one only)", h.layers)
+	case h.mct != 0:
+		return nil, unsupported("multiple-component transform")
+	case h.transform != 1:
+		return nil, unsupported("irreversible 9/7 transform")
+	case h.cbStyle != 0:
+		return nil, unsupported("code-block style 0x%02X", h.cbStyle)
 	}
-	sot.TilePartLen, err = c.r.ReadUint32()
-	if err != nil {
-		return nil, err
+	levels := int(h.levels)
+	nBands := 3*levels + 1
+	if allZero(h.exps) {
+		return nil, invalid("all-zero QCD exponents (legacy stream?)")
 	}
-	sot.TilePartIdx, err = c.r.ReadByte()
-	if err != nil {
-		return nil, err
+	if len(h.exps) < nBands {
+		return nil, invalid("QCD has %d exponents, need %d for %d levels", len(h.exps), nBands, levels)
 	}
-	sot.NumTileParts, err = c.r.ReadByte()
-	if err != nil {
-		return nil, err
-	}
-
-	return sot, nil
-}
-
-// ReadTilePartHeader reads markers between SOT and SOD
-func (c *CodestreamReader) ReadTilePartHeader() error {
-	for {
-		marker, err := c.readMarker()
-		if err != nil {
-			return err
+	// Mb = εb + G - 1 must be >= 0 (εb = G = 0 would underflow) and < 32 so
+	// tier-1 shifts and int32 magnitudes stay in range.
+	mbs := make([]int, nBands)
+	for i, e := range h.exps[:nBands] {
+		mb := int(e) + int(h.guard) - 1
+		switch {
+		case mb < 0:
+			return nil, invalid("QCD band %d has εb = G = 0", i)
+		case mb >= 32:
+			return nil, unsupported("QCD band %d Mb %d (εb %d, G %d) exceeds 31 bit-planes", i, mb, e, h.guard)
 		}
-
-		switch marker {
-		case MarkerSOD:
-			// Start of data - end of tile-part header
-			return nil
-		case MarkerCOD:
-			if err := c.readCOD(); err != nil {
-				return err
-			}
-		case MarkerQCD:
-			if err := c.readQCD(); err != nil {
-				return err
-			}
-		default:
-			// Skip other markers
-			length, err := c.r.ReadUint16()
-			if err != nil {
-				return err
-			}
-			c.r.Skip(int(length) - 2)
-		}
+		mbs[i] = mb
 	}
+	return func(kind bandKind, level int) int { return mbs[qcdIndex(kind, level, levels)] }, nil
 }
 
-// Reader returns the underlying byte reader for reading tile data
-func (c *CodestreamReader) Reader() *ByteReader {
-	return c.r
-}
-
-// CodestreamWriter writes JPEG 2000 codestream structure
-type CodestreamWriter struct {
-	w *ByteWriter
-}
-
-// NewCodestreamWriter creates a new codestream writer
-func NewCodestreamWriter(w io.Writer) *CodestreamWriter {
-	return &CodestreamWriter{
-		w: NewByteWriter(w),
-	}
-}
-
-// WriteSOC writes the Start of Codestream marker
-func (c *CodestreamWriter) WriteSOC() error {
-	return c.w.WriteUint16(MarkerSOC)
-}
-
-// WriteSIZ writes the SIZ marker segment
-func (c *CodestreamWriter) WriteSIZ(siz *SIZMarker) error {
-	if err := c.w.WriteUint16(MarkerSIZ); err != nil {
-		return err
-	}
-
-	// Length: 38 + 3*numComponents
-	length := uint16(38 + 3*len(siz.Components))
-	if err := c.w.WriteUint16(length); err != nil {
-		return err
-	}
-
-	if err := c.w.WriteUint16(siz.Rsiz); err != nil {
-		return err
-	}
-	if err := c.w.WriteUint32(siz.XSiz); err != nil {
-		return err
-	}
-	if err := c.w.WriteUint32(siz.YSiz); err != nil {
-		return err
-	}
-	if err := c.w.WriteUint32(siz.XOsiz); err != nil {
-		return err
-	}
-	if err := c.w.WriteUint32(siz.YOsiz); err != nil {
-		return err
-	}
-	if err := c.w.WriteUint32(siz.XTsiz); err != nil {
-		return err
-	}
-	if err := c.w.WriteUint32(siz.YTsiz); err != nil {
-		return err
-	}
-	if err := c.w.WriteUint32(siz.XTOsiz); err != nil {
-		return err
-	}
-	if err := c.w.WriteUint32(siz.YTOsiz); err != nil {
-		return err
-	}
-	if err := c.w.WriteUint16(uint16(len(siz.Components))); err != nil {
-		return err
-	}
-
-	for _, comp := range siz.Components {
-		ssiz := byte(comp.Precision - 1)
-		if comp.Signed {
-			ssiz |= 0x80
-		}
-		if err := c.w.WriteByte(ssiz); err != nil {
-			return err
-		}
-		if err := c.w.WriteByte(byte(comp.XRsiz)); err != nil {
-			return err
-		}
-		if err := c.w.WriteByte(byte(comp.YRsiz)); err != nil {
-			return err
+func allZero(b []uint8) bool {
+	for _, v := range b {
+		if v != 0 {
+			return false
 		}
 	}
-
-	return nil
+	return true
 }
 
-// WriteCOD writes the COD marker segment
-func (c *CodestreamWriter) WriteCOD(cod *CODMarker) error {
-	if err := c.w.WriteUint16(MarkerCOD); err != nil {
-		return err
+// appendCodestream writes SOC SIZ COD QCD SOT SOD <tile> EOC for one
+// unsigned 16-bit component.
+func appendCodestream(out []byte, w, h, levels, xcb, ycb int, tile []byte) ([]byte, error) {
+	be16 := binary.BigEndian.AppendUint16
+	be32 := binary.BigEndian.AppendUint32
+	out = be16(out, MarkerSOC)
+
+	out = be16(out, MarkerSIZ)
+	out = be16(out, 38+3)
+	out = be16(out, 0) // Rsiz
+	for _, v := range []uint32{uint32(w), uint32(h), 0, 0, uint32(w), uint32(h), 0, 0} {
+		out = be32(out, v)
+	}
+	out = be16(out, 1)
+	out = append(out, bitDepth-1, 1, 1)
+
+	out = be16(out, MarkerCOD)
+	out = be16(out, 12)
+	out = append(out, 0, 0) // Scod, LRCP
+	out = be16(out, 1)      // layers
+	out = append(out, 0, uint8(levels), uint8(xcb-2), uint8(ycb-2), 0, 1)
+
+	exps := qcdEpsilons(levels)
+	out = be16(out, MarkerQCD)
+	out = be16(out, uint16(3+len(exps)))
+	out = append(out, guardBits<<5)
+	for _, e := range exps {
+		out = append(out, e<<3)
 	}
 
-	// Length: 12 + precinct sizes
-	length := uint16(12)
-	if cod.Scod&CodingStylePrecinctsUser != 0 {
-		length += uint16(len(cod.PrecinctSizes))
+	// Psot spans the SOT segment (12), SOD (2) and the tile data.
+	psot := uint64(14) + uint64(len(tile))
+	if psot > 0xFFFFFFFF {
+		return nil, fmt.Errorf("%w: tile-part of %d bytes exceeds Psot", ErrUnsupported, len(tile))
 	}
-	if err := c.w.WriteUint16(length); err != nil {
-		return err
-	}
-
-	if err := c.w.WriteByte(cod.Scod); err != nil {
-		return err
-	}
-	if err := c.w.WriteByte(byte(cod.Progression)); err != nil {
-		return err
-	}
-	if err := c.w.WriteUint16(cod.NumLayers); err != nil {
-		return err
-	}
-	if err := c.w.WriteByte(cod.MCT); err != nil {
-		return err
-	}
-	if err := c.w.WriteByte(cod.DecompLevels); err != nil {
-		return err
-	}
-	if err := c.w.WriteByte(cod.CodeBlockWidthExp); err != nil {
-		return err
-	}
-	if err := c.w.WriteByte(cod.CodeBlockHeightExp); err != nil {
-		return err
-	}
-	if err := c.w.WriteByte(cod.CodeBlockStyle); err != nil {
-		return err
-	}
-	if err := c.w.WriteByte(byte(cod.Transform)); err != nil {
-		return err
-	}
-
-	if cod.Scod&CodingStylePrecinctsUser != 0 {
-		if err := c.w.WriteBytes(cod.PrecinctSizes); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-// WriteQCD writes the QCD marker segment for reversible (lossless) coding
-func (c *CodestreamWriter) WriteQCD(qcd *QCDMarker) error {
-	if err := c.w.WriteUint16(MarkerQCD); err != nil {
-		return err
-	}
-
-	// Length: 3 + step sizes
-	length := uint16(3 + len(qcd.StepSizes))
-	if err := c.w.WriteUint16(length); err != nil {
-		return err
-	}
-
-	// Sqcd: guard bits in upper 3 bits, quantization type in lower 5
-	sqcd := (qcd.GuardBits << 5) | (qcd.Sqcd & 0x1F)
-	if err := c.w.WriteByte(sqcd); err != nil {
-		return err
-	}
-
-	// For reversible coding, each step size is 1 byte (exponent only)
-	for _, step := range qcd.StepSizes {
-		exp := byte(step << 3) // Exponent in bits 3-7
-		if err := c.w.WriteByte(exp); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-// WriteSOT writes a tile-part header
-func (c *CodestreamWriter) WriteSOT(sot *SOTMarker) error {
-	if err := c.w.WriteUint16(MarkerSOT); err != nil {
-		return err
-	}
-	if err := c.w.WriteUint16(10); err != nil { // Fixed length
-		return err
-	}
-	if err := c.w.WriteUint16(sot.TileIndex); err != nil {
-		return err
-	}
-	if err := c.w.WriteUint32(sot.TilePartLen); err != nil {
-		return err
-	}
-	if err := c.w.WriteByte(sot.TilePartIdx); err != nil {
-		return err
-	}
-	return c.w.WriteByte(sot.NumTileParts)
-}
-
-// WriteSOD writes the Start of Data marker
-func (c *CodestreamWriter) WriteSOD() error {
-	return c.w.WriteUint16(MarkerSOD)
-}
-
-// WriteEOC writes the End of Codestream marker
-func (c *CodestreamWriter) WriteEOC() error {
-	return c.w.WriteUint16(MarkerEOC)
-}
-
-// WriteBytes writes raw bytes
-func (c *CodestreamWriter) WriteBytes(data []byte) error {
-	return c.w.WriteBytes(data)
-}
-
-// Flush flushes the underlying buffer
-func (c *CodestreamWriter) Flush() error {
-	return c.w.Flush()
-}
-
-// Writer returns the underlying byte writer
-func (c *CodestreamWriter) Writer() *ByteWriter {
-	return c.w
-}
-
-// BuildDefaultCOD creates a default COD marker for lossless encoding
-func BuildDefaultCOD(decompLevels int, numLayers int, progression ProgressionOrder, useMCT bool) *CODMarker {
-	cod := &CODMarker{
-		Scod:             0, // No user-defined precincts, no SOP/EPH
-		Progression:      progression,
-		NumLayers:        uint16(numLayers),
-		MCT:              0,
-		DecompLevels:     byte(decompLevels),
-		CodeBlockWidthExp:  4, // 64x64 code-blocks
-		CodeBlockHeightExp: 4,
-		CodeBlockStyle:   0,
-		Transform:        TransformReversible53, // Lossless
-	}
-	if useMCT {
-		cod.MCT = 1
-	}
-	return cod
-}
-
-// BuildDefaultQCD creates a default QCD marker for lossless encoding
-func BuildDefaultQCD(decompLevels int, guardBits int) *QCDMarker {
-	// For reversible coding: 3*levels + 1 subbands (LL + 3 subbands per level)
-	numSubbands := 3*decompLevels + 1
-	qcd := &QCDMarker{
-		Sqcd:      0, // Reversible, no quantization
-		GuardBits: byte(guardBits),
-		StepSizes: make([]int16, numSubbands),
-	}
-	// All exponents set to 0 for reversible
-	return qcd
-}
-
-// BuildSIZ creates a SIZ marker from image parameters
-func BuildSIZ(width, height int, components []ComponentInfo, tileWidth, tileHeight int) *SIZMarker {
-	if tileWidth == 0 {
-		tileWidth = width
-	}
-	if tileHeight == 0 {
-		tileHeight = height
-	}
-
-	return &SIZMarker{
-		Rsiz:       0, // Baseline
-		XSiz:       uint32(width),
-		YSiz:       uint32(height),
-		XOsiz:      0,
-		YOsiz:      0,
-		XTsiz:      uint32(tileWidth),
-		YTsiz:      uint32(tileHeight),
-		XTOsiz:     0,
-		YTOsiz:     0,
-		Components: components,
-	}
-}
-
-// ParseCodestreamHeader parses a JPEG 2000 codestream and returns header info
-func ParseCodestreamHeader(data []byte) (*SIZMarker, *CODMarker, *QCDMarker, error) {
-	if len(data) < 4 {
-		return nil, nil, nil, errors.New("codestream too short")
-	}
-
-	// Check SOC marker
-	if binary.BigEndian.Uint16(data[0:2]) != MarkerSOC {
-		return nil, nil, nil, ErrInvalidMarker
-	}
-
-	var siz SIZMarker
-	var cod CODMarker
-	var qcd QCDMarker
-
-	pos := 2
-	for pos < len(data)-2 {
-		marker := binary.BigEndian.Uint16(data[pos : pos+2])
-		pos += 2
-
-		if marker == MarkerSOT || marker == MarkerSOD {
-			break
-		}
-
-		if pos+2 > len(data) {
-			break
-		}
-		length := int(binary.BigEndian.Uint16(data[pos : pos+2]))
-		if pos+length > len(data) {
-			break
-		}
-
-		segment := data[pos : pos+length]
-		pos += length
-
-		switch marker {
-		case MarkerSIZ:
-			if err := parseSIZSegment(segment, &siz); err != nil {
-				return nil, nil, nil, err
-			}
-		case MarkerCOD:
-			if err := parseCODSegment(segment, &cod); err != nil {
-				return nil, nil, nil, err
-			}
-		case MarkerQCD:
-			if err := parseQCDSegment(segment, &qcd); err != nil {
-				return nil, nil, nil, err
-			}
-		}
-	}
-
-	return &siz, &cod, &qcd, nil
-}
-
-func parseSIZSegment(data []byte, siz *SIZMarker) error {
-	if len(data) < 38 {
-		return ErrInvalidSIZ
-	}
-	siz.Rsiz = binary.BigEndian.Uint16(data[2:4])
-	siz.XSiz = binary.BigEndian.Uint32(data[4:8])
-	siz.YSiz = binary.BigEndian.Uint32(data[8:12])
-	siz.XOsiz = binary.BigEndian.Uint32(data[12:16])
-	siz.YOsiz = binary.BigEndian.Uint32(data[16:20])
-	siz.XTsiz = binary.BigEndian.Uint32(data[20:24])
-	siz.YTsiz = binary.BigEndian.Uint32(data[24:28])
-	siz.XTOsiz = binary.BigEndian.Uint32(data[28:32])
-	siz.YTOsiz = binary.BigEndian.Uint32(data[32:36])
-	numComps := int(binary.BigEndian.Uint16(data[36:38]))
-
-	siz.Components = make([]ComponentInfo, numComps)
-	pos := 38
-	for i := 0; i < numComps && pos+3 <= len(data); i++ {
-		ssiz := data[pos]
-		siz.Components[i].Signed = (ssiz & 0x80) != 0
-		siz.Components[i].Precision = int(ssiz&0x7F) + 1
-		siz.Components[i].XRsiz = int(data[pos+1])
-		siz.Components[i].YRsiz = int(data[pos+2])
-		pos += 3
-	}
-	return nil
-}
-
-func parseCODSegment(data []byte, cod *CODMarker) error {
-	if len(data) < 12 {
-		return ErrInvalidCOD
-	}
-	cod.Scod = data[2]
-	cod.Progression = ProgressionOrder(data[3])
-	cod.NumLayers = binary.BigEndian.Uint16(data[4:6])
-	cod.MCT = data[6]
-	cod.DecompLevels = data[7]
-	cod.CodeBlockWidthExp = data[8]
-	cod.CodeBlockHeightExp = data[9]
-	cod.CodeBlockStyle = data[10]
-	cod.Transform = TransformType(data[11])
-
-	if cod.Scod&CodingStylePrecinctsUser != 0 && len(data) > 12 {
-		cod.PrecinctSizes = make([]byte, len(data)-12)
-		copy(cod.PrecinctSizes, data[12:])
-	}
-	return nil
-}
-
-func parseQCDSegment(data []byte, qcd *QCDMarker) error {
-	if len(data) < 3 {
-		return ErrInvalidQCD
-	}
-	sqcd := data[2]
-	qcd.Sqcd = sqcd & 0x1F
-	qcd.GuardBits = (sqcd >> 5) & 0x07
-
-	remaining := len(data) - 3
-	if qcd.Sqcd == 0 { // Reversible
-		qcd.StepSizes = make([]int16, remaining)
-		for i := 0; i < remaining; i++ {
-			qcd.StepSizes[i] = int16(data[3+i] >> 3)
-		}
-	}
-	return nil
+	out = be16(out, MarkerSOT)
+	out = be16(out, 10)
+	out = be16(out, 0)
+	out = be32(out, uint32(psot))
+	out = append(out, 0, 1)
+	out = be16(out, MarkerSOD)
+	out = append(out, tile...)
+	return be16(out, MarkerEOC), nil
 }

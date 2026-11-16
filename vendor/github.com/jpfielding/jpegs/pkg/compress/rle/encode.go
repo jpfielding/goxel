@@ -5,106 +5,77 @@ import (
 	"fmt"
 	"image"
 	"io"
+	"math"
 )
 
 // Encode encodes an image into DICOM RLE format.
-// It supports 8-bit (Gray) and 16-bit (Gray16) images.
-// 16-bit images are split into High-Byte and Low-Byte planes for better compression.
+// It supports 8-bit (*image.Gray, one segment) and 16-bit (*image.Gray16, two
+// segments: high byte plane then low byte plane) images.
+//
+// Each row of each byte plane is PackBits-compressed separately, as PS3.5
+// G.3.1 requires, so no run crosses a row boundary. Each segment is padded to
+// even length.
 func Encode(w io.Writer, img image.Image) error {
-	var bounds = img.Bounds()
-	var width, height = bounds.Dx(), bounds.Dy()
-	var numPixels = width * height
+	bounds := img.Bounds()
+	width, height := bounds.Dx(), bounds.Dy()
+	numPixels := width * height
 
-	var segments [][]byte
-
+	var planes [][]byte
 	switch src := img.(type) {
 	case *image.Gray:
-		// 8-bit: Single segment
-		// Use Pix directly if stride matches?
-		// But Pix might have stride padding. Better to extract contiguous bytes?
-		// Or just compress row by row? PackBits usually compresses continuous stream.
-		// "The RLE algorithm ... operates on ... segments".
-		// Segment is usually the whole frame component.
-		// We need contiguous bytes.
-		data := make([]byte, numPixels)
-		i := 0
+		plane := make([]byte, 0, numPixels)
 		for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
-			rowOffset := (y - bounds.Min.Y) * src.Stride
-			row := src.Pix[rowOffset : rowOffset+width]
-			copy(data[i:], row)
-			i += width
+			off := src.PixOffset(bounds.Min.X, y)
+			plane = append(plane, src.Pix[off:off+width]...)
 		}
-		segments = append(segments, encodePackBits(data))
+		planes = [][]byte{plane}
 
 	case *image.Gray16:
-		// 16-bit: Split into High Byte and Low Byte planes
-		highBytes := make([]byte, numPixels)
-		lowBytes := make([]byte, numPixels)
-
-		i := 0
+		high := make([]byte, 0, numPixels)
+		low := make([]byte, 0, numPixels)
 		for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
-			for x := bounds.Min.X; x < bounds.Max.X; x++ {
-				// Gray16At handles bounds checks, but direct slice access is faster if possible.
-				// But Pix is BigEndian in Go image types usually?
-				// image.Gray16 Pix is []uint8. "Pix holds the image's pixels, as big-endian uint16s."
-				// So even bytes = High, odd bytes = Low.
-				rowOffset := (y-bounds.Min.Y)*src.Stride + (x-bounds.Min.X)*2
-				highBytes[i] = src.Pix[rowOffset]
-				lowBytes[i] = src.Pix[rowOffset+1]
-				i++
+			off := src.PixOffset(bounds.Min.X, y)
+			row := src.Pix[off : off+2*width]
+			for x := 0; x < width; x++ {
+				high = append(high, row[2*x])
+				low = append(low, row[2*x+1])
 			}
 		}
-
-		segments = append(segments, encodePackBits(highBytes)) // Segment 1: High Bytes
-		segments = append(segments, encodePackBits(lowBytes))  // Segment 2: Low Bytes
+		planes = [][]byte{high, low}
 
 	default:
-		return fmt.Errorf("rle: unsupported image type %T", img)
+		return fmt.Errorf("%w: image type %T (want *image.Gray or *image.Gray16)", ErrUnsupported, img)
 	}
 
-	// Calculate DICOM RLE Header
-	// Header is 64 bytes.
-	// Byte 0-3: Num Segments (uint32)
-	// Byte 4-63: 15 offsets (uint32).
-	// Offsets are relative to the start of the Header (byte 0).
-
-	// Pad segments to even length (DICOM RLE requirement)
-	for i := range segments {
-		if len(segments[i])%2 != 0 {
-			segments[i] = append(segments[i], 0x00)
+	segments := make([][]byte, len(planes))
+	for i, p := range planes {
+		seg := encodePackBitsRows(p, width)
+		if len(seg)%2 != 0 {
+			seg = append(seg, 0x00)
 		}
+		segments[i] = seg
 	}
 
-	headerSize := 64
-	numSegments := uint32(len(segments))
-	if numSegments > 15 {
-		return fmt.Errorf("rle: too many segments (%d)", numSegments)
+	// Header: uint32 segment count, then 15 uint32 offsets measured from the
+	// start of the header (PS3.5 G.5).
+	var header [headerSize]byte
+	binary.LittleEndian.PutUint32(header[0:4], uint32(len(segments)))
+	offset := uint64(headerSize)
+	for i, seg := range segments {
+		if offset > math.MaxUint32 {
+			return fmt.Errorf("%w: segment %d offset %d exceeds 32 bits", ErrUnsupported, i, offset)
+		}
+		binary.LittleEndian.PutUint32(header[4+4*i:8+4*i], uint32(offset))
+		offset += uint64(len(seg))
 	}
 
-	offsets := make([]uint32, 15)
-	currentOffset := uint32(headerSize)
-
-	for i := range segments {
-		offsets[i] = currentOffset
-		currentOffset += uint32(len(segments[i]))
+	if _, err := w.Write(header[:]); err != nil {
+		return fmt.Errorf("rle: write header: %w", err)
 	}
-
-	// Write Header
-	// Num Segments
-	if err := binary.Write(w, binary.LittleEndian, numSegments); err != nil {
-		return err
-	}
-	// Offsets
-	if err := binary.Write(w, binary.LittleEndian, offsets); err != nil {
-		return err
-	}
-
-	// Write Segments
-	for _, seg := range segments {
+	for i, seg := range segments {
 		if _, err := w.Write(seg); err != nil {
-			return err
+			return fmt.Errorf("rle: write segment %d: %w", i, err)
 		}
 	}
-
 	return nil
 }

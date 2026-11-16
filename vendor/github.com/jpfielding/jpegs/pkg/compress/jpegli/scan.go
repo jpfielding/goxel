@@ -1,450 +1,288 @@
 package jpegli
 
-import (
-	"bufio"
-	"errors"
-	"fmt"
-	"image"
-	"image/color"
-	"io"
-	"log/slog"
-)
+import "fmt"
 
-// decodeScan decodes the compressed scan data
-func (d *Decoder) decodeScan() (image.Image, error) {
-	// Read SOS parameters
-	if err := d.readSOS(); err != nil {
-		return nil, err
+// bitReader reads the entropy-coded segment of a scan from an in-memory
+// stream: MSB first, 0xFF 0x00 unstuffed to 0xFF. It never reads past a
+// marker; when it reaches one (or the end of the data) it stops and records
+// where, so the caller can handle restarts and the end of the scan. Running
+// out of bits is a truncation error, never zero padding.
+type bitReader struct {
+	data []byte
+	pos  int    // next unread byte
+	acc  uint64 // bit accumulator; the low n bits are valid
+	n    int
+
+	stopped   bool // reached a marker or the end of data
+	markerPos int  // offset of the 0xFF that starts the marker (or len(data))
+	marker    byte // marker code; 0 when the data ended instead
+
+	restarts bool // a DRI is in effect: RSTn markers are expected
+}
+
+func (b *bitReader) fill() {
+	for b.n <= 56 && !b.stopped {
+		if b.pos >= len(b.data) {
+			b.stopped, b.markerPos = true, len(b.data)
+			return
+		}
+		c := b.data[b.pos]
+		if c != 0xFF {
+			b.acc = b.acc<<8 | uint64(c)
+			b.n += 8
+			b.pos++
+			continue
+		}
+		k := b.pos + 1
+		if k < len(b.data) && b.data[k] == 0x00 { // stuffed 0xFF
+			b.acc = b.acc<<8 | 0xFF
+			b.n += 8
+			b.pos += 2
+			continue
+		}
+		for k < len(b.data) && b.data[k] == 0xFF { // fill bytes before a marker
+			k++
+		}
+		b.stopped, b.markerPos = true, b.pos
+		if k < len(b.data) {
+			b.marker = b.data[k]
+		}
+		return
 	}
+}
 
-	// Debug: check remaining bytes in reader
-	if br, ok := d.r.(interface{ Len() int }); ok {
-		slog.Debug("remaining bytes after SOS", slog.Int("bytes", br.Len()))
+// errEnd is the error for running out of entropy-coded data mid-scan: an
+// illegal restart marker when the reader stopped at RSTn without a DRI,
+// otherwise truncation.
+func (b *bitReader) errEnd() error {
+	if !b.restarts && b.marker >= 0xD0 && b.marker <= 0xD7 {
+		return fmt.Errorf("%w: restart marker RST%d at offset %d without DRI", ErrInvalidData, b.marker-0xD0, b.markerPos)
 	}
+	return &TruncatedError{Offset: b.markerPos, Context: "entropy-coded scan"}
+}
 
-	// Create bit reader for entropy-coded data
-	br := newBitReader(d.r)
+// readBits reads n <= 16 bits.
+func (b *bitReader) readBits(n int) (int, error) {
+	if b.n < n {
+		b.fill()
+		if b.n < n {
+			return 0, b.errEnd()
+		}
+	}
+	b.n -= n
+	return int(b.acc>>b.n) & (1<<n - 1), nil
+}
 
-	// Allocate image based on precision
-	var img image.Image
-	if d.precision <= 8 {
-		img = image.NewGray(image.Rect(0, 0, d.width, d.height))
+// decodeHuffman decodes one symbol with the T.81 F.2.2.3 procedure, using
+// the 8-bit lookup for short codes.
+func (b *bitReader) decodeHuffman(ht *huffmanTable) (int, error) {
+	if b.n < 16 {
+		b.fill()
+		if b.n == 0 {
+			return 0, b.errEnd()
+		}
+	}
+	// Top 16 bits, zero-padded past the available bits. A code that needs a
+	// padded bit is truncation, detected below by comparing its length.
+	var peek uint32
+	if b.n >= 16 {
+		peek = uint32(b.acc>>(b.n-16)) & 0xFFFF
 	} else {
-		img = image.NewGray16(image.Rect(0, 0, d.width, d.height))
+		peek = uint32(b.acc<<(16-b.n)) & 0xFFFF
 	}
-
-	// Get Huffman table for first component
-	tableIdx := 0
-	if len(d.compInfo) > 0 {
-		tableIdx = d.compInfo[0].tableIndex
-	}
-	if tableIdx < 0 || tableIdx >= len(d.dcTables) {
-		return nil, fmt.Errorf("jpegli: Huffman table selector %d out of range", tableIdx)
-	}
-	ht := d.dcTables[tableIdx]
-	if ht == nil {
-		return nil, errors.New("missing Huffman table")
-	}
-
-	// Maximum value based on precision
-	maxVal := (1 << d.precision) - 1
-
-	// Previous row for prediction
-	prevRow := make([]int, d.width)
-	currRow := make([]int, d.width)
-
-	// Restart counter
-	restartCounter := 0
-	mcuCount := 0
-
-	for y := 0; y < d.height; y++ {
-		for x := 0; x < d.width; x++ {
-			// Check for restart marker
-			if d.restartInterval > 0 && mcuCount > 0 && mcuCount%d.restartInterval == 0 {
-				if err := br.alignToByte(); err != nil {
-					return nil, err
-				}
-				// Read restart marker
-				b1, _ := br.readByte()
-				b2, _ := br.readByte()
-				if b1 != 0xFF || (b2&0xF8) != 0xD0 {
-					// Put bytes back or skip
-					slog.Debug("missed restart marker", slog.Int("x", x), slog.Int("y", y))
-				}
-				restartCounter++
-				// Reset prediction
-				for i := range prevRow {
-					prevRow[i] = 0
-				}
-			}
-
-			// Decode Huffman symbol (# of bits for difference)
-			ssss, err := d.decodeHuffman(br, ht)
-			if err != nil {
-				if err == io.EOF {
-					// End of data
-					totalPixels := y*d.width + x
-					expectedPixels := d.width * d.height
-					// If we have most of the image, return what we have
-					if float64(totalPixels) > float64(expectedPixels)*0.99 {
-						slog.Warn("Premature EOF in scan data, returning partial image",
-							slog.Int("decoded", totalPixels),
-							slog.Int("expected", expectedPixels))
-						// Fill remaining pixels in this row with last value
-						for k := x; k < d.width; k++ {
-							if k > 0 {
-								currRow[k] = currRow[k-1]
-							}
-						}
-						return img, nil
-					}
-					return nil, fmt.Errorf("premature EOF at pixel (%d,%d), decoded %d/%d pixels (%.1f%%)",
-						x, y, totalPixels, expectedPixels, float64(totalPixels)*100/float64(expectedPixels))
-				}
-				// Check if we're close enough to EOF to return partial image
-				totalPixels := y*d.width + x
-				expectedPixels := d.width * d.height
-				if float64(totalPixels) > float64(expectedPixels)*0.99 {
-					slog.Warn("Huffman error near end of image, returning partial",
-						slog.Int("decoded", totalPixels),
-						slog.Int("expected", expectedPixels))
-					// Fill remaining pixels with last value
-					lastVal := 0
-					if x > 0 {
-						lastVal = currRow[x-1]
-					}
-					for k := x; k < d.width; k++ {
-						currRow[k] = lastVal
-					}
-					// Write filled pixels to image
-					if grayImg, ok := img.(*image.Gray); ok {
-						for k := x; k < d.width; k++ {
-							grayImg.SetGray(k, y, color.Gray{Y: uint8(currRow[k])})
-						}
-					} else if gray16Img, ok := img.(*image.Gray16); ok {
-						for k := x; k < d.width; k++ {
-							gray16Img.SetGray16(k, y, color.Gray16{Y: uint16(currRow[k])})
-						}
-					}
-					return img, nil
-				}
-				offset := int64(0)
-				if br != nil {
-					offset = br.totalBits / 8
-				}
-				slog.Error("decodeHuffman failed", slog.Int("x", x), slog.Int("y", y), slog.Int64("offset", offset), slog.Any("error", err))
-				return nil, err
-			}
-
-			if ssss > 16 {
-				return nil, fmt.Errorf("jpegli: invalid difference category %d at pixel (%d,%d)", ssss, x, y)
-			}
-
-			// Read additional bits for the difference value
-			var diff int
-			if ssss > 0 {
-				bits, err := br.readBits(ssss)
-				if err != nil {
-					if err == io.EOF {
-						totalPixels := y*d.width + x
-						expectedPixels := d.width * d.height
-						if float64(totalPixels) > float64(expectedPixels)*0.99 {
-							slog.Warn("Premature EOF reading difference bits, returning partial image",
-								slog.Int("decoded", totalPixels),
-								slog.Int("expected", expectedPixels))
-							return img, nil
-						}
-					}
-					return nil, err
-				}
-				// Convert to signed value
-				diff = extend(bits, ssss)
-			}
-
-			// Get prediction
-			pred := d.predict(currRow, prevRow, x, y)
-
-			// Apply point transform
-			if d.pointTrans > 0 {
-				diff <<= d.pointTrans
-			}
-
-			// Reconstruct pixel value
-			val := (pred + diff) & maxVal
-
-			currRow[x] = val
-			mcuCount++
-
-			// Store in image
-			if grayImg, ok := img.(*image.Gray); ok {
-				grayImg.SetGray(x, y, color.Gray{Y: uint8(val)})
-			} else if gray16Img, ok := img.(*image.Gray16); ok {
-				gray16Img.SetGray16(x, y, color.Gray16{Y: uint16(val)})
-			}
+	if e := ht.lookup[peek>>8]; e >= 0 {
+		size := int(e >> 8)
+		if size > b.n {
+			return 0, b.errEnd()
 		}
-		// Swap rows
-		prevRow, currRow = currRow, prevRow
-		for i := range currRow {
-			currRow[i] = 0
+		b.n -= size
+		return int(e & 0xFF), nil
+	}
+	for l := 9; l <= 16; l++ {
+		code := int32(peek >> (16 - l))
+		if code <= ht.maxcode[l] {
+			if l > b.n {
+				return 0, b.errEnd()
+			}
+			b.n -= l
+			return int(ht.values[ht.valptr[l]+int(code-ht.mincode[l])]), nil
 		}
 	}
-
-	return img, nil
+	if b.n < 16 {
+		return 0, b.errEnd()
+	}
+	return 0, fmt.Errorf("%w: invalid Huffman code 0x%04X near offset %d", ErrInvalidData, peek, b.pos)
 }
 
-// predict computes the predicted value based on the selected predictor
-func (d *Decoder) predict(currRow, prevRow []int, x, y int) int {
-	var Ra, Rb, Rc int
-
-	// Get neighbor values
-	if x > 0 {
-		Ra = currRow[x-1] // Left
+// checkSegmentEnd verifies that only the padding bits of the current byte
+// remain before the marker that ends an entropy-coded segment.
+func (b *bitReader) checkSegmentEnd(where string) error {
+	b.fill()
+	if b.n >= 8 {
+		return fmt.Errorf("%w: entropy-coded data continues past the %s (%d unread bits)", ErrInvalidData, where, b.n)
 	}
-	if y > 0 {
-		Rb = prevRow[x] // Above
-		if x > 0 {
-			Rc = prevRow[x-1] // Above-left
+	return nil
+}
+
+// peek16 returns the next 16 bits without consuming them; ok is false when
+// fewer than 16 remain before the end of the segment.
+func (b *bitReader) peek16() (v int, ok bool) {
+	if b.n < 16 {
+		b.fill()
+		if b.n < 16 {
+			return 0, false
 		}
 	}
+	return int(b.acc>>(b.n-16)) & 0xFFFF, true
+}
 
-	// First row/column handling
-	if y == 0 && x == 0 {
-		// First pixel: predict from half max value
-		return 1 << (d.precision - 1)
-	}
-	if y == 0 {
-		// First row: use left neighbor
-		return Ra
-	}
-	if x == 0 {
-		// First column: use above neighbor
-		return Rb
-	}
+// padOnes reports whether the unread bits of the current byte are all 1s,
+// the padding T.81 F.1.2.3 prescribes. Call after checkSegmentEnd.
+func (b *bitReader) padOnes() bool {
+	return b.acc&(1<<b.n-1) == 1<<b.n-1
+}
 
-	// Apply selected predictor
-	switch d.predictor {
-	case 0:
-		return 0 // No prediction
+// restart consumes the RSTn marker that must follow a restart interval
+// (T.81 H.1.1, B.2.1): discard the padding bits, require RST(want), and
+// resume at the next entropy-coded segment.
+func (b *bitReader) restart(want int) error {
+	if err := b.checkSegmentEnd("restart interval"); err != nil {
+		return err
+	}
+	switch {
+	case b.marker == 0:
+		return &TruncatedError{Offset: b.markerPos, Context: "restart marker"}
+	case int(b.marker) != 0xD0+want:
+		return fmt.Errorf("%w: expected RST%d at offset %d, got marker 0xFF%02X", ErrInvalidData, want, b.markerPos, b.marker)
+	}
+	// Skip 0xFF, any fill bytes, and the marker code.
+	k := b.markerPos + 1
+	for b.data[k] == 0xFF {
+		k++
+	}
+	b.pos, b.acc, b.n = k+1, 0, 0
+	b.stopped, b.marker = false, 0
+	return nil
+}
+
+// predict applies predictor sel (T.81 Table H.1) to the neighbours Ra
+// (left), Rb (above) and Rc (above-left). The divisions by 2 are arithmetic
+// right shifts, as in libjpeg-turbo and libjpeg (IJG/Richter); they differ
+// from truncating division for negative odd differences.
+func predict(sel, ra, rb, rc int) int {
+	switch sel {
 	case 1:
-		return Ra // Left
+		return ra
 	case 2:
-		return Rb // Above
+		return rb
 	case 3:
-		return Rc // Above-left
+		return rc
 	case 4:
-		return Ra + Rb - Rc // Linear
+		return ra + rb - rc
 	case 5:
-		return Ra + (Rb-Rc)/2
+		return ra + (rb-rc)>>1
 	case 6:
-		return Rb + (Ra-Rc)/2
-	case 7:
-		return (Ra + Rb) / 2 // Average
-	default:
-		return Ra // Default to left
+		return rb + (ra-rc)>>1
+	default: // 7, validated by readSOS
+		return (ra + rb) >> 1
 	}
 }
 
-// extend converts a partial bit sequence to a signed integer
+// extend converts SSSS appended bits to a signed difference (T.81 F.2.2.1).
 func extend(bits, ssss int) int {
-	if ssss == 0 {
-		return 0
-	}
-	vt := 1 << (ssss - 1)
-	if bits < vt {
-		// Negative value
+	if bits < 1<<(ssss-1) {
 		return bits - (1<<ssss - 1)
 	}
 	return bits
 }
 
-// decodeHuffman decodes a single Huffman symbol
-func (d *Decoder) decodeHuffman(br *bitReader, ht *huffmanTable) (int, error) {
-	// Try 8-bit lookup first
-	peek, err := br.peekBits(8)
-	if err != nil && err != io.EOF {
-		return 0, err
+// storeSample writes sample v at index i of an image.Gray (wide=false) or
+// big-endian image.Gray16 (wide=true) pixel buffer.
+func storeSample(pix []byte, i, v int, wide bool) {
+	if wide {
+		pix[2*i] = byte(v >> 8)
+		pix[2*i+1] = byte(v)
+		return
 	}
+	pix[i] = byte(v)
+}
 
-	// Ensure peek is within bounds (0-255)
-	peek = peek & 0xFF
+// decodeScan decodes the T.81 Annex H entropy-coded scan starting at d.pos
+// into pix and then reads the trailer up to EOI. saw16 reports whether any
+// sample had difference category 16; d.legacyMark records whether the 16
+// bits after the first one were 0x7FFF, the legacy encoder's appended bits.
+//
+// The DPCM loop runs in the reduced domain P' = P - Pt; reconstructed
+// samples are shifted left by Pt on store. A restart resets prediction:
+// the first row of each interval is predicted as the first row of the scan.
+func (d *Decoder) decodeScan(ht *huffmanTable, pix []byte, wide bool) (saw16 bool, err error) {
+	w, h, pt := d.width, d.height, d.pointTrans
+	pp := d.precision - pt
+	mask := 1<<pp - 1
+	br := &bitReader{data: d.data, pos: d.pos, restarts: d.restartInterval > 0}
+	d.legacyMark = false
+	restartRows := d.restartInterval / w
 
-	lookup := ht.lookup[peek]
-
-	if lookup >= 0 {
-		size := int(lookup >> 8)
-		value := int(lookup & 0xFF)
-		if br.eof && size > br.bits {
-			return 0, io.EOF
-		}
-		br.consumeBits(size)
-		return value, nil
-	}
-
-	// Slow path: decode bit by bit
-	code := 0
-	for size := 1; size <= 16; size++ {
-		bit, err := br.readBit()
-		if err != nil {
-			return 0, err
-		}
-		code = code<<1 | bit
-
-		// Search for matching code
-		codeIdx := 0
-		for i := 1; i < size; i++ {
-			codeIdx += ht.bits[i]
-		}
-		for i := 0; i < ht.bits[size]; i++ {
-			if ht.codes[codeIdx+i] == uint16(code) {
-				return int(ht.values[codeIdx+i]), nil
+	prev, cur := make([]int, w), make([]int, w)
+	rst := 0
+	for y := 0; y < h; y++ {
+		first := y == 0
+		if restartRows > 0 && y > 0 && y%restartRows == 0 {
+			if err := br.restart(rst); err != nil {
+				return saw16, err
 			}
+			rst = (rst + 1) & 7
+			first = true
 		}
-	}
-
-	return 0, fmt.Errorf("invalid Huffman code: reached 16 bits without match, code=%b", code)
-}
-
-// bitReader reads bits from a byte stream, handling byte stuffing (0xFF00 -> 0xFF)
-type bitReader struct {
-	r         *bufio.Reader
-	buf       uint32
-	bits      int
-	eof       bool
-	totalBits int64
-}
-
-func newBitReader(r io.Reader) *bitReader {
-	br, ok := r.(*bufio.Reader)
-	if !ok {
-		br = bufio.NewReader(r)
-	}
-	return &bitReader{r: br}
-}
-
-func (b *bitReader) fillBits() error {
-	for b.bits < 16 && !b.eof {
-		c, err := b.r.ReadByte()
-		if err != nil {
-			if err == io.EOF {
-				b.eof = true
-				return nil
-			}
-			return err
-		}
-
-		// Handle byte stuffing
-		if c == 0xFF {
-			// Peek next byte to see if it's stuffed 0x00 or a marker
-			nextBytes, err := b.r.Peek(1)
+		for x := 0; x < w; x++ {
+			ssss, err := br.decodeHuffman(ht)
 			if err != nil {
-				if err == io.EOF {
-					// 0xFF at very end of data
-					b.eof = true
-					return nil
+				return saw16, err
+			}
+			var diff int
+			switch {
+			case ssss > 16:
+				return saw16, fmt.Errorf("%w: difference category %d at sample (%d,%d)", ErrInvalidData, ssss, x, y)
+			case ssss == 16:
+				// T.81 H.1.2.2: category 16 is the difference 32768 with
+				// no appended bits, possible only when P' = 16.
+				if pp != 16 {
+					return saw16, fmt.Errorf("%w: difference category 16 at sample (%d,%d) with P' = %d", ErrInvalidData, x, y, pp)
 				}
-				return err
+				if !saw16 {
+					v, ok := br.peek16()
+					d.legacyMark = ok && v == 0x7FFF
+				}
+				diff, saw16 = 32768, true
+			case ssss > 0:
+				bits, err := br.readBits(ssss)
+				if err != nil {
+					return saw16, err
+				}
+				diff = extend(bits, ssss)
 			}
-			next := nextBytes[0]
 
-			if next == 0x00 {
-				// Stuffed byte - use 0xFF
-				b.r.Discard(1) // Consume the 0x00
-				b.buf = b.buf<<8 | 0xFF
-				b.bits += 8
-			} else if next >= 0xD0 && next <= 0xD7 {
-				// Restart marker - ignore but must remain byte-aligned
-				b.r.Discard(1) // Consume the marker byte
-				continue
-			} else {
-				// Other marker (like EOI) - stop reading data
-				b.r.UnreadByte() // Put back the 0xFF
-				b.eof = true
-				return nil
+			var pred int
+			switch {
+			case first && x == 0:
+				pred = 1 << (pp - 1)
+			case first:
+				pred = cur[x-1]
+			case x == 0:
+				pred = prev[0]
+			default:
+				pred = predict(d.predictor, cur[x-1], prev[x], prev[x-1])
 			}
-		} else {
-			b.buf = b.buf<<8 | uint32(c)
-			b.bits += 8
+			v := (pred + diff) & mask
+			cur[x] = v
+			storeSample(pix, y*w+x, v<<pt, wide)
 		}
+		prev, cur = cur, prev
 	}
-	return nil
-}
 
-func (b *bitReader) readBit() (int, error) {
-	if b.bits < 1 {
-		if err := b.fillBits(); err != nil {
-			return 0, err
-		}
+	if err := br.checkSegmentEnd("last sample"); err != nil {
+		return saw16, err
 	}
-	if b.bits < 1 {
-		// EOF reached: no more entropy-coded data.
-		return 0, io.EOF
-	}
-	b.bits--
-	b.totalBits++
-	return int((b.buf >> b.bits) & 1), nil
-}
-
-func (b *bitReader) readBits(n int) (int, error) {
-	if n == 0 {
-		return 0, nil
-	}
-	if n > 16 {
-		return 0, fmt.Errorf("jpegli: cannot read %d bits at once", n)
-	}
-	for b.bits < n {
-		if err := b.fillBits(); err != nil {
-			return 0, err
-		}
-		if b.eof && b.bits < n {
-			// EOF reached. Pad with 0s.
-			validBitsVal := int(b.buf & ((1 << b.bits) - 1))
-			missingBits := n - b.bits
-			// Shift valid bits to MSB of result, lower bits are 0s
-			result := validBitsVal << missingBits
-
-			b.bits = 0 // Consumed all valid
-			b.totalBits += int64(n)
-			return result, nil
-		}
-	}
-	b.bits -= n
-	b.totalBits += int64(n)
-	mask := (1 << n) - 1
-	return int((b.buf >> b.bits) & uint32(mask)), nil
-}
-
-func (b *bitReader) peekBits(n int) (int, error) {
-	for b.bits < n {
-		if err := b.fillBits(); err != nil {
-			return 0, err
-		}
-		if b.eof && b.bits < n {
-			// Pad with 0s and mask to requested bits
-			// Current valid bits (at bottom of buffer) shifted left
-			// Lower bits are 0s by default
-			val := int(b.buf) << (n - b.bits)
-
-			mask := (1 << n) - 1
-			return val & mask, nil
-		}
-	}
-	mask := (1 << n) - 1
-	return int((b.buf >> (b.bits - n)) & uint32(mask)), nil
-}
-
-func (b *bitReader) consumeBits(n int) {
-	b.bits -= n
-	if b.bits < 0 && b.eof {
-		b.bits = 0
-	}
-	b.totalBits += int64(n)
-}
-
-func (b *bitReader) alignToByte() error {
-	b.bits = b.bits & ^7 // Clear remaining bits in current byte
-	return nil
-}
-
-func (b *bitReader) readByte() (byte, error) {
-	return b.r.ReadByte()
+	d.pos = br.markerPos
+	return saw16, d.readTrailer()
 }

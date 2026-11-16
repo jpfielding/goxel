@@ -1,229 +1,197 @@
 package jpegli
 
 import (
-	"encoding/binary"
+	"fmt"
 	"image"
 	"io"
 )
 
-// Options configures JPEG Lossless encoding.
+// Options configures JPEG Lossless encoding. The zero value encodes with
+// predictor 1, no point transform, no restarts and a precision derived from
+// the image.
 type Options struct {
-	// Predictor selection (1-7, default 1)
+	// Predictor is the selection value (SOS Ss), 1..7. Zero means 1.
 	Predictor int
-	// Point transform (0 for lossless)
+	// PointTransform (SOS Al), 0..Precision-1. Samples are shifted right by
+	// it before coding, so the low PointTransform bits are lost.
 	PointTransform int
+	// Precision is the sample precision P (SOF3), 2..16. Zero means 8 for
+	// *image.Gray and 16 otherwise. Every sample must fit in P bits.
+	Precision int
+	// RestartIntervalRows emits a restart marker every this many rows; zero
+	// disables restarts. RestartIntervalRows × width must fit the 16-bit DRI
+	// field.
+	RestartIntervalRows int
 }
 
-// Encode writes img to w in JPEG Lossless format
+// Encode writes img to w as a T.81 Annex H (Process 14) JPEG Lossless
+// stream: one component, the fixed 17-symbol DC Huffman table, SOI through
+// EOI. *image.Gray and *image.Gray16 samples are coded as stored; for other
+// image types the red channel of RGBA() is scaled to the precision. A nil
+// opts uses the Options zero value.
 func Encode(w io.Writer, img image.Image, opts *Options) error {
-	enc := &encoder{
-		w:         w,
-		predictor: 1,
-	}
+	var o Options
 	if opts != nil {
-		if opts.Predictor >= 1 && opts.Predictor <= 7 {
-			enc.predictor = opts.Predictor
+		o = *opts
+	}
+	b := img.Bounds()
+	width, height := b.Dx(), b.Dy()
+	if width < 1 || height < 1 || width > 65535 || height > 65535 {
+		return fmt.Errorf("%w: dimensions %dx%d (allowed 1..65535)", ErrInvalidParameter, width, height)
+	}
+	if o.Precision == 0 {
+		o.Precision = 16
+		if _, ok := img.(*image.Gray); ok {
+			o.Precision = 8
 		}
-		enc.pointTrans = opts.PointTransform
 	}
-	return enc.encode(img)
+	if o.Predictor == 0 {
+		o.Predictor = 1
+	}
+	switch {
+	case o.Precision < 2 || o.Precision > 16:
+		return fmt.Errorf("%w: precision %d (allowed 2..16)", ErrInvalidParameter, o.Precision)
+	case o.Predictor < 1 || o.Predictor > 7:
+		return fmt.Errorf("%w: predictor %d (allowed 1..7)", ErrInvalidParameter, o.Predictor)
+	case o.PointTransform < 0 || o.PointTransform >= o.Precision:
+		return fmt.Errorf("%w: point transform %d (allowed 0..%d)", ErrInvalidParameter, o.PointTransform, o.Precision-1)
+	case o.RestartIntervalRows < 0 || o.RestartIntervalRows > 65535 || o.RestartIntervalRows*width > 65535:
+		return fmt.Errorf("%w: restart interval %d rows x width %d does not fit the 16-bit DRI field", ErrInvalidParameter, o.RestartIntervalRows, width)
+	}
+
+	ht := defaultTable()
+	out := make([]byte, 0, 64+width*height*o.Precision/8)
+	out = append(out, 0xFF, 0xD8) // SOI
+	// JFIF APP0: version 1.1, no units, density 1x1, no thumbnail.
+	out = append(out, 0xFF, 0xE0, 0x00, 0x10, 'J', 'F', 'I', 'F', 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00)
+	// SOF3: P, Y, X, Nf = 1, component 1 sampled 1x1, Tq = 0.
+	out = append(out, 0xFF, 0xC3, 0x00, 0x0B, byte(o.Precision),
+		byte(height>>8), byte(height), byte(width>>8), byte(width), 1, 1, 0x11, 0)
+	// DHT: DC table 0.
+	out = append(out, 0xFF, 0xC4, 0x00, byte(2+1+16+len(ht.values)), 0x00)
+	for l := 1; l <= 16; l++ {
+		out = append(out, byte(ht.bits[l]))
+	}
+	out = append(out, ht.values...)
+	if o.RestartIntervalRows > 0 {
+		ri := o.RestartIntervalRows * width
+		out = append(out, 0xFF, 0xDD, 0x00, 0x04, byte(ri>>8), byte(ri))
+	}
+	// SOS: Ns = 1, component 1 with DC table 0, Ss = predictor, Se = 0,
+	// Ah = 0, Al = point transform.
+	out = append(out, 0xFF, 0xDA, 0x00, 0x08, 1, 1, 0x00, byte(o.Predictor), 0, byte(o.PointTransform))
+
+	out, err := encodeScan(out, img, ht, o)
+	if err != nil {
+		return err
+	}
+	out = append(out, 0xFF, 0xD9) // EOI
+	if _, err := w.Write(out); err != nil {
+		return fmt.Errorf("jpegli: write: %w", err)
+	}
+	return nil
 }
 
-type encoder struct {
-	w          io.Writer
-	predictor  int
-	pointTrans int
-	precision  int
-	width      int
-	height     int
+// defaultTable is the fixed DC table the encoder writes: 17 symbols
+// (SSSS 0..16) with code lengths 2, 3×5, then 4..14.
+func defaultTable() *huffmanTable {
+	ht := &huffmanTable{
+		bits:   [17]int{0, 0, 1, 5, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0},
+		values: []byte{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+	}
+	generateHuffmanCodes(ht)
+	return ht
 }
 
-func (e *encoder) encode(img image.Image) error {
-	bounds := img.Bounds()
-	e.width = bounds.Dx()
-	e.height = bounds.Dy()
-
-	// Determine precision from image type
-	switch img.(type) {
-	case *image.Gray16:
-		e.precision = 16
+// rowSamples writes row y (relative to the bounds) of img into dst.
+func rowSamples(img image.Image, y, precision int, dst []int) {
+	b := img.Bounds()
+	switch m := img.(type) {
 	case *image.Gray:
-		e.precision = 8
+		row := m.Pix[m.PixOffset(b.Min.X, b.Min.Y+y):]
+		for x := range dst {
+			dst[x] = int(row[x])
+		}
+	case *image.Gray16:
+		row := m.Pix[m.PixOffset(b.Min.X, b.Min.Y+y):]
+		for x := range dst {
+			dst[x] = int(row[2*x])<<8 | int(row[2*x+1])
+		}
 	default:
-		e.precision = 16 // Default to 16-bit
+		for x := range dst {
+			r, _, _, _ := img.At(b.Min.X+x, b.Min.Y+y).RGBA()
+			dst[x] = int(r >> (16 - precision))
+		}
 	}
-
-	// Write SOI
-	if err := e.writeMarker(MarkerSOI); err != nil {
-		return err
-	}
-
-	// Write APP0 (JFIF)
-	if err := e.writeAPP0(); err != nil {
-		return err
-	}
-
-	// Write SOF3 (Lossless)
-	if err := e.writeSOF3(); err != nil {
-		return err
-	}
-
-	// Build and write Huffman table
-	ht := e.buildHuffmanTable(img)
-	if err := e.writeDHT(ht); err != nil {
-		return err
-	}
-
-	// Write SOS and scan data
-	if err := e.writeSOS(img, ht); err != nil {
-		return err
-	}
-
-	// Write EOI
-	return e.writeMarker(MarkerEOI)
 }
 
-func (e *encoder) writeMarker(marker int) error {
-	return binary.Write(e.w, binary.BigEndian, uint16(marker))
-}
+// encodeScan appends the entropy-coded scan to out. It mirrors decodeScan:
+// reduced domain P' = P - Pt, prediction reset at each restart.
+func encodeScan(out []byte, img image.Image, ht *huffmanTable, o Options) ([]byte, error) {
+	b := img.Bounds()
+	w, h, pt := b.Dx(), b.Dy(), o.PointTransform
+	pp := o.Precision - pt
 
-func (e *encoder) writeAPP0() error {
-	// JFIF APP0 marker
-	if err := e.writeMarker(MarkerAPP0); err != nil {
-		return err
+	var code, size [17]int
+	for k, v := range ht.values {
+		code[v], size[v] = int(ht.codes[k]), ht.sizes[k]
 	}
-
-	// Length (16 bytes total: 2 length + 5 JFIF\0 + 2 version + 1 units + 4 density + 2 thumbnail)
-	data := []byte{
-		0x00, 0x10, // Length = 16
-		0x4A, 0x46, 0x49, 0x46, 0x00, // "JFIF\0"
-		0x01, 0x01, // Version 1.1
-		0x00,       // Units: no units
-		0x00, 0x01, // X density = 1
-		0x00, 0x01, // Y density = 1
-		0x00, 0x00, // No thumbnail
-	}
-	_, err := e.w.Write(data)
-	return err
-}
-
-func (e *encoder) writeSOF3() error {
-	if err := e.writeMarker(MarkerSOF3); err != nil {
-		return err
-	}
-
-	// Length = 2 + 1 + 2 + 2 + 1 + 3*components
-	length := 2 + 1 + 2 + 2 + 1 + 3 // 1 component
-	data := make([]byte, length)
-	data[0] = byte(length >> 8)
-	data[1] = byte(length)
-	data[2] = byte(e.precision)
-	data[3] = byte(e.height >> 8)
-	data[4] = byte(e.height)
-	data[5] = byte(e.width >> 8)
-	data[6] = byte(e.width)
-	data[7] = 1 // 1 component
-
-	// Component: ID=1, sampling=1x1, table=0
-	data[8] = 1    // Component ID
-	data[9] = 0x11 // Sampling: H=1, V=1
-	data[10] = 0   // Quantization table (not used in lossless)
-
-	_, err := e.w.Write(data)
-	return err
-}
-
-// buildHuffmanTable analyzes the image and builds an optimal Huffman table
-func (e *encoder) buildHuffmanTable(img image.Image) *huffmanTable {
-	// Count occurrences of each SSSS category (0-16)
-	counts := make([]int, 17)
-
-	prevRow := make([]int, e.width)
-	currRow := make([]int, e.width)
-	maxVal := (1 << e.precision) - 1
-
-	for y := 0; y < e.height; y++ {
-		for x := 0; x < e.width; x++ {
-			// Get pixel value
-			val := e.getPixel(img, x, y)
-			currRow[x] = val
-
-			// Get prediction
-			pred := e.predict(currRow, prevRow, x, y)
-
-			// Calculate difference
-			diff := (val - pred) & maxVal
-			if diff > maxVal/2 {
-				diff -= maxVal + 1 // Convert to signed
+	bw := bitWriter{out: out}
+	src := make([]int, w)
+	prev, cur := make([]int, w), make([]int, w)
+	rst := 0
+	for y := 0; y < h; y++ {
+		first := y == 0
+		if o.RestartIntervalRows > 0 && y > 0 && y%o.RestartIntervalRows == 0 {
+			bw.flush()
+			bw.out = append(bw.out, 0xFF, byte(0xD0+rst))
+			rst = (rst + 1) & 7
+			first = true
+		}
+		rowSamples(img, y, o.Precision, src)
+		for x := 0; x < w; x++ {
+			if src[x]>>o.Precision != 0 {
+				return nil, fmt.Errorf("%w: sample %d at (%d,%d) exceeds precision %d", ErrInvalidParameter, src[x], x, y, o.Precision)
 			}
-
-			// Get SSSS category
+			v := src[x] >> pt
+			cur[x] = v
+			var pred int
+			switch {
+			case first && x == 0:
+				pred = 1 << (pp - 1)
+			case first:
+				pred = cur[x-1]
+			case x == 0:
+				pred = prev[0]
+			default:
+				pred = predict(o.Predictor, cur[x-1], prev[x], prev[x-1])
+			}
+			// T.81 H.1.2.1: the difference is taken modulo 2^16, not 2^P'.
+			// Below P' = 16 it never wraps; at 16, 32768 codes as -32768
+			// (category 16). Decoders such as libjpeg-turbo reconstruct
+			// modulo 2^16, so wrapping modulo 2^P' corrupts their output.
+			diff := (v - pred) & 0xFFFF
+			if diff >= 0x8000 {
+				diff -= 0x10000
+			}
 			ssss := categorize(diff)
-			counts[ssss]++
+			bw.writeBits(code[ssss], size[ssss])
+			// T.81 H.1.2.2: category 16 (difference 32768) has no
+			// appended bits.
+			if ssss > 0 && ssss < 16 {
+				if diff < 0 {
+					diff += 1<<ssss - 1
+				}
+				bw.writeBits(diff, ssss)
+			}
 		}
-		prevRow, currRow = currRow, prevRow
+		prev, cur = cur, prev
 	}
-
-	// Build Huffman table from counts using standard JPEG algorithm
-	return buildHuffmanFromCounts(counts)
+	bw.flush()
+	return bw.out, nil
 }
 
-func (e *encoder) getPixel(img image.Image, x, y int) int {
-	switch g := img.(type) {
-	case *image.Gray16:
-		return int(g.Gray16At(x, y).Y)
-	case *image.Gray:
-		return int(g.GrayAt(x, y).Y)
-	default:
-		r, _, _, _ := img.At(x, y).RGBA()
-		return int(r >> (16 - e.precision))
-	}
-}
-
-func (e *encoder) predict(currRow, prevRow []int, x, y int) int {
-	var Ra, Rb, Rc int
-
-	if x > 0 {
-		Ra = currRow[x-1]
-	}
-	if y > 0 {
-		Rb = prevRow[x]
-		if x > 0 {
-			Rc = prevRow[x-1]
-		}
-	}
-
-	if y == 0 && x == 0 {
-		return 1 << (e.precision - 1)
-	}
-	if y == 0 {
-		return Ra
-	}
-	if x == 0 {
-		return Rb
-	}
-
-	switch e.predictor {
-	case 1:
-		return Ra
-	case 2:
-		return Rb
-	case 3:
-		return Rc
-	case 4:
-		return Ra + Rb - Rc
-	case 5:
-		return Ra + (Rb-Rc)/2
-	case 6:
-		return Rb + (Ra-Rc)/2
-	case 7:
-		return (Ra + Rb) / 2
-	default:
-		return Ra
-	}
-}
-
-// categorize returns the SSSS category for a difference value
+// categorize returns the SSSS category (bit length of |diff|).
 func categorize(diff int) int {
 	if diff < 0 {
 		diff = -diff
@@ -236,187 +204,30 @@ func categorize(diff int) int {
 	return ssss
 }
 
-// buildHuffmanFromCounts creates a Huffman table from symbol counts
-func buildHuffmanFromCounts(counts []int) *huffmanTable {
-	// Extended table to support 16-bit data (SSSS 0-16)
-	// This is a simple table with fixed code lengths
-	ht := &huffmanTable{}
-
-	// Extended Huffman table for 16-bit lossless JPEG
-	// BITS: number of codes of each length (1-16)
-	// Use a distribution that covers all 17 possible SSSS values (0-16)
-	// Sum must equal 17: 0+1+5+1+1+1+1+1+1+1+1+1+1+1+0+0 = 17
-	ht.bits = [17]int{0, 0, 1, 5, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0}
-	ht.values = []byte{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
-
-	// Generate codes
-	var totalCodes int
-	for i := 1; i <= 16; i++ {
-		totalCodes += ht.bits[i]
-	}
-
-	ht.codes = make([]uint16, totalCodes)
-	ht.sizes = make([]int, totalCodes)
-
-	k := 0
-	for i := 1; i <= 16; i++ {
-		for j := 0; j < ht.bits[i]; j++ {
-			ht.sizes[k] = i
-			k++
-		}
-	}
-
-	code := uint16(0)
-	si := ht.sizes[0]
-	for k := 0; k < totalCodes; k++ {
-		for ht.sizes[k] > si {
-			code <<= 1
-			si++
-		}
-		ht.codes[k] = code
-		code++
-	}
-
-	return ht
-}
-
-func (e *encoder) writeDHT(ht *huffmanTable) error {
-	if err := e.writeMarker(MarkerDHT); err != nil {
-		return err
-	}
-
-	// Calculate length: 2 + 1 + 16 + len(values)
-	length := 2 + 1 + 16 + len(ht.values)
-	data := make([]byte, length)
-	data[0] = byte(length >> 8)
-	data[1] = byte(length)
-	data[2] = 0 // Table class 0 (DC), Table ID 0
-
-	// Copy BITS
-	for i := 1; i <= 16; i++ {
-		data[2+i] = byte(ht.bits[i])
-	}
-
-	// Copy HUFFVAL
-	copy(data[19:], ht.values)
-
-	_, err := e.w.Write(data)
-	return err
-}
-
-func (e *encoder) writeSOS(img image.Image, ht *huffmanTable) error {
-	if err := e.writeMarker(MarkerSOS); err != nil {
-		return err
-	}
-
-	// SOS header
-	// Length = 2 + 1 + 2*components + 3
-	length := 2 + 1 + 2 + 3 // 1 component
-	header := make([]byte, length)
-	header[0] = byte(length >> 8)
-	header[1] = byte(length)
-	header[2] = 1 // 1 component
-	header[3] = 1 // Component ID
-	header[4] = 0 // DC table 0, AC table 0
-	header[5] = byte(e.predictor)
-	header[6] = 0 // Se (not used in lossless)
-	header[7] = byte(e.pointTrans)
-
-	if _, err := e.w.Write(header); err != nil {
-		return err
-	}
-
-	// Encode scan data
-	return e.encodeScan(img, ht)
-}
-
-func (e *encoder) encodeScan(img image.Image, ht *huffmanTable) error {
-	bw := newBitWriter(e.w)
-
-	prevRow := make([]int, e.width)
-	currRow := make([]int, e.width)
-	maxVal := (1 << e.precision) - 1
-
-	for y := 0; y < e.height; y++ {
-		for x := 0; x < e.width; x++ {
-			// Get pixel value
-			val := e.getPixel(img, x, y)
-			currRow[x] = val
-
-			// Get prediction
-			pred := e.predict(currRow, prevRow, x, y)
-
-			// Calculate difference (handle wraparound)
-			diff := (val - pred) & maxVal
-			if diff > maxVal/2 {
-				diff -= maxVal + 1
-			}
-
-			// Encode the difference
-			ssss := categorize(diff)
-			if err := e.encodeHuffman(bw, ht, ssss); err != nil {
-				return err
-			}
-
-			// Encode additional bits
-			if ssss > 0 {
-				if diff < 0 {
-					diff = diff + (1 << ssss) - 1
-				}
-				bw.writeBits(diff, ssss)
-			}
-		}
-		prevRow, currRow = currRow, prevRow
-	}
-
-	return bw.flush()
-}
-
-func (e *encoder) encodeHuffman(bw *bitWriter, ht *huffmanTable, ssss int) error {
-	// Find code for this symbol
-	for i, val := range ht.values {
-		if int(val) == ssss {
-			bw.writeBits(int(ht.codes[i]), ht.sizes[i])
-			return nil
-		}
-	}
-	return nil
-}
-
-// bitWriter writes bits to an io.Writer with byte stuffing
+// bitWriter appends bits MSB first with 0xFF 0x00 byte stuffing.
 type bitWriter struct {
-	w    io.Writer
-	buf  uint32
+	out  []byte
+	acc  uint32
 	bits int
 }
 
-func newBitWriter(w io.Writer) *bitWriter {
-	return &bitWriter{w: w}
-}
-
 func (b *bitWriter) writeBits(val, n int) {
-	b.buf = (b.buf << n) | uint32(val&((1<<n)-1))
+	b.acc = b.acc<<n | uint32(val)&(1<<n-1)
 	b.bits += n
-
 	for b.bits >= 8 {
 		b.bits -= 8
-		byteVal := byte(b.buf >> b.bits)
-		b.w.Write([]byte{byteVal})
-		if byteVal == 0xFF {
-			b.w.Write([]byte{0x00}) // Byte stuffing
+		c := byte(b.acc >> b.bits)
+		b.out = append(b.out, c)
+		if c == 0xFF {
+			b.out = append(b.out, 0x00)
 		}
 	}
 }
 
-func (b *bitWriter) flush() error {
+// flush pads the partial byte with 1-bits (T.81 F.1.2.3) and byte-aligns.
+func (b *bitWriter) flush() {
 	if b.bits > 0 {
-		// Pad with 1s
-		b.buf = (b.buf << (8 - b.bits)) | ((1 << (8 - b.bits)) - 1)
-		byteVal := byte(b.buf)
-		b.w.Write([]byte{byteVal})
-		if byteVal == 0xFF {
-			b.w.Write([]byte{0x00})
-		}
+		b.writeBits(1<<(8-b.bits)-1, 8-b.bits)
 	}
-	return nil
+	b.acc = 0
 }

@@ -138,7 +138,7 @@ github.com/inconshreveable/mousetrap
 # github.com/jeandeaual/go-locale v0.0.0-20250612000132-0ef82f21eade
 ## explicit; go 1.18
 github.com/jeandeaual/go-locale
-# github.com/jpfielding/jpegs v0.2.0
+# github.com/jpfielding/jpegs v0.3.0
 ## explicit; go 1.25.5
 github.com/jpfielding/jpegs/pkg/compress/jpeg2k
 github.com/jpfielding/jpegs/pkg/compress/jpegli
