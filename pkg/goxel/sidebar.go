@@ -2,47 +2,43 @@ package goxel
 
 import (
 	"fmt"
+	"image/color"
 	"sort"
 	"strings"
 	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/layout"
-	"fyne.io/fyne/v2/widget"
 )
 
 // sidebar is the desktop left column: Study, Details, Volumes, Findings and
 // the DICOM metadata, collapsed, at the bottom.
 func (v *Viewer) sidebar() fyne.CanvasObject {
-	items := []fyne.CanvasObject{v.studySection(), hairline(), v.detailsSection()}
+	items := []fyne.CanvasObject{v.studySection(), rule(), v.detailsSection()}
 	if len(v.volumeKeys()) > 1 {
-		items = append(items, hairline(), v.volumesSection())
+		items = append(items, rule(), v.volumesSection())
 	}
-	items = append(items, hairline(), v.findingsSection(), hairline(), v.metadataSection())
-	body := container.NewVScroll(inset(12, 10, container.NewVBox(items...)))
-	edge := filled(colHairline)
-	edge.SetMinSize(fyne.NewSize(1, 1))
-	return container.NewStack(filled(colPanel), container.NewBorder(nil, nil, nil, edge, body))
+	items = append(items, rule(), v.findingsSection(), rule(), v.metadataSection())
+	body := container.NewVScroll(inset(16, 16, vstack(8, items...)))
+	return border(nil, nil, nil, hairline(), panel(colPanel, 0, body))
 }
 
 // studySection: the "Open now" card, open actions and load status.
 func (v *Viewer) studySection() fyne.CanvasObject {
 	items := []fyne.CanvasObject{sectionTitle("Study", "")}
 	if v.loaded() {
-		label := text("Open now", 12, colMuted, false)
-		name := widget.NewLabel(elideMiddle(v.st.loadedName, 30))
-		name.Truncation = fyne.TextTruncateEllipsis
-		edge := filled(colAccent)
+		label := text("Open now", 12, colAccent)
+		name := text(elideMiddle(v.st.loadedName, 30), bodySize(), colHeading)
+		edge := rrect(colAccent, color.Transparent, 3, 0)
 		edge.SetMinSize(fyne.NewSize(4, 1))
-		card := container.NewStack(filled(colOpenCard),
-			container.NewBorder(nil, nil, edge, nil, inset(8, 4, container.NewVBox(label, name))))
-		items = append(items, card)
+		body := container.New(marginLayout{14, 8}, vstack(2, leftCentre(label), leftCentre(name)))
+		items = append(items, container.NewStack(rrect(colOpenCard, color.Transparent, 6, 0),
+			border(nil, nil, edge, nil, nil), body))
 	} else {
 		items = append(items, note("No study open"))
 	}
 	items = append(items, v.openButtons(false), v.loadStatus())
-	return container.NewVBox(items...)
+	return vstack(8, items...)
 }
 
 // detailsSection: voxels, physical extent, modality and volume count.
@@ -50,7 +46,7 @@ func (v *Viewer) detailsSection() fyne.CanvasObject {
 	items := []fyne.CanvasObject{sectionTitle("Details", "")}
 	p := v.primary
 	if p == nil {
-		return container.NewVBox(append(items, note("—"))...)
+		return vstack(8, append(items, note("—"))...)
 	}
 	ex, ey, ez := float64(p.Width)*spacingOr1(p.VoxelSizeX), float64(p.Height)*spacingOr1(p.VoxelSizeY),
 		float64(p.Depth)*spacingOr1(p.VoxelSizeZ)
@@ -58,13 +54,13 @@ func (v *Viewer) detailsSection() fyne.CanvasObject {
 	if modality == "" {
 		modality = "—"
 	}
-	items = append(items,
+	rows := vstack(2,
 		keyValue("Voxels", fmt.Sprintf("%d × %d × %d", p.Width, p.Height, p.Depth)),
-		keyValue("Extent (mm)", fmt.Sprintf("%.0f × %.0f × %.0f", ex, ey, ez)),
+		keyValue("Extent", fmt.Sprintf("%.0f × %.0f × %.0f mm", ex, ey, ez)),
 		keyValue("Modality", modality),
 		keyValue("Volumes", fmt.Sprintf("%d", len(v.volumeKeys()))),
 	)
-	return container.NewVBox(items...)
+	return vstack(8, append(items, rows)...)
 }
 
 // volumesSection: one row per 3D volume — visibility and opacity.
@@ -76,24 +72,26 @@ func (v *Viewer) volumesSection() fyne.CanvasObject {
 			vol.Enabled = b
 			v.setup3DView()
 		})
-		alpha := newSliderRow(v.st.layout.compact(), "Opacity", 0, 1, 0.05,
-			func(x float64) string { return fmt.Sprintf("%.2f", x) }, vol.Alpha,
+		alpha := newSliderRow(fraction("Opacity", 0, 1), vol.Alpha,
 			func(x float64) {
 				vol.Alpha = x
 				v.debounced("layers", 80*time.Millisecond, v.setup3DView)
 			}, nil)
 		items = append(items, check, alpha.obj)
 	}
-	return container.NewVBox(items...)
+	return vstack(6, items...)
 }
 
 // findingsSection: count and rows, or roxel's empty sentence.
 func (v *Viewer) findingsSection() fyne.CanvasObject {
 	n := v.findingCount()
-	head := container.NewBorder(nil, nil, sectionTitle("Findings", ""), nil,
-		container.NewHBox(layout.NewSpacer(), container.NewCenter(text(fmt.Sprintf("%d reported", n), 12, colMuted, false))))
+	count := ""
+	if n > 0 {
+		count = fmt.Sprintf("%d reported", n)
+	}
+	head := sectionTitle("Findings", count)
 	if n == 0 {
-		return container.NewVBox(head, note("No findings were loaded with this study."))
+		return vstack(8, head, bodyNote("No findings were loaded with this study."))
 	}
 	items := []fyne.CanvasObject{head}
 	var keys []string
@@ -122,9 +120,9 @@ func (v *Viewer) findingsSection() fyne.CanvasObject {
 			vol.Enabled = b
 			v.setup3DView()
 		})
-		items = append(items, container.NewBorder(nil, nil, container.NewCenter(swatch), nil, check))
+		items = append(items, flexRow(8, 1, container.NewCenter(swatch), check))
 	}
-	return container.NewVBox(items...)
+	return vstack(6, items...)
 }
 
 func (v *Viewer) sortedKeys() []string {
@@ -140,9 +138,17 @@ func (v *Viewer) sortedKeys() []string {
 func (v *Viewer) metadataSection() fyne.CanvasObject {
 	s := v.scan
 	if s == nil {
-		return layout.NewSpacer()
+		return vstack(0)
 	}
-	form := container.NewVBox()
+	title := "DICOM metadata"
+	head := newTapArea(hrow(8, chevron(v.st.metadataOpen), text(title, 14.5, colHeading)), func() {
+		v.st.metadataOpen = !v.st.metadataOpen
+		v.rebuild()
+	})
+	if !v.st.metadataOpen {
+		return minHeight(24, head)
+	}
+	rows := vstack(2)
 	for _, kv := range [][2]string{
 		{"Patient ID", s.PatientID}, {"Patient name", s.PatientName},
 		{"Study date", s.StudyDate}, {"Study time", s.StudyTime},
@@ -154,8 +160,7 @@ func (v *Viewer) metadataSection() fyne.CanvasObject {
 		if val == "" {
 			val = "—"
 		}
-		form.Add(keyValue(kv[0], val))
+		rows.Add(keyValue(kv[0], elideMiddle(val, 18)))
 	}
-	acc := widget.NewAccordion(widget.NewAccordionItem("DICOM metadata", form))
-	return acc
+	return vstack(8, minHeight(24, head), rows)
 }

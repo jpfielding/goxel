@@ -25,7 +25,15 @@ type Interactive2DView struct {
 
 	OnAnnotationAdded func(x, y, w, h float32)
 	viewer            *Viewer // Reference to check annotation mode
+
+	// OnLayout runs after each layout, so the footer's scale bar follows
+	// the zoom and the window size.
+	OnLayout func()
+	scale    float32 // pixels per millimetre of the image as last drawn
 }
+
+// pixelsPerMM is the scale of the image as drawn, for the footer's scale bar.
+func (iv *Interactive2DView) pixelsPerMM() float32 { return iv.scale }
 
 func NewInteractive2DView(img *canvas.Image, v *Viewer) *Interactive2DView {
 	iv := &Interactive2DView{
@@ -53,6 +61,8 @@ func (iv *Interactive2DView) SetZoom(percent float64) {
 
 func (iv *Interactive2DView) CreateRenderer() fyne.WidgetRenderer {
 	iv.image.FillMode = canvas.ImageFillStretch
+	// Voxels stay square-edged when magnified, as in roxel.
+	iv.image.ScaleMode = canvas.ImageScalePixels
 	return &interactive2DRenderer{iv: iv}
 }
 
@@ -109,12 +119,12 @@ func (iv *Interactive2DView) MouseDown(e *desktop.MouseEvent) {
 
 func (iv *Interactive2DView) MouseUp(*desktop.MouseEvent) {}
 
-// imageSize is the slice's pixel size for the current orientation.
+// imageSize is the slice's physical size in millimetres for the current
+// orientation: the image is drawn in true proportions, not in voxels.
 func (iv *Interactive2DView) imageSize() (float32, float32) {
-	if iv.viewer != nil && iv.viewer.dicox != nil {
-		b := iv.viewer.dicox.Bounds()
-		if b.Dx() > 0 && b.Dy() > 0 {
-			return float32(b.Dx()), float32(b.Dy())
+	if iv.viewer != nil && iv.viewer.dicox != nil && iv.viewer.loaded() {
+		if w, h := iv.viewer.sliceSizeMM(); w > 0 && h > 0 {
+			return float32(w), float32(h)
 		}
 	}
 	if iv.image.Image != nil {
@@ -137,6 +147,7 @@ func (r *interactive2DRenderer) Layout(size fyne.Size) {
 
 	imgW, imgH := iv.imageSize()
 	scale := min(size.Width/imgW, size.Height/imgH) * iv.zoom
+	iv.scale = scale
 	w, h := imgW*scale, imgH*scale
 	iv.image.Move(fyne.NewPos((size.Width-w)/2+iv.panX, (size.Height-h)/2+iv.panY))
 	iv.image.Resize(fyne.NewSize(w, h))
@@ -152,6 +163,9 @@ func (r *interactive2DRenderer) Layout(size fyne.Size) {
 		}
 		iv.overlay.Move(fyne.NewPos(x1, y1))
 		iv.overlay.Resize(fyne.NewSize(x2-x1, y2-y1))
+	}
+	if iv.OnLayout != nil {
+		iv.OnLayout()
 	}
 }
 

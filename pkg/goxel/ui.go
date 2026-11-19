@@ -81,6 +81,7 @@ func NewViewer(a fyne.App) *Viewer {
 
 	v.content = container.NewStack()
 	v.root = container.New(&responsiveLayout{v: v}, v.content)
+	v.win.SetPadded(false) // panels meet edge to edge, separated by hairlines
 	v.win.SetContent(v.root)
 	v.win.Canvas().SetOnTypedKey(v.onKey)
 	v.win.Resize(fyne.NewSize(1440, 900))
@@ -135,6 +136,7 @@ func (v *Viewer) rebuild() {
 	// crashes Fyne 2.7's wasm driver while it reloads textures.)
 	compact := v.st.layout.compact()
 	v.theme.compact = compact
+	uiTouch = compact
 	var c fyne.CanvasObject
 	if compact {
 		c = v.phoneRoot()
@@ -523,19 +525,27 @@ func (v *Viewer) slicePlaneOverlay() ([][3]float64, string) {
 	if !v.st.showSlicePlane {
 		return nil, readout
 	}
-	return slicePlaneCorners(v.st.orientation, v.st.sliceIndex, count, v.volumeRenderer.scaleZ), readout
+	return slicePlaneCorners(v.st.orientation, v.st.sliceIndex, count, v.volumeRenderer.scaleY, v.volumeRenderer.scaleZ), readout
 }
 
-// slicePlaneCorners is the slice's rectangle in box space [0,1]x[0,1]x[0,scaleZ].
-func slicePlaneCorners(o ViewOrientation, slice, count int, scaleZ float64) [][3]float64 {
+// slicePlaneCorners is the slice's rectangle in box space
+// [0,1]x[0,scaleY]x[0,scaleZ].
+func slicePlaneCorners(o ViewOrientation, slice, count int, scaleY, scaleZ float64) [][3]float64 {
 	f := (float64(slice) + 0.5) / float64(max(count, 1))
 	switch o {
 	case Coronal:
-		return [][3]float64{{0, f, 0}, {1, f, 0}, {1, f, scaleZ}, {0, f, scaleZ}}
+		y := f * scaleY
+		return [][3]float64{{0, y, 0}, {1, y, 0}, {1, y, scaleZ}, {0, y, scaleZ}}
 	case Sagittal:
-		return [][3]float64{{f, 0, 0}, {f, 1, 0}, {f, 1, scaleZ}, {f, 0, scaleZ}}
+		return [][3]float64{{f, 0, 0}, {f, scaleY, 0}, {f, scaleY, scaleZ}, {f, 0, scaleZ}}
 	default:
 		z := f * scaleZ
-		return [][3]float64{{0, 0, z}, {1, 0, z}, {1, 1, z}, {0, 1, z}}
+		return [][3]float64{{0, 0, z}, {1, 0, z}, {1, scaleY, z}, {0, scaleY, z}}
 	}
+}
+
+// captionPosition is the part of a slice caption before its size: "Coronal 129 / 256".
+func captionPosition(caption string) string {
+	pos, _, _ := strings.Cut(caption, " · ")
+	return pos
 }

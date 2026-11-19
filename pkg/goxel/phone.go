@@ -4,12 +4,12 @@ import (
 	"fmt"
 	"image/color"
 	"math"
+	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/layout"
-	"fyne.io/fyne/v2/theme"
+	"fyne.io/fyne/v2/driver/desktop"
 	"fyne.io/fyne/v2/widget"
 )
 
@@ -41,7 +41,7 @@ func (l layoutClass) homeIndicatorInset() float32 {
 
 func (v *Viewer) phoneRoot() fyne.CanvasObject {
 	if !v.loaded() {
-		return container.NewBorder(v.appBar(), nil, nil, nil, v.emptyState())
+		return border(v.appBar(), nil, nil, nil, v.emptyState())
 	}
 	if v.st.focusSlice || v.st.focusVolume {
 		return v.phoneFocusView()
@@ -57,7 +57,7 @@ func (v *Viewer) phoneRoot() fyne.CanvasObject {
 	default:
 		body = v.withSheet(v.volumeRenderer, v.sheetOpenFor(), v.volumeSheet)
 	}
-	return container.NewBorder(v.appBar(), v.tabBar(), nil, nil, body)
+	return border(v.appBar(), v.tabBar(), nil, nil, body)
 }
 
 func (v *Viewer) sheetOpenFor() bool { return v.st.sheetOpen }
@@ -72,16 +72,16 @@ func (v *Viewer) studyPage() fyne.CanvasObject {
 	if v.st.layout == layoutPhoneLandscape {
 		right := []fyne.CanvasObject{v.detailsSection()}
 		if many {
-			right = append(right, hairline(), v.volumesSection())
+			right = append(right, rule(), v.volumesSection())
 		}
-		return container.NewGridWithColumns(2, v.studySection(), container.NewVBox(right...))
+		return columns(24, v.studySection(), vstack(8, right...))
 	}
-	items := []fyne.CanvasObject{v.studySection(), hairline(), v.detailsSection()}
+	items := []fyne.CanvasObject{v.studySection(), rule(), v.detailsSection()}
 	if many {
-		items = append(items, hairline(), v.volumesSection())
+		items = append(items, rule(), v.volumesSection())
 	}
-	items = append(items, hairline(), v.metadataSection())
-	return container.NewVBox(items...)
+	items = append(items, rule(), v.metadataSection())
+	return vstack(8, items...)
 }
 
 // phoneSliceArea is the 2D slice, edge to edge.
@@ -98,9 +98,9 @@ func (v *Viewer) withSheet(view fyne.CanvasObject, open bool, sheet func() fyne.
 	}
 	s := panel(colPanel, 0, inset(16, 8, sheet()))
 	if v.st.layout == layoutPhoneLandscape {
-		return container.NewBorder(nil, nil, nil, container.New(sizedLayout{w: landscapePanel}, s), view)
+		return border(nil, nil, nil, container.New(sizedLayout{w: landscapePanel}, border(nil, nil, hairline(), nil, s)), view)
 	}
-	return container.NewBorder(nil, container.New(sizedLayout{h: sheetHeight}, s), nil, nil, view)
+	return border(nil, container.New(sizedLayout{h: sheetHeight}, border(hairline(), nil, nil, nil, s)), nil, nil, view)
 }
 
 // tabBar: four tabs; the active one has an ACCENT top bar and label, view
@@ -110,81 +110,185 @@ func (v *Viewer) tabBar() fyne.CanvasObject {
 	for _, t := range []phoneTab{tabStudy, tabFindings, tabSlice, tabView3D} {
 		tabs = append(tabs, v.tabButton(t))
 	}
-	row := container.New(sizedLayout{h: tabRowHeight}, container.NewGridWithColumns(4, tabs...))
-	inset := v.st.layout.homeIndicatorInset()
-	return panel(colBG, 0, container.NewBorder(hairline(), nil, nil, nil,
-		container.NewVBox(row, container.New(sizedLayout{h: inset}, layout.NewSpacer()))))
+	row := container.New(sizedLayout{h: tabRowHeight}, inset(8, 0, columns(0, tabs...)))
+	home := v.st.layout.homeIndicatorInset()
+	return panel(colBG, 0, vstack(0, hairline(), row, container.New(sizedLayout{h: home}, vstack(0))))
 }
 
 func (v *Viewer) tabButton(t phoneTab) fyne.CanvasObject {
 	active := t == v.st.phoneTab
-	fg := color.Color(colMuted)
-	topBar := filled(color.Transparent)
-	if active {
-		fg = colAccent
-		topBar.FillColor = colAccent
+	c := &tabCell{label: t.label(), active: active, toggles: active && t.isView(), open: v.st.sheetOpen}
+	if t == tabFindings {
+		c.badge = v.findingCount()
 	}
-	topBar.SetMinSize(fyne.NewSize(1, 3))
-	label := text(t.label(), 14, fg, active)
-	row := container.NewHBox(layout.NewSpacer(), container.NewCenter(label))
-	if active && t.isView() {
-		res := theme.MenuDropUpIcon()
-		if v.st.sheetOpen {
-			res = theme.MenuDropDownIcon()
-		}
-		chev := canvas.NewImageFromResource(theme.NewPrimaryThemedResource(res))
-		chev.SetMinSize(fyne.NewSize(14, 14))
-		row.Add(container.NewCenter(chev))
-	}
-	if n := v.findingCount(); t == tabFindings && n > 0 {
-		badge := canvas.NewCircle(colDanger)
-		count := text(fmt.Sprintf("%d", n), 11, colBG, true)
-		count.Alignment = fyne.TextAlignCenter
-		row.Add(container.NewCenter(container.New(sizedLayout{w: 16, h: 16}, container.NewStack(badge, container.NewCenter(count)))))
-	}
-	row.Add(layout.NewSpacer())
-	content := container.NewBorder(topBar, nil, nil, nil, container.NewCenter(row))
-	return newTapArea(content, func() {
+	c.onTap = func() {
 		v.st.selectTab(t)
 		v.rebuild()
 		if t == tabView3D {
 			v.volumeRenderer.FitView()
 		}
-	})
+	}
+	c.ExtendBaseWidget(c)
+	return c
 }
+
+// tabCell is one tab of the bottom bar. The active tab is raised on a PANEL
+// tint with an accent bar; a view's tab carries a chevron saying whether its
+// controls are open.
+type tabCell struct {
+	widget.BaseWidget
+	label   string
+	active  bool
+	toggles bool
+	open    bool
+	badge   int
+	onTap   func()
+	pressed bool
+}
+
+func (c *tabCell) Tapped(*fyne.PointEvent)       { c.onTap() }
+func (c *tabCell) MouseDown(*desktop.MouseEvent) { c.pressed = true; c.Refresh() }
+func (c *tabCell) MouseUp(*desktop.MouseEvent)   { c.pressed = false; c.Refresh() }
+func (c *tabCell) Cursor() desktop.Cursor        { return desktop.PointerCursor }
+
+func (c *tabCell) CreateRenderer() fyne.WidgetRenderer {
+	r := &tabRenderer{c: c, bg: rrect(colPanel, color.Transparent, 8, 0), bar: rrect(colAccent, color.Transparent, 2, 0),
+		text: text(c.label, 14, colText), badgeDot: canvas.NewCircle(colDanger), count: text("", 11, colBG)}
+	r.chev[0], r.chev[1] = line(colText, 1.6), line(colText, 1.6)
+	return r
+}
+
+type tabRenderer struct {
+	c        *tabCell
+	bg, bar  *canvas.Rectangle
+	text     *canvas.Text
+	chev     [2]*canvas.Line
+	badgeDot *canvas.Circle
+	count    *canvas.Text
+}
+
+func (r *tabRenderer) MinSize() fyne.Size { return fyne.NewSize(40, tabRowHeight) }
+
+func (r *tabRenderer) Layout(size fyne.Size) {
+	c := r.c
+	r.bg.Move(fyne.NewPos(3, 2))
+	r.bg.Resize(fyne.NewSize(size.Width-6, size.Height-6))
+	r.bar.Move(fyne.NewPos(14, 2))
+	r.bar.Resize(fyne.NewSize(size.Width-28, 3))
+	ts := fyne.MeasureText(c.label, 14, fyne.TextStyle{})
+	extra := float32(0)
+	if c.toggles {
+		extra = 13
+	}
+	left := size.Width/2 - (ts.Width+extra)/2
+	r.text.Move(fyne.NewPos(left, size.Height/2-ts.Height/2))
+	r.text.Resize(ts)
+	if c.toggles {
+		cx, cy := left+ts.Width+9, size.Height/2+1
+		dy := float32(-2.5)
+		if c.open {
+			dy = 2.5
+		}
+		a, b, z := fyne.NewPos(cx-4, cy-dy), fyne.NewPos(cx, cy+dy), fyne.NewPos(cx+4, cy-dy)
+		r.chev[0].Position1, r.chev[0].Position2 = a, b
+		r.chev[1].Position1, r.chev[1].Position2 = b, z
+	}
+	if c.badge > 0 {
+		cx, cy := size.Width-9, float32(13)
+		r.badgeDot.Move(fyne.NewPos(cx-8, cy-8))
+		r.badgeDot.Resize(fyne.NewSize(16, 16))
+		r.count.Text = fmt.Sprintf("%d", c.badge)
+		cs := fyne.MeasureText(r.count.Text, 11, fyne.TextStyle{})
+		r.count.Move(fyne.NewPos(cx-cs.Width/2, cy-cs.Height/2))
+		r.count.Resize(cs)
+	}
+}
+
+func (r *tabRenderer) Refresh() {
+	c := r.c
+	fg := color.NRGBA(colText)
+	if c.active {
+		fg = colAccent
+	}
+	r.text.Color = fg
+	for _, l := range r.chev {
+		l.StrokeColor = fg
+		if c.toggles {
+			l.Show()
+		} else {
+			l.Hide()
+		}
+	}
+	if c.active || c.pressed {
+		r.bg.Show()
+	} else {
+		r.bg.Hide()
+	}
+	if c.active {
+		r.bar.Show()
+	} else {
+		r.bar.Hide()
+	}
+	if c.badge > 0 {
+		r.badgeDot.Show()
+		r.count.Show()
+	} else {
+		r.badgeDot.Hide()
+		r.count.Hide()
+	}
+	r.Layout(c.Size())
+	canvas.Refresh(r.bg)
+}
+
+func (r *tabRenderer) Objects() []fyne.CanvasObject {
+	return []fyne.CanvasObject{r.bg, r.bar, r.text, r.chev[0], r.chev[1], r.badgeDot, r.count}
+}
+
+func (r *tabRenderer) Destroy() {}
 
 // pageSelector is the sheet's segmented page picker.
 func pageSelector(labels []string, selected int, onSelect func(int)) fyne.CanvasObject {
-	return minHeight(touchTarget, newSegmented(labels, selected, onSelect).box)
+	return newSegmented(labels, selected, onSelect)
 }
 
-// buttonRow is a row of equal touch buttons.
-func buttonRow(buttons ...*widget.Button) fyne.CanvasObject {
+// buttonRow is a row of equal-width touch buttons filling the row.
+func buttonRow(buttons ...*button) fyne.CanvasObject {
 	objs := make([]fyne.CanvasObject, len(buttons))
 	for i, b := range buttons {
-		objs[i] = b
+		objs[i] = b.sized(0, touchTarget)
 	}
-	return minHeight(touchTarget, container.NewGridWithColumns(len(objs), objs...))
+	return columns(10, objs...)
 }
 
-// touchRow is a label then content, at touch height.
+// touchRow is a label cell then content, at touch height.
 func touchRow(label string, content fyne.CanvasObject) fyne.CanvasObject {
-	l := widget.NewLabel(label)
-	return minHeight(touchTarget, container.NewBorder(nil, nil, fixedWidth(96, container.NewVBox(layout.NewSpacer(), l, layout.NewSpacer())), nil, content))
+	return minHeight(touchTarget, flexRow(10, 1, fixedWidth(78, rowLabel(label)), content))
+}
+
+// wrapCenterLayout centres a wrapping text vertically in the width it is given.
+type wrapCenterLayout struct{}
+
+func (wrapCenterLayout) Layout(objs []fyne.CanvasObject, size fyne.Size) {
+	for _, o := range objs {
+		o.Resize(fyne.NewSize(size.Width, size.Height))
+		h := min(o.MinSize().Height, size.Height)
+		o.Resize(fyne.NewSize(size.Width, h))
+		o.Move(fyne.NewPos(0, (size.Height-h)/2))
+	}
+}
+
+func (wrapCenterLayout) MinSize(objs []fyne.CanvasObject) fyne.Size { return fyne.NewSize(40, 0) }
+
+// hint is wrapped muted help text, centred on its row.
+func hint(s string) fyne.CanvasObject {
+	return container.New(wrapCenterLayout{}, newWrapped(s, 13, colMuted))
 }
 
 // volumeSheet: Camera / Slice / Windowing / Display / Lighting, or the band
 // editor while it is open.
 func (v *Viewer) volumeSheet() fyne.CanvasObject {
 	if v.st.bandsOpen && v.st.preset == paletteMaterials {
-		done := widget.NewButton("Done", func() {
-			v.st.bandsOpen = false
-			v.rebuild()
-		})
-		done.Importance = widget.HighImportance
-		return container.NewBorder(minHeight(touchTarget, container.NewBorder(nil, nil,
-			container.NewCenter(text("Material bands", 15, colHeading, true)), done)), nil, nil, nil,
-			container.NewVScroll(v.bandsEditor()))
+		return v.bandsPage()
 	}
 	v.st.bandsOpen = false
 	sel := pageSelector(volumePageLabels, int(v.st.volumePage), func(i int) {
@@ -196,31 +300,61 @@ func (v *Viewer) volumeSheet() fyne.CanvasObject {
 	case pageCamera:
 		page = v.cameraPage()
 	case pageSlicePlane:
-		page = container.NewVBox(minHeight(touchTarget, v.slicePlaneTools()),
-			minHeight(touchTarget, v.planePicker().box), v.sliceRow().obj)
+		page = v.slicePlaneSheetPage()
 	case pageWindowing:
-		c := v.st.layout.compact()
-		center := newSliderRow(c, "Center", 0, 65535, 1, f0, v.st.windowCenter3D, func(x float64) {
-			v.st.windowCenter3D = x
-			v.apply3DWindow()
-		}, nil)
-		width := newSliderRow(c, "Width", 1, 65535, 1, f0, v.st.windowWidth3D, func(x float64) {
-			v.st.windowWidth3D = x
-			v.apply3DWindow()
-		}, nil)
-		page = container.NewVBox(center.obj, width.obj, v.opacityRow().obj)
+		rows := append([]fyne.CanvasObject{sectionTitle("3D windowing", "stored values")}, v.window3DRows()...)
+		page = vstack(8, append(rows, v.opacityRow().obj)...)
 	case pageDisplay:
 		legend := v.paletteLegend()
 		var legendRow fyne.CanvasObject = legend
 		if v.st.preset == paletteMaterials {
-			legendRow = container.NewBorder(nil, nil, nil, fixedWidth(132, v.bandsButton()), legend)
+			legendRow = flexRow(10, 0, legend, v.bandsButton().sized(132, touchTarget))
 		}
-		page = container.NewVBox(minHeight(touchTarget, v.palettePicker().box), minHeight(touchTarget, legendRow),
-			touchRow("Quality", v.qualityPicker().box), v.densityRow().obj)
+		page = vstack(8, v.palettePicker(), minHeight(touchTarget, legendRow),
+			touchRow("Quality", v.qualityPicker()), v.densityRow().obj)
 	default:
 		page = v.lightingRows()
 	}
-	return container.NewBorder(sel, nil, nil, nil, inset(0, 8, page))
+	return border(sel, nil, nil, nil, inset(0, 8, page))
+}
+
+// slicePlaneSheetPage: the slice plane, the cutaway with its dependent option
+// indented beneath it, and the slice position that moves both.
+func (v *Viewer) slicePlaneSheetPage() fyne.CanvasObject {
+	rows := []fyne.CanvasObject{v.slicePlanePage()}
+	if v.cutawayAvailable() && v.dicox.MaxSlice() > 0 {
+		rows = append(rows, v.sliceRow().obj)
+	}
+	return vstack(8, rows...)
+}
+
+// bandsPage is the compact material-band editor: the thresholds strip, then
+// one band at a time so its opacity row fits without scrolling.
+func (v *Viewer) bandsPage() fyne.CanvasObject {
+	done := newButton("Done", func() {
+		v.st.bandsOpen = false
+		v.rebuild()
+	}).sized(72, touchTarget)
+	head := minHeight(touchTarget, hrow(10, done, pageTitle("Material bands")))
+	bands := v.st.bands
+	strip := NewMultiRangeSlider(0, float64(bands[len(bands)-1].Threshold), bands)
+	strip.Compact = true
+	strip.OnChanged = func([]int) { v.debounced("bands", 60*time.Millisecond, v.applyPalette) }
+	var names []string
+	var idx []int
+	for i, b := range bands {
+		if !b.IsTransparent {
+			names = append(names, b.Name)
+			idx = append(idx, i)
+		}
+	}
+	v.st.selectedBand = max(0, min(v.st.selectedBand, len(names)-1))
+	picker := newSegmented(names, v.st.selectedBand, func(i int) {
+		v.st.selectedBand = i
+		v.rebuild()
+	})
+	i := idx[v.st.selectedBand]
+	return vstack(8, head, strip, picker, v.bandOpacityRow(i, "Opacity", strip.GetBandAlpha(i)).obj)
 }
 
 // cameraPage gives a tap for everything the gestures do.
@@ -229,35 +363,40 @@ func (v *Viewer) cameraPage() fyne.CanvasObject {
 	var rows []fyne.CanvasObject
 	if !v.st.focusVolume {
 		rows = append(rows, buttonRow(
-			widget.NewButton("Fit view", vr.FitView),
-			widget.NewButton("Focus volume", v.toggleFocusVolume)))
+			newButton("Fit view", vr.FitView),
+			newButton("Focus volume", v.toggleFocusVolume)))
 	}
 	rows = append(rows, touchRow("View along", buttonRow(
-		widget.NewButton("X", func() { vr.LookAlong(0) }),
-		widget.NewButton("Y", func() { vr.LookAlong(1) }),
-		widget.NewButton("Z", func() { vr.LookAlong(2) }))))
+		newButton("X", func() { vr.LookAlong(0) }),
+		newButton("Y", func() { vr.LookAlong(1) }),
+		newButton("Z", func() { vr.LookAlong(2) }))))
 	mode := 0
 	if v.st.dragPans {
 		mode = 1
 	}
-	orbitPan := newSegmented([]string{"Orbit", "Pan"}, mode, func(i int) { v.st.dragPans = i == 1 })
-	arrow := func(icon fyne.Resource, dx, dy float64) *widget.Button {
-		return widget.NewButtonWithIcon("", icon, func() {
+	orbitPan := newSegmented([]string{"Orbit", "Pan"}, mode, func(i int) {
+		v.st.dragPans = i == 1
+		v.rebuild()
+	})
+	arrow := func(icon iconKind, dx, dy float64) *button {
+		return newIconButton(icon, "", func() {
 			if v.st.dragPans {
 				vr.PanPixels(dx*panStep, dy*panStep)
 			} else {
-				vr.Orbit(-dx*orbitStep, -dy*orbitStep)
+				vr.Orbit(dx*orbitStep, -dy*orbitStep)
 			}
-		})
+		}).sized(touchTarget, touchTarget)
 	}
-	arrows := container.NewGridWithColumns(4,
-		arrow(theme.NavigateBackIcon(), -1, 0), arrow(theme.NavigateNextIcon(), 1, 0),
-		arrow(theme.MoveUpIcon(), 0, -1), arrow(theme.MoveDownIcon(), 0, 1))
-	rows = append(rows, minHeight(touchTarget, container.NewGridWithColumns(2, orbitPan.box, arrows)))
-	rows = append(rows, touchRow("Zoom", buttonRow(
-		widget.NewButton("-", func() { vr.ZoomBy(1.25) }),
-		widget.NewButton("+", func() { vr.ZoomBy(1 / 1.25) }))))
-	return container.NewVBox(rows...)
+	rows = append(rows, minHeight(touchTarget, flexRow(10, 0, orbitPan,
+		arrow(iconLeft, -1, 0), arrow(iconRight, 1, 0), arrow(iconUp, 0, -1), arrow(iconDown, 0, 1))))
+	tip := "Or drag to orbit, pinch to zoom, two fingers to pan."
+	if v.st.dragPans {
+		tip = "Or drag to pan and pinch to zoom."
+	}
+	zoomOut := newButton("−", func() { vr.ZoomBy(1.25) }).textSize(22).sized(touchTarget, touchTarget)
+	zoomIn := newButton("+", func() { vr.ZoomBy(1 / 1.25) }).textSize(22).sized(touchTarget, touchTarget)
+	rows = append(rows, minHeight(touchTarget, flexRow(10, 3, fixedWidth(78, rowLabel("Zoom")), zoomOut, zoomIn, hint(tip))))
+	return vstack(8, rows...)
 }
 
 // sliceSheet: Slice / Image / Volume (Volume only when there is a choice).
@@ -276,42 +415,34 @@ func (v *Viewer) sliceSheet() fyne.CanvasObject {
 	var page fyne.CanvasObject
 	switch v.st.slicePage {
 	case pageImage:
-		c := v.st.layout.compact()
-		commit := func() {
-			v.dicox.SetWindowLevel(int(v.st.windowCenter2D))
-			v.dicox.SetWindowWidth(int(v.st.windowWidth2D))
-			v.refresh2D()
-		}
-		center := newSliderRow(c, "Center", 0, 65535, 1, f0, v.st.windowCenter2D,
-			func(x float64) { v.st.windowCenter2D = x }, func(float64) { commit() })
-		width := newSliderRow(c, "Width", 1, 65535, 1, f0, v.st.windowWidth2D,
-			func(x float64) { v.st.windowWidth2D = x }, func(float64) { commit() })
-		page = container.NewVBox(center.obj, width.obj, v.zoomRow().obj)
+		rows := append([]fyne.CanvasObject{sectionTitle("2D windowing", "stored values")}, v.window2DRows()...)
+		page = vstack(8, append(rows, v.zoomRow().obj)...)
 	case pageVolume:
 		picker := v.volumePicker()
-		if picker == nil {
-			picker = layout.NewSpacer()
+		var pick fyne.CanvasObject = vstack(0)
+		if picker != nil {
+			pick = picker
 		}
-		page = container.NewVBox(minHeight(touchTarget, picker),
-			note("Changes the 2D slice only. Pick the 3D volume under Study."))
+		page = vstack(8, minHeight(touchTarget, pick),
+			hint("Changes the 2D slice only. Pick the 3D volume under Study."))
 	default:
-		rows := []fyne.CanvasObject{minHeight(touchTarget, v.planePicker().box), v.sliceRow().obj,
+		rows := []fyne.CanvasObject{v.planePicker(), v.sliceRow().obj,
 			minHeight(touchTarget, v.compositeToggle())}
 		if !v.st.focusSlice {
 			rows = append(rows, buttonRow(
-				widget.NewButton("Fit image", v.fitImage),
-				widget.NewButton("Focus slice", v.toggleFocusSlice)))
+				newButton("Fit image", v.fitImage),
+				newButton("Focus slice", v.toggleFocusSlice)))
 		}
-		page = container.NewVBox(rows...)
+		page = vstack(8, rows...)
 	}
-	return container.NewBorder(sel, nil, nil, nil, inset(0, 8, page))
+	return border(sel, nil, nil, nil, inset(0, 8, page))
 }
 
 // phoneFocusView: the view fills the screen above one action bar; "Adjust
 // display" opens the same paged controls the tab view uses.
 func (v *Viewer) phoneFocusView() fyne.CanvasObject {
 	slice := v.st.focusSlice
-	exit := widget.NewButton("Exit focus", func() {
+	exit := newButton("Exit focus", func() {
 		v.st.focusSlice, v.st.focusVolume, v.st.focusAdjustOpen = false, false, false
 		v.rebuild()
 		v.volumeRenderer.FitView()
@@ -320,16 +451,15 @@ func (v *Viewer) phoneFocusView() fyne.CanvasObject {
 	if slice {
 		fitLabel, fit = "Fit image", v.fitImage
 	}
-	adjust := widget.NewButton("Adjust display", func() {
+	adjust := newButton("Adjust display", func() {
 		v.st.focusAdjustOpen = !v.st.focusAdjustOpen
 		v.rebuild()
 	})
-	if v.st.focusAdjustOpen {
-		adjust.Importance = widget.SuccessImportance
-	}
-	bar := panel(colBG, 0, container.NewVBox(
-		inset(16, 8, buttonRow(exit, widget.NewButton(fitLabel, fit), adjust)),
-		container.New(sizedLayout{h: v.st.layout.homeIndicatorInset()}, layout.NewSpacer())))
+	adjust.selected = v.st.focusAdjustOpen
+	bar := panel(colBG, 0, vstack(0,
+		hairline(),
+		inset(16, 8, buttonRow(exit, newButton(fitLabel, fit), adjust)),
+		container.New(sizedLayout{h: v.st.layout.homeIndicatorInset()}, vstack(0))))
 
 	view, sheet := fyne.CanvasObject(v.volumeRenderer), v.volumeSheet
 	if slice {
@@ -340,7 +470,7 @@ func (v *Viewer) phoneFocusView() fyne.CanvasObject {
 	} else if slice && !v.st.composite && v.dicox.MaxSlice() > 0 {
 		// Stepping through slices is the main thing to do here: keep it out.
 		row := panel(colPanel, 0, inset(16, 8, v.sliceRow().obj))
-		view = container.NewBorder(nil, row, nil, nil, view)
+		view = border(nil, border(hairline(), nil, nil, nil, row), nil, nil, view)
 	}
-	return container.NewBorder(nil, bar, nil, nil, view)
+	return border(nil, bar, nil, nil, view)
 }

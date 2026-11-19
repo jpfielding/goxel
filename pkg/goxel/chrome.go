@@ -4,7 +4,6 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/layout"
-	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 )
 
@@ -15,26 +14,29 @@ func (v *Viewer) appBar() fyne.CanvasObject {
 	if compact {
 		markSize, nameSize = 22, 19
 	}
-	left := container.NewHBox(
-		container.NewCenter(markImage(markSize)),
-		container.NewCenter(text("goxel", nameSize, colHeading, false)),
-	)
-	var right fyne.CanvasObject = layout.NewSpacer()
+	left := hrow(8, markImage(markSize), text("goxel", nameSize, colHeading))
+	var right fyne.CanvasObject
 	if v.st.loadedName != "" && v.loaded() {
 		maxRunes := 64
 		if compact {
 			maxRunes = 28
 		}
-		name := text(elideMiddle(v.st.loadedName, maxRunes), 13, colMuted, false)
-		name.Alignment = fyne.TextAlignTrailing
-		right = shrinkable(container.NewVBox(layout.NewSpacer(), name, layout.NewSpacer()))
+		right = rightCentre(text(elideMiddle(v.st.loadedName, maxRunes), 13, colMuted))
 	}
 	vpad := float32(8)
 	if compact {
 		vpad = 6
 	}
-	row := container.NewBorder(nil, nil, left, nil, right)
-	return panel(colPanel, 0, inset(16, vpad, minHeight(28, row)))
+	bar := panel(colPanel, 0, inset(16, vpad, minHeight(28, border(nil, nil, left, nil, shrinkable(orSpacer(right))))))
+	return border(nil, hairline(), nil, nil, bar)
+}
+
+// orSpacer returns o, or an empty object when o is nil.
+func orSpacer(o fyne.CanvasObject) fyne.CanvasObject {
+	if o == nil {
+		return layout.NewSpacer()
+	}
+	return o
 }
 
 // navigationText is the status bar's one line of hints (roxel's wording).
@@ -56,8 +58,8 @@ func navigationText(st *uiState, touch bool) string {
 }
 
 func (v *Viewer) statusBar() fyne.CanvasObject {
-	t := text(navigationText(&v.st, hasTouch()), 12, colMuted, false)
-	return panel(colBG, 0, inset(16, 5, shrinkable(t)))
+	t := text(navigationText(&v.st, hasTouch()), 12, colMuted)
+	return border(hairline(), nil, nil, nil, panel(colBG, 0, inset(16, 5, shrinkable(leftCentre(t)))))
 }
 
 // emptyState is the first-use card: what this is and the one action.
@@ -67,10 +69,10 @@ func (v *Viewer) emptyState() fyne.CanvasObject {
 	if compact {
 		markSize = 56
 	}
-	title := text("Open a DICOM study", 22, colHeading, false)
+	title := text("Open a DICOM study", 22, colHeading)
 	title.Alignment = fyne.TextAlignCenter
 	intro := note("See a CT scan as a 3D volume and as 2D slices.")
-	intro.Alignment = fyne.TextAlignCenter
+	intro.centre = true
 
 	formats := "DICOM .dcm or .dcs files, or a study folder."
 	switch {
@@ -80,14 +82,13 @@ func (v *Viewer) emptyState() fyne.CanvasObject {
 		formats = "DICOM .dcm or .dcs files."
 	}
 	fmtNote := note(formats)
-	fmtNote.Alignment = fyne.TextAlignCenter
-	fmtNote.SizeName = theme.SizeNameCaptionText
+	fmtNote.centre = true
+	fmtNote.size = 12
 
-	card := container.NewVBox(
+	card := vstack(8,
 		container.NewCenter(markImage(markSize)),
 		container.NewCenter(title),
 		intro,
-		layout.NewSpacer(),
 		v.openButtons(true),
 		v.loadStatus(),
 		fmtNote,
@@ -123,29 +124,31 @@ func (c *centredColumn) MinSize(objs []fyne.CanvasObject) fyne.Size {
 	return fyne.NewSize(min(c.width, 240), h)
 }
 
-// openButtons: "Open file…" (primary) and "Open folder…" on desktop or
-// "Load sample" in the browser.
+// openButtons: "Open file…" (primary on first use) and "Open folder…" on
+// desktop or "Load sample" in the browser, each as wide as the column.
 func (v *Viewer) openButtons(primary bool) fyne.CanvasObject {
 	busy := v.st.loadingFile != ""
-	open := widget.NewButton("Open file…", v.openFile)
-	if primary {
-		open.Importance = widget.HighImportance
-	}
-	var second *widget.Button
+	open := newButton("Open file…", v.openFile)
+	open.primary = primary
+	var second *button
 	if canOpenFolder {
-		second = widget.NewButton("Open folder…", v.openFolder)
+		second = newButton("Open folder…", v.openFolder)
 	} else {
-		second = widget.NewButton("Load sample", v.LoadSample)
+		second = newButton("Load sample", v.LoadSample)
 	}
 	if busy {
 		open.Disable()
 		second.Disable()
 	}
-	h := float32(32)
-	if primary || v.st.layout.compact() {
+	h := float32(30)
+	if primary {
+		h = touchTarget
+	} else if v.st.layout.compact() {
 		h = touchTarget
 	}
-	return container.NewVBox(minHeight(h, open), minHeight(h, second))
+	open.sized(0, h)
+	second.sized(0, h)
+	return vstack(8, open, second)
 }
 
 // loadStatus: a spinner while loading, or the last error with a retry hint.
@@ -153,12 +156,9 @@ func (v *Viewer) loadStatus() fyne.CanvasObject {
 	switch {
 	case v.st.loadingFile != "":
 		bar := widget.NewProgressBarInfinite()
-		return container.NewVBox(note("Loading "+elideMiddle(v.st.loadingFile, 40)+"…"), bar)
+		return vstack(4, note("Loading "+elideMiddle(v.st.loadingFile, 40)+"…"), bar)
 	case v.st.loadError != "":
-		msg := widget.NewLabel(v.st.loadError)
-		msg.Wrapping = fyne.TextWrapWord
-		msg.Importance = widget.DangerImportance
-		return container.NewVBox(msg, note("Choose a DICOM .dcm or .dcs file to try again."))
+		return vstack(4, newWrapped(v.st.loadError, bodySize(), colDanger), note("Choose a DICOM .dcm or .dcs file to try again."))
 	}
-	return layout.NewSpacer()
+	return vstack(0)
 }

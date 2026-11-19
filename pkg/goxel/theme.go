@@ -25,6 +25,9 @@ var (
 	colControl  = color.NRGBA{38, 52, 66, 255}
 	colHover    = color.NRGBA{52, 70, 86, 255}
 	colOpenCard = color.NRGBA{27, 47, 52, 255}
+	// colDisabled is text of a disabled control: well apart from colText, as
+	// egui fades it.
+	colDisabled = color.NRGBA{98, 110, 122, 255}
 )
 
 // goxelTheme is the one Fyne theme: dark only, with larger type and touch
@@ -46,8 +49,10 @@ func (t *goxelTheme) Color(name fyne.ThemeColorName, _ fyne.ThemeVariant) color.
 		return colPanel
 	case theme.ColorNameForeground:
 		return colText
-	case theme.ColorNamePlaceHolder, theme.ColorNameDisabled:
+	case theme.ColorNamePlaceHolder:
 		return colMuted
+	case theme.ColorNameDisabled:
+		return colDisabled
 	case theme.ColorNamePrimary, theme.ColorNameFocus, theme.ColorNameHyperlink:
 		return colAccent
 	case theme.ColorNameForegroundOnPrimary:
@@ -59,10 +64,12 @@ func (t *goxelTheme) Color(name fyne.ThemeColorName, _ fyne.ThemeVariant) color.
 		return colSelected
 	case theme.ColorNameForegroundOnSuccess:
 		return colHeading
-	case theme.ColorNameButton, theme.ColorNameInputBackground:
+	case theme.ColorNameButton:
 		return colControl
 	case theme.ColorNameDisabledButton:
 		return colPanel
+	case theme.ColorNameInputBackground:
+		return colControl
 	case theme.ColorNameHover:
 		return colHover
 	case theme.ColorNameInputBorder:
@@ -79,8 +86,14 @@ func (t *goxelTheme) Color(name fyne.ThemeColorName, _ fyne.ThemeVariant) color.
 	return theme.DefaultTheme().Color(name, theme.VariantDark)
 }
 
+// Font is one regular weight for every text style, as egui has: bold text
+// would be a different face from roxel's. Monospace and symbol text keep the
+// stock faces.
 func (t *goxelTheme) Font(style fyne.TextStyle) fyne.Resource {
-	return theme.DefaultTheme().Font(style)
+	if style.Monospace || style.Symbol {
+		return theme.DefaultTheme().Font(style)
+	}
+	return ubuntuLight
 }
 
 func (t *goxelTheme) Icon(name fyne.ThemeIconName) fyne.Resource {
@@ -120,11 +133,3 @@ func (t *goxelTheme) Size(name fyne.ThemeSizeName) float32 {
 	}
 	return theme.DefaultTheme().Size(name)
 }
-
-// markSVG is goxel's hexagon mark (the same shape roxel uses), in ACCENT.
-const markSVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-<polygon points="32,4 56,18 56,46 32,60 8,46 8,18" fill="none" stroke="#69d3bf" stroke-width="5" stroke-linejoin="round"/>
-<polygon points="32,20 42,26 42,38 32,44 22,38 22,26" fill="#69d3bf"/>
-</svg>`
-
-var markResource = fyne.NewStaticResource("goxel-mark.svg", []byte(markSVG))

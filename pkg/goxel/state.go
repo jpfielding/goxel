@@ -1,6 +1,10 @@
 package goxel
 
-import "github.com/jpfielding/goxel/pkg/volume"
+import (
+	"math"
+
+	"github.com/jpfielding/goxel/pkg/volume"
+)
 
 // layoutClass is the responsive layout, chosen from the window's logical size
 // only (never a platform flag), as roxel does.
@@ -153,6 +157,7 @@ type uiState struct {
 	volumePage      volumePage
 	slicePage       slicePage
 	bandsOpen       bool
+	metadataOpen    bool
 	selectedBand    int
 	dragPans        bool
 
@@ -166,6 +171,7 @@ type uiState struct {
 
 	windowCenter3D float64
 	windowWidth3D  float64
+	range3D        windowRange
 	opacity        float64
 	density        float64
 	ambient        float64
@@ -179,6 +185,7 @@ type uiState struct {
 	zoom2D         float64 // percent, 50-500
 	windowCenter2D float64
 	windowWidth2D  float64
+	range2D        windowRange
 
 	loadedName  string
 	loadedPath  string
@@ -188,18 +195,23 @@ type uiState struct {
 
 func newUIState() uiState {
 	return uiState{
-		layout:      layoutDesktop,
-		phoneTab:    tabView3D,
-		sheetOpen:   true,
-		bands:       volume.DefaultColorBands(),
-		quality:     qualityHigh,
-		opacity:     0.5,
-		density:     float64(volume.DefaultColorBands()[0].Threshold) / 30000,
-		ambient:     0.55,
-		diffuse:     0.65,
-		specular:    0.4,
-		orientation: Axial,
-		zoom2D:      100,
+		layout:         layoutDesktop,
+		phoneTab:       tabView3D,
+		sheetOpen:      true,
+		bands:          volume.DefaultColorBands(),
+		preset:         paletteGrayscale,
+		quality:        qualityHigh,
+		opacity:        volume.DefaultOpacity,
+		density:        volume.DefaultDensity,
+		ambient:        volume.DefaultAmbient,
+		diffuse:        volume.DefaultDiffuse,
+		specular:       volume.DefaultSpecular,
+		depthCue:       volume.DefaultDepthCue,
+		showSlicePlane: true,
+		orientation:    Coronal,
+		zoom2D:         100,
+		range3D:        windowRangeFor(32768, 65536),
+		range2D:        windowRangeFor(32768, 65536),
 	}
 }
 
@@ -250,4 +262,40 @@ func cutawayPlane(o ViewOrientation, slice, count int, reverse bool) (nx, ny, nz
 		nx, ny, nz, d = -nx, -ny, -nz, frac
 	}
 	return nx, ny, nz, d
+}
+
+// windowRange is what a pair of windowing rows' tracks cover: the useful range
+// around the volume's own window, so the thumbs start centred. The number
+// boxes and steppers accept the full stored range.
+type windowRange struct {
+	centerLo, centerHi float64
+	widthLo, widthHi   float64
+	step               float64 // one press of a stepper
+}
+
+// windowRangeFor is the range for a volume whose window is (center, width):
+// the centre track covers the window itself, the width track 1 to twice it.
+func windowRangeFor(center, width float64) windowRange {
+	width = math.Max(width, 1)
+	r := windowRange{
+		centerLo: center - width/2, centerHi: center + width/2,
+		widthLo: 1, widthHi: width * 2,
+	}
+	r.step = windowStep(r.widthHi - r.widthLo)
+	return r
+}
+
+// windowStep is about 1/200 of the useful range, rounded up to a tidy number.
+func windowStep(span float64) float64 {
+	raw := span / 200
+	if raw <= 1 {
+		return 1
+	}
+	magnitude := math.Pow(10, math.Floor(math.Log10(raw)))
+	for _, m := range []float64{1, 2, 5, 10} {
+		if s := m * magnitude; s >= raw {
+			return s
+		}
+	}
+	return raw
 }

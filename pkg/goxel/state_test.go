@@ -101,16 +101,47 @@ func TestElideMiddle(t *testing.T) {
 }
 
 func TestFitDistance(t *testing.T) {
-	assert.InDelta(t, 1.01, fitDistance(0.40625), 0.01)
-	assert.Equal(t, 5.0, fitDistance(100))
+	// A unit cube seen straight on fills the height with a 6% margin: its
+	// near face is half a unit closer than the centre.
+	assert.InDelta(t, 0.5*1.06/shaderFov+0.5, fitDistance(1, 1, 0, 0, 1), 1e-9)
+	// A wider viewport leaves the height fit alone; a narrower one needs more room.
+	assert.InDelta(t, fitDistance(1, 1, 0, 0, 1), fitDistance(1, 1, 0, 0, 2), 1e-9)
+	assert.Greater(t, fitDistance(1, 1, 0, 0, 0.5), fitDistance(1, 1, 0, 0, 1))
+	// A slab seen along its thin side needs less distance than the cube.
+	assert.Less(t, fitDistance(1, 0.2, 0, 0, 1.5), fitDistance(1, 1, 0, 0, 1.5))
 }
 
 func TestSlicePlaneCorners(t *testing.T) {
-	c := slicePlaneCorners(Axial, 0, 2, 0.5)
+	c := slicePlaneCorners(Axial, 0, 2, 1, 0.5)
 	assert.Equal(t, [3]float64{0, 0, 0.125}, c[0])
 	assert.Equal(t, [3]float64{1, 1, 0.125}, c[2])
-	c = slicePlaneCorners(Coronal, 1, 2, 0.5)
+	c = slicePlaneCorners(Coronal, 1, 2, 1, 0.5)
 	assert.Equal(t, [3]float64{1, 0.75, 0.5}, c[2])
-	c = slicePlaneCorners(Sagittal, 1, 4, 2)
+	c = slicePlaneCorners(Coronal, 1, 2, 0.5, 2)
+	assert.Equal(t, [3]float64{1, 0.375, 2}, c[2], "the plane sits inside the physical box")
+	c = slicePlaneCorners(Sagittal, 1, 4, 1, 2)
 	assert.Equal(t, [3]float64{0.375, 1, 2}, c[2])
+}
+
+func TestWindowRangeFor(t *testing.T) {
+	r := windowRangeFor(238, 2524)
+	assert.InDelta(t, -1024, r.centerLo, 1e-9)
+	assert.InDelta(t, 1500, r.centerHi, 1e-9)
+	assert.InDelta(t, 1, r.widthLo, 1e-9)
+	assert.InDelta(t, 5048, r.widthHi, 1e-9)
+	// The window sits mid-track, so the thumbs start centred.
+	assert.InDelta(t, 0.5, (238-r.centerLo)/(r.centerHi-r.centerLo), 1e-9)
+	assert.InDelta(t, 0.5, (2524-r.widthLo)/(r.widthHi-r.widthLo), 0.001)
+	assert.Equal(t, 50.0, windowStep(5047))
+	assert.Equal(t, 2.0, windowStep(399))
+	assert.Equal(t, 1.0, windowStep(49))
+}
+
+func TestDefaultsFollowRoxel(t *testing.T) {
+	s := newUIState()
+	assert.Equal(t, paletteGrayscale, s.preset)
+	assert.Equal(t, Coronal, s.orientation)
+	assert.True(t, s.showSlicePlane)
+	assert.InDelta(t, 0.25, s.opacity, 1e-9)
+	assert.InDelta(t, 0.35, s.depthCue, 1e-9)
 }

@@ -72,16 +72,16 @@ func (desktopLayout) MinSize(objs []fyne.CanvasObject) fyne.Size {
 func (v *Viewer) desktopRoot() fyne.CanvasObject {
 	bar := v.appBar()
 	if !v.loaded() {
-		return container.NewBorder(bar, nil, nil, nil, v.emptyState())
+		return border(bar, nil, nil, nil, v.emptyState())
 	}
 	status := v.statusBar()
 	if v.st.focusSlice {
-		return container.NewBorder(bar, status, nil, nil, v.sliceFocusView())
+		return border(bar, status, nil, nil, v.sliceFocusView())
 	}
-	centre := container.NewBorder(v.volumeHeader(), v.shelf(), nil, nil, v.volumeRenderer)
+	centre := border(v.volumeHeader(), v.shelf(), nil, nil, v.volumeRenderer)
 	if v.st.focusVolume {
-		return container.NewBorder(bar, status, nil, nil, centre)
+		return border(bar, status, nil, nil, centre)
 	}
 	body := container.New(desktopLayout{}, v.sidebar(), v.slicePanel(), centre)
-	return container.NewBorder(bar, status, nil, nil, body)
+	return border(bar, status, nil, nil, body)
 }

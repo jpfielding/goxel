@@ -48,8 +48,14 @@ type VolumeRenderer struct {
 
 	Align AlignParams
 
-	// Aspect Ratio control
-	scaleZ float64
+	// Physical box: X is 1, Y and Z are relative to it.
+	scaleY, scaleZ float64
+
+	// viewAspect is the widget's width over height: the render fills the
+	// widget, so the camera fits the box to this aspect.
+	viewAspect float64
+	// maxZoom is how far the camera may back off (grows with the fitted box).
+	maxZoom float64
 
 	// Channel-based render backpressure (buffer size 1)
 	// Non-blocking send drops frames when GPU is busy
@@ -77,7 +83,10 @@ type AlignParams struct {
 // NewVolumeRenderer creates a new volume renderer, attempting GPU first
 func NewVolumeRenderer() *VolumeRenderer {
 	vr := &VolumeRenderer{
-		scaleZ:     2.0,                    // Default 200% Z-stretch
+		scaleY:     1,
+		scaleZ:     1,
+		viewAspect: 1,
+		maxZoom:    5,
 		renderChan: make(chan struct{}, 1), // Buffer size 1 for backpressure
 		Align: AlignParams{
 			FlipX:    true,
@@ -103,6 +112,7 @@ func NewVolumeRenderer() *VolumeRenderer {
 		slog.Info("GPU volume renderer initialized successfully")
 		vr.gpuRenderer = gpuRenderer
 		vr.useGPU = true
+		gpuRenderer.SetRotation(defaultAzimuth, defaultElevation)
 
 		// Start render goroutine for channel-based backpressure
 		go vr.renderLoop()
@@ -467,16 +477,19 @@ func (vr *VolumeRenderer) GetLighting() (ambient, diffuse, specular float64) {
 	return 0.7, 0.5, 0.75 // SIAT-lib defaults
 }
 
-// SetScaleZ sets the Z limit/scaling
-func (vr *VolumeRenderer) SetScaleZ(scale float64) {
+// SetBoxScale sets the physical proportions of the volume box: Y and Z
+// extents relative to X.
+func (vr *VolumeRenderer) SetBoxScale(y, z float64) {
 	vr.mu.Lock()
 	defer vr.mu.Unlock() // Extend lock scope to cover GPU call
-	vr.scaleZ = scale
+	vr.scaleY, vr.scaleZ = y, z
 
 	if vr.useGPU && vr.gpuRenderer != nil {
-		vr.gpuRenderer.SetScaleZ(scale)
+		vr.gpuRenderer.SetScaleY(y)
+		vr.gpuRenderer.SetScaleZ(z)
 	} else if vr.cpuRenderer != nil {
-		vr.cpuRenderer.SetScaleZ(scale)
+		vr.cpuRenderer.SetScaleY(y)
+		vr.cpuRenderer.SetScaleZ(z)
 	}
 	// Trigger update
 	fyne.Do(func() { vr.Refresh() })
@@ -503,14 +516,24 @@ func (vr *VolumeRenderer) CreateRenderer() fyne.WidgetRenderer {
 		vr:      vr,
 		img:     vr.img,
 		readout: canvas.NewText("", colAccent),
+		swatch:  canvas.NewLine(colAccent),
 	}
 	r.readout.TextSize = 12.5
 	r.readout.Alignment = fyne.TextAlignTrailing
+	r.swatch.StrokeWidth = 1.5
+	r.swatch.Hide()
 	for i := range r.edges {
-		l := canvas.NewLine(color.NRGBA{105, 211, 191, 180})
+		l := canvas.NewLine(color.NRGBA{105, 211, 191, 178})
 		l.StrokeWidth = 1
 		l.Hide()
 		r.edges[i] = l
+	}
+	for i := range r.axes {
+		r.axes[i] = canvas.NewLine(gizmoColors[i])
+		r.axes[i].StrokeWidth = 1.5
+		r.axes[i].Hide()
+		r.letters[i] = canvas.NewText("", gizmoColors[i])
+		r.letters[i].TextSize = 12
 	}
 	return r
 }
@@ -577,7 +600,7 @@ func (vr *VolumeRenderer) Dragged(e *fyne.DragEvent) {
 			// Rotate: turntable rotation
 			rotX, rotY := vr.gpuRenderer.GetRotation()
 
-			rotX -= float64(e.Dragged.DX) * 0.01
+			rotX += float64(e.Dragged.DX) * 0.005
 			for rotX < 0 {
 				rotX += 2 * math.Pi
 			}
@@ -585,7 +608,7 @@ func (vr *VolumeRenderer) Dragged(e *fyne.DragEvent) {
 				rotX -= 2 * math.Pi
 			}
 
-			rotY -= float64(e.Dragged.DY) * 0.01
+			rotY -= float64(e.Dragged.DY) * 0.005
 			for rotY < 0 {
 				rotY += 2 * math.Pi
 			}
@@ -642,26 +665,64 @@ func (vr *VolumeRenderer) ZoomBy(f float64) {
 	if vr.gpuRenderer == nil {
 		return
 	}
-	vr.gpuRenderer.SetZoom(math.Max(0.5, math.Min(5, vr.gpuRenderer.GetZoom()*f)))
+	vr.gpuRenderer.SetZoom(math.Max(minZoom, math.Min(vr.maxZoom, vr.gpuRenderer.GetZoom()*f)))
 	vr.TriggerRender()
 }
 
-// fitDistance is the camera distance at which the volume box [1 x 1 x
-// scaleZ] fits the view: its bounding sphere against the shader's 0.8
-// half-angle tangent, with a little margin.
-func fitDistance(scaleZ float64) float64 {
-	r := 0.5 * math.Sqrt(2+scaleZ*scaleZ)
-	return math.Max(0.5, math.Min(5, r/0.8*1.1))
+// minZoom is the closest the camera may come to the volume's centre.
+const minZoom = 0.5
+
+// The 3D view opens from the front and above, like roxel's.
+const (
+	defaultAzimuth   = 0.25
+	defaultElevation = -1.1
+)
+
+// shaderFov is the ray-march shader's half-angle tangent (vertical).
+const shaderFov = 0.8
+
+// fitDistance is the camera distance at which all eight corners of the box
+// [1 x boxY x boxZ] lie inside a viewport of the given aspect, seen from
+// (azimuth, elevation), with a 6% margin.
+func fitDistance(boxY, boxZ, azimuth, elevation, aspect float64) float64 {
+	sinAz, cosAz := math.Sin(azimuth), math.Cos(azimuth)
+	sinEl, cosEl := math.Sin(elevation), math.Cos(elevation)
+	// Viewing direction (from the camera to the centre) and the camera basis,
+	// as in the shader.
+	f := [3]float64{-sinAz * cosEl, -sinEl, -cosAz * cosEl}
+	r := [3]float64{cosAz, 0, -sinAz}
+	u := [3]float64{f[1]*r[2] - f[2]*r[1], f[2]*r[0] - f[0]*r[2], f[0]*r[1] - f[1]*r[0]}
+	if l := math.Sqrt(u[0]*u[0] + u[1]*u[1] + u[2]*u[2]); l > 1e-3 {
+		u = [3]float64{u[0] / l, u[1] / l, u[2] / l}
+	}
+	dot := func(a, b [3]float64) float64 { return a[0]*b[0] + a[1]*b[1] + a[2]*b[2] }
+	dist := minZoom
+	for _, x := range []float64{-0.5, 0.5} {
+		for _, y := range []float64{-boxY / 2, boxY / 2} {
+			for _, z := range []float64{-boxZ / 2, boxZ / 2} {
+				d := [3]float64{x, y, z}
+				depth := dot(d, f)
+				dist = math.Max(dist, math.Abs(dot(d, r))*1.06/(shaderFov*math.Max(aspect, 0.1))-depth)
+				dist = math.Max(dist, math.Abs(dot(d, u))*1.06/shaderFov-depth)
+			}
+		}
+	}
+	return dist
 }
 
-// FitView centres the volume and fits it to the view, keeping the angle.
+// FitView centres the volume and fits its box to the view, keeping the angle.
 func (vr *VolumeRenderer) FitView() {
 	if vr.gpuRenderer == nil {
 		vr.ResetView()
 		return
 	}
+	vr.mu.Lock()
+	rotX, rotY := vr.gpuRenderer.GetRotation()
+	d := fitDistance(vr.scaleY, vr.scaleZ, rotX, rotY, vr.viewAspect)
+	vr.maxZoom = math.Max(5, d*2)
+	vr.mu.Unlock()
 	vr.gpuRenderer.SetPan(0, 0)
-	vr.gpuRenderer.SetZoom(fitDistance(vr.gpuRenderer.Params().ScaleZ))
+	vr.gpuRenderer.SetZoom(d)
 	vr.TriggerRender()
 }
 
@@ -674,7 +735,7 @@ func (vr *VolumeRenderer) LookAlong(axis int) {
 	case 0:
 		vr.gpuRenderer.SetRotation(math.Pi/2, 0)
 	case 1:
-		vr.gpuRenderer.SetRotation(0, math.Pi/2-0.01)
+		vr.gpuRenderer.SetRotation(0, -math.Pi/2+0.01)
 	default:
 		vr.gpuRenderer.SetRotation(0, 0)
 	}
@@ -721,12 +782,7 @@ func (vr *VolumeRenderer) Scrolled(e *fyne.ScrollEvent) {
 	if vr.useGPU && vr.gpuRenderer != nil {
 		zoom := vr.gpuRenderer.GetZoom()
 		zoom -= float64(e.Scrolled.DY) * 0.05
-		if zoom < 0.5 {
-			zoom = 0.5
-		}
-		if zoom > 5 {
-			zoom = 5
-		}
+		zoom = math.Max(minZoom, math.Min(vr.maxZoom, zoom))
 		vr.gpuRenderer.SetZoom(zoom)
 
 		// Non-blocking send to render channel - drops frame if GPU busy
@@ -766,8 +822,8 @@ func (vr *VolumeRenderer) ResetView() {
 	defer vr.mu.Unlock()
 
 	if vr.useGPU && vr.gpuRenderer != nil {
-		vr.gpuRenderer.SetRotation(0.3, 0.5)
-		vr.gpuRenderer.SetZoom(2.0)
+		vr.gpuRenderer.SetRotation(defaultAzimuth, defaultElevation)
+		vr.gpuRenderer.SetZoom(fitDistance(vr.scaleY, vr.scaleZ, defaultAzimuth, defaultElevation, vr.viewAspect))
 		vr.gpuRenderer.ForceRender()
 	} else if vr.cpuRenderer != nil {
 		vr.cpuRenderer.RotationX = 0.3
@@ -794,9 +850,7 @@ func (vr *VolumeRenderer) SetQuality(mode int) {
 		vr.cpuRenderer.SetQuality(mode)
 	}
 	if vr.gpuRenderer != nil {
-		p := vr.gpuRenderer.Params()
-		p.StepSize = renderQuality(mode).stepSize()
-		vr.gpuRenderer.SetParams(p)
+		vr.gpuRenderer.SetStepSize(renderQuality(mode).stepSize())
 	}
 }
 
@@ -826,54 +880,83 @@ type volumeWidgetRenderer struct {
 	img     *canvas.Image
 	edges   [4]*canvas.Line
 	readout *canvas.Text
+	swatch  *canvas.Line // line sample before the readout, tying it to the outline
+	axes    [3]*canvas.Line
+	letters [3]*canvas.Text
 }
 
-// projectToImage maps a point in the renderer's box space to normalised
-// image coordinates with the same camera model as the ray-march shader.
-func (vr *VolumeRenderer) projectToImage(p [3]float64) (x, y float64, ok bool) {
+// Gizmo colours: X pink, Y the accent, Z blue, as on roxel's corner gizmo.
+var gizmoColors = [3]color.NRGBA{{231, 145, 135, 255}, {105, 211, 191, 255}, {143, 177, 225, 255}}
+
+// cameraBasis returns the camera position, viewing direction and the screen
+// right and screen-down vectors, with the shader's camera model. The 3D image
+// is shown without a vertical flip, so +u is down the screen.
+func (vr *VolumeRenderer) cameraBasis() (cam, f, r, u [3]float64) {
 	g := vr.gpuRenderer
 	rotX, rotY := g.GetRotation()
 	zoom := g.GetZoom()
 	panX, panY := g.GetPan()
-	scaleZ := g.Params().ScaleZ
 	sinAz, cosAz := math.Sin(rotX), math.Cos(rotX)
 	sinEl, cosEl := math.Sin(rotY), math.Cos(rotY)
-	c := [3]float64{0.5 + panX, 0.5 + panY, scaleZ * 0.5}
-	cam := [3]float64{sinAz*cosEl*zoom + c[0], sinEl*zoom + c[1], cosAz*cosEl*zoom + c[2]}
-	f := [3]float64{c[0] - cam[0], c[1] - cam[1], c[2] - cam[2]}
+	c := [3]float64{0.5 + panX, vr.scaleY*0.5 + panY, vr.scaleZ * 0.5}
+	cam = [3]float64{sinAz*cosEl*zoom + c[0], sinEl*zoom + c[1], cosAz*cosEl*zoom + c[2]}
+	f = [3]float64{c[0] - cam[0], c[1] - cam[1], c[2] - cam[2]}
 	fl := math.Sqrt(f[0]*f[0] + f[1]*f[1] + f[2]*f[2])
 	f = [3]float64{f[0] / fl, f[1] / fl, f[2] / fl}
-	r := [3]float64{cosAz, 0, -sinAz}
-	u := [3]float64{f[1]*r[2] - f[2]*r[1], f[2]*r[0] - f[0]*r[2], f[0]*r[1] - f[1]*r[0]}
+	r = [3]float64{cosAz, 0, -sinAz}
+	u = [3]float64{f[1]*r[2] - f[2]*r[1], f[2]*r[0] - f[0]*r[2], f[0]*r[1] - f[1]*r[0]}
 	if ul := math.Sqrt(u[0]*u[0] + u[1]*u[1] + u[2]*u[2]); ul > 0.001 {
 		u = [3]float64{u[0] / ul, u[1] / ul, u[2] / ul}
 	}
+	return cam, f, r, u
+}
+
+func dot3(a, b [3]float64) float64 { return a[0]*b[0] + a[1]*b[1] + a[2]*b[2] }
+
+// projectToImage maps a point in the renderer's box space to normalised
+// image coordinates with the same camera model as the ray-march shader.
+func (vr *VolumeRenderer) projectToImage(p [3]float64) (x, y float64, ok bool) {
+	cam, f, r, u := vr.cameraBasis()
 	d := [3]float64{p[0] - cam[0], p[1] - cam[1], p[2] - cam[2]}
-	dot := func(a, b [3]float64) float64 { return a[0]*b[0] + a[1]*b[1] + a[2]*b[2] }
-	depth := dot(d, f)
+	depth := dot3(d, f)
 	if depth <= 1e-6 {
 		return 0, 0, false
 	}
-	const fov = 0.8 // the shader's half-angle tangent; the render is square
-	ux, uy := dot(d, r)/(depth*fov), dot(d, u)/(depth*fov)
-	return (ux + 1) / 2, (1 - uy) / 2, true
+	ux, uy := dot3(d, r)/(depth*shaderFov*math.Max(vr.viewAspect, 0.1)), dot3(d, u)/(depth*shaderFov)
+	return (ux + 1) / 2, (uy + 1) / 2, true
 }
 
-// layoutOverlay positions the slice-plane outline and readout over the image.
+// layoutOverlay positions the slice-plane outline, its readout and the axis
+// gizmo over the image.
 func (r *volumeWidgetRenderer) layoutOverlay(size fyne.Size) {
 	for _, e := range r.edges {
 		e.Hide()
 	}
+	r.swatch.Hide()
 	r.readout.Text = ""
-	if r.vr.Overlay == nil || !r.vr.IsGPU() {
+	for i := range r.axes {
+		r.axes[i].Hide()
+		r.letters[i].Text = ""
+	}
+	if !r.vr.IsGPU() {
+		return
+	}
+	r.layoutGizmo(size)
+	if r.vr.Overlay == nil {
 		return
 	}
 	corners, readout := r.vr.Overlay()
 	r.readout.Text = readout
 	r.readout.Color = colAccent
 	ts := fyne.MeasureText(readout, r.readout.TextSize, r.readout.TextStyle)
-	r.readout.Move(fyne.NewPos(size.Width-ts.Width-16, size.Height-ts.Height-14))
+	pos := fyne.NewPos(size.Width-ts.Width-16, size.Height-ts.Height-14)
+	r.readout.Move(pos)
 	r.readout.Resize(ts)
+	if readout != "" && len(corners) == 4 {
+		y := pos.Y + ts.Height/2
+		r.swatch.Position1, r.swatch.Position2 = fyne.NewPos(pos.X-26, y), fyne.NewPos(pos.X-8, y)
+		r.swatch.Show()
+	}
 	if len(corners) != 4 {
 		return
 	}
@@ -892,28 +975,77 @@ func (r *volumeWidgetRenderer) layoutOverlay(size fyne.Size) {
 	}
 }
 
+// layoutGizmo draws the X / Y / Z axes in the lower-left corner: the "View
+// along" buttons are named for them.
+func (r *volumeWidgetRenderer) layoutGizmo(size fyne.Size) {
+	if size.Width < 120 || size.Height < 120 {
+		return
+	}
+	_, _, right, down := r.vr.cameraBasis()
+	origin := fyne.NewPos(40, size.Height-40)
+	for i, axis := range [3][3]float64{{1, 0, 0}, {0, 1, 0}, {0, 0, 1}} {
+		dx, dy := dot3(axis, right), dot3(axis, down)
+		n := math.Hypot(dx, dy)
+		end := fyne.NewPos(origin.X+float32(dx*20), origin.Y+float32(dy*20))
+		r.axes[i].Position1, r.axes[i].Position2 = origin, end
+		r.axes[i].Show()
+		// An axis pointing at the viewer has no direction on screen.
+		ox, oy := 0.0, -1.0
+		if n > 0.05 {
+			ox, oy = dx/n, dy/n
+		}
+		reach := math.Max(n*20+9, 17)
+		r.letters[i].Text = [3]string{"X", "Y", "Z"}[i]
+		ts := fyne.MeasureText(r.letters[i].Text, r.letters[i].TextSize, r.letters[i].TextStyle)
+		r.letters[i].Move(fyne.NewPos(origin.X+float32(ox*reach)-ts.Width/2, origin.Y+float32(oy*reach)-ts.Height/2))
+		r.letters[i].Resize(ts)
+	}
+}
+
+// renderSize is the GL target for a widget of the given size: its aspect,
+// with the long side at the platform's resolution.
+func renderSize(size fyne.Size) (int, int) {
+	longSide := 1024
+	if fyne.CurrentDevice().IsBrowser() {
+		longSide = 768
+	}
+	if size.Width <= 0 || size.Height <= 0 {
+		return longSide, longSide
+	}
+	if size.Width >= size.Height {
+		return longSide, max(int(float32(longSide)*size.Height/size.Width), 64)
+	}
+	return max(int(float32(longSide)*size.Width/size.Height), 64), longSide
+}
+
 func (r *volumeWidgetRenderer) Layout(size fyne.Size) {
-	// Aspect fit, centred: the clear colour matches the theme background, so
-	// the square render blends into the viewport.
+	vr := r.vr
+	if vr.IsGPU() {
+		// The render fills the widget: the camera fits the box to its aspect.
+		r.img.Move(fyne.NewPos(0, 0))
+		r.img.Resize(size)
+		w, h := renderSize(size)
+		vr.gpuRenderer.SetRenderSize(w, h)
+		if aspect := float64(size.Width / max(size.Height, 1)); aspect != vr.viewAspect && size.Width > 0 {
+			vr.viewAspect = aspect
+			vr.FitView()
+		}
+		r.layoutOverlay(size)
+		return
+	}
+	// CPU fallback: a square image, aspect-fit and centred.
 	aspect := float32(1.0)
-	if r.vr.dimX > 0 && r.vr.dimY > 0 {
-		aspect = float32(r.vr.dimX) / float32(r.vr.dimY)
+	if vr.dimX > 0 && vr.dimY > 0 {
+		aspect = float32(vr.dimX) / float32(vr.dimY)
 	}
-
-	viewW := size.Width
-	viewH := size.Height
-
-	renderW := viewW
-	renderH := viewW / aspect
-
-	if renderH > viewH {
-		renderH = viewH
-		renderW = viewH * aspect
+	renderW := size.Width
+	renderH := size.Width / aspect
+	if renderH > size.Height {
+		renderH = size.Height
+		renderW = size.Height * aspect
 	}
-
-	r.img.Move(fyne.NewPos((viewW-renderW)/2, (viewH-renderH)/2))
+	r.img.Move(fyne.NewPos((size.Width-renderW)/2, (size.Height-renderH)/2))
 	r.img.Resize(fyne.NewSize(renderW, renderH))
-	r.layoutOverlay(size)
 }
 
 func (r *volumeWidgetRenderer) MinSize() fyne.Size {
@@ -937,12 +1069,18 @@ func (r *volumeWidgetRenderer) Refresh() {
 	for _, e := range r.edges {
 		canvas.Refresh(e)
 	}
+	for i := range r.axes {
+		canvas.Refresh(r.axes[i])
+		canvas.Refresh(r.letters[i])
+	}
+	canvas.Refresh(r.swatch)
 	canvas.Refresh(r.readout)
 	canvas.Refresh(r.img)
 }
 
 func (r *volumeWidgetRenderer) Objects() []fyne.CanvasObject {
-	return []fyne.CanvasObject{r.img, r.edges[0], r.edges[1], r.edges[2], r.edges[3], r.readout}
+	return []fyne.CanvasObject{r.img, r.edges[0], r.edges[1], r.edges[2], r.edges[3], r.swatch, r.readout,
+		r.axes[0], r.axes[1], r.axes[2], r.letters[0], r.letters[1], r.letters[2]}
 }
 
 func (r *volumeWidgetRenderer) Destroy() {

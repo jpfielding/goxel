@@ -6,7 +6,6 @@ import (
 	"image/color"
 	"image/jpeg"
 	"log/slog"
-	"math"
 )
 
 // ViewOrientation defines the plane for MPR viewing
@@ -50,6 +49,10 @@ func isJPEGLossless(data []byte) bool {
 type DICOXImage struct {
 	level int
 	width int
+
+	// intercept is added to every stored value, so the window is in modality
+	// units (as the 3D view's is).
+	intercept int32
 
 	// For native (uncompressed) frames
 	nativeData []uint16 // Flattened pixel data
@@ -140,6 +143,11 @@ func (d *DICOXImage) SetEncodedFrame(data []byte, rows, cols, bitsAllocated int,
 	}
 	d.isEncoded = true
 	return nil
+}
+
+// SetRescale sets the rescale intercept the window is applied after.
+func (d *DICOXImage) SetRescale(intercept float64) {
+	d.intercept = int32(intercept)
 }
 
 func (d *DICOXImage) WindowLevel() int {
@@ -301,8 +309,8 @@ func (d *DICOXImage) At(x, y int) color.Color {
 				if tfAlpha <= 0 {
 					return 0
 				}
-				// pow(alpha, 1.5) matches GPU shader
-				adjusted := math.Pow(tfAlpha, 1.5) * alphaScale
+				// The GPU shader's opacity: the transfer function's alpha times the scale.
+				adjusted := tfAlpha * alphaScale
 				if adjusted > 1 {
 					adjusted = 1
 				}
@@ -314,7 +322,7 @@ func (d *DICOXImage) At(x, y int) color.Color {
 				// Project through Z (front to back)
 				for z := 0; z < d.volZ && accumA < 0.98; z++ {
 					if z < len(d.volume) && y < len(d.volume[z]) && x < len(d.volume[z][y]) {
-						density := float64(d.volume[z][y][x])
+						density := float64(d.volume[z][y][x]) + float64(d.intercept)
 						// Skip if below window minimum (transparent/air)
 						if density > wMin {
 							r, g, b, tfAlpha := getColor(density)
@@ -335,7 +343,7 @@ func (d *DICOXImage) At(x, y int) color.Color {
 				volZ := y
 				for volY := 0; volY < d.volY && accumA < 0.98; volY++ {
 					if volZ < len(d.volume) && volY < len(d.volume[volZ]) && x < len(d.volume[volZ][volY]) {
-						density := float64(d.volume[volZ][volY][x])
+						density := float64(d.volume[volZ][volY][x]) + float64(d.intercept)
 						if density > wMin {
 							r, g, b, tfAlpha := getColor(density)
 							// Use transfer function's alpha (same as 3D shader)
@@ -355,7 +363,7 @@ func (d *DICOXImage) At(x, y int) color.Color {
 				volY := x
 				for volX := 0; volX < d.volX && accumA < 0.98; volX++ {
 					if volZ < len(d.volume) && volY < len(d.volume[volZ]) && volX < len(d.volume[volZ][volY]) {
-						density := float64(d.volume[volZ][volY][volX])
+						density := float64(d.volume[volZ][volY][volX]) + float64(d.intercept)
 						if density > wMin {
 							r, g, b, tfAlpha := getColor(density)
 							// Use transfer function's alpha (same as 3D shader)
@@ -416,7 +424,7 @@ func (d *DICOXImage) At(x, y int) color.Color {
 				}
 			}
 		}
-		raw = int32(val)
+		raw = int32(val) + d.intercept
 	} else if d.isEncoded {
 		i := y*d.decodedCols + x
 		if i >= len(d.decoded) || len(d.decoded[i]) == 0 {

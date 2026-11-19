@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/jpfielding/goxel/pkg/dicom"
@@ -375,6 +376,8 @@ func parseDICOMDataset(ds *dicom.Dataset, sourcePath string) (*ScanCollection, e
 	vol.RescaleIntercept = intercept
 	vol.RescaleSlope = slope
 
+	vol.WindowCenter, vol.WindowWidth, vol.WindowFromTags = windowFromDataset(ds)
+
 	// Get pixel spacing
 	pixelSpacingRow, pixelSpacingCol := dicom.GetPixelSpacing(ds)
 	vol.VoxelSizeY = pixelSpacingRow
@@ -529,6 +532,32 @@ func mergeScan(result, scan *ScanCollection) {
 	if result.WindowWidth == 2000 && scan.WindowWidth != 2000 {
 		result.WindowWidth = scan.WindowWidth
 	}
+}
+
+// windowFromDataset reads the file's Window Center / Width. ok is false when
+// the file has none, has several presets, or has a width so large (a full
+// stored range) that it says nothing about the data; the caller then derives
+// a window from the pixels.
+func windowFromDataset(ds *dicom.Dataset) (center, width float64, ok bool) {
+	first := func(t tag.Tag) (v float64, multi, found bool) {
+		elem, has := ds.FindElement(t.Group, t.Element)
+		if !has {
+			return 0, false, false
+		}
+		s, has := elem.GetString()
+		if !has {
+			return 0, false, false
+		}
+		parts := strings.Split(s, "\\")
+		v, err := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+		return v, len(parts) > 1, err == nil
+	}
+	wc, multiC, okC := first(tag.WindowCenter)
+	ww, multiW, okW := first(tag.WindowWidth)
+	if !okC || !okW || multiC || multiW || ww <= 0 || ww >= 65000 {
+		return 0, 0, false
+	}
+	return wc, ww, true
 }
 
 // Helper functions to extract DICOM tag values

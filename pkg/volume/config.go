@@ -4,6 +4,7 @@ package volume
 import (
 	"encoding/json"
 	"image/color"
+	"math"
 	"os"
 	"sort"
 )
@@ -136,16 +137,8 @@ func DefaultConfig() *RenderConfig {
 				{Density: 1800, R: 188, G: 25, B: 30},
 				{Density: 30000, R: 188, G: 25, B: 30},
 			},
-			// MONOCHROME (from tc_opac.ts) - Grayscale
-			"MONOCHROME": {
-				{Density: 0, R: 0, G: 0, B: 0},
-				{Density: 600, R: 170, G: 170, B: 170},
-				{Density: 900, R: 150, G: 150, B: 150},
-				{Density: 1700, R: 125, G: 125, B: 125},
-				{Density: 2500, R: 100, G: 100, B: 100},
-				{Density: 4200, R: 64, G: 64, B: 64},
-				{Density: 30000, R: 40, G: 40, B: 40},
-			},
+			// MONOCHROME - lifted grayscale, one ramp for the whole density range
+			"MONOCHROME": monochromeColors(),
 			// LAPTOP_REMOVAL (from tc_opac.ts) - Gray/Blue for laptop subtraction view
 			"LAPTOP_REMOVAL": {
 				{Density: 0, R: 0, G: 0, B: 0},
@@ -178,29 +171,15 @@ func DefaultConfig() *RenderConfig {
 				{Density: 30000, Alpha: 0.3},
 				{Density: 35000, Alpha: 0.4},
 			},
-			// FINDING - Higher base opacity
+			// FINDING - nothing below the cut-off, then a ramp from 0.03 to 0.2
 			"FINDING": {
 				{Density: 0, Alpha: 0.0},
+				{Density: 699, Alpha: 0.0},
 				{Density: 700, Alpha: 0.03},
-				{Density: 1000, Alpha: 0.1},
-				{Density: 1800, Alpha: 0.12},
-				{Density: 2000, Alpha: 0.15},
 				{Density: 30000, Alpha: 0.2},
 			},
-			// MONOCHROME (from tc_opac.ts)
-			"MONOCHROME": {
-				{Density: 0, Alpha: 0.0},
-				{Density: 599, Alpha: 0.0},
-				{Density: 600, Alpha: 0.03},
-				{Density: 899, Alpha: 0.03},
-				{Density: 900, Alpha: 0.1},
-				{Density: 1699, Alpha: 0.1},
-				{Density: 1700, Alpha: 0.15},
-				{Density: 2499, Alpha: 0.15},
-				{Density: 2500, Alpha: 0.4},
-				{Density: 4200, Alpha: 0.4},
-				{Density: 30000, Alpha: 0.5},
-			},
+			// MONOCHROME - opacity rises linearly with density, to 0.5
+			"MONOCHROME": monochromeOpacity(),
 			// LAPTOP_REMOVAL (from tc_opac.ts) - Zero opacity for subtraction
 			"LAPTOP_REMOVAL": {
 				{Density: 0, Alpha: 0.0},
@@ -717,4 +696,31 @@ func SetConfig(cfg *RenderConfig) {
 // GetConfig returns the active render configuration.
 func GetConfig() *RenderConfig {
 	return CurrentConfig
+}
+
+// monochromeSteps is the number of entries in the generated grayscale maps:
+// fine enough that linear interpolation between them is invisible.
+const monochromeSteps = 400
+
+// monochromeColors is the grayscale ramp 0.9 * t^0.65 over the density range
+// 0-30000. The power lifts the midtones so mid-density material reads on the
+// dark workspace instead of fading into it as the ramp gets darker.
+func monochromeColors() []ColorEntry {
+	out := make([]ColorEntry, monochromeSteps+1)
+	for i := range out {
+		t := float64(i) / monochromeSteps
+		g := int(math.Round(0.9 * math.Pow(t, 0.65) * 255))
+		out[i] = ColorEntry{Density: int(math.Round(t * 30000)), R: g, G: g, B: g}
+	}
+	return out
+}
+
+// monochromeOpacity is a linear opacity ramp, 0 to 0.5, over the density range.
+func monochromeOpacity() []OpacityEntry {
+	out := make([]OpacityEntry, monochromeSteps+1)
+	for i := range out {
+		t := float64(i) / monochromeSteps
+		out[i] = OpacityEntry{Density: int(math.Round(t * 30000)), Alpha: 0.5 * t}
+	}
+	return out
 }

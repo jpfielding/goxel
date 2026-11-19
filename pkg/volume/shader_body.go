@@ -44,6 +44,7 @@ uniform float windowMin;
 uniform float windowRange;
 uniform float alphaScale;
 uniform float stepSize;
+uniform float scaleY;
 uniform float scaleZ;
 uniform float rescaleIntercept;
 uniform vec4 tintColor;
@@ -55,9 +56,9 @@ uniform vec4 clipPlane;
 uniform bool enableClip;
 uniform float depthCue;
 
-// Ray-box intersection for box [0,1]x[0,1]x[0,scaleZ]
+// Ray-box intersection for the physical box [0,1]x[0,scaleY]x[0,scaleZ]
 vec2 intersectBox(vec3 origin, vec3 dir) {
-    vec3 boxSize = vec3(1.0, 1.0, scaleZ);
+    vec3 boxSize = vec3(1.0, scaleY, scaleZ);
     vec3 invDir = 1.0 / dir;
     vec3 t1 = (vec3(0.0) - origin) * invDir;
     vec3 t2 = (boxSize - origin) * invDir;
@@ -84,7 +85,14 @@ void main() {
 
     vec4 accum = vec4(0.0);
     float t = tNear;
-    vec3 boxSize = vec3(1.0, 1.0, scaleZ);
+    vec3 boxSize = vec3(1.0, scaleY, scaleZ);
+
+    // Opacity is defined over one smallest voxel, so it does not depend on
+    // the step (quality) or the camera distance: Beer-Lambert correction.
+    vec3 dims = vec3(textureSize(volumeTex, 0));
+    vec3 voxel = boxSize / dims;
+    float referenceStep = min(voxel.x, min(voxel.y, voxel.z));
+    float stepLen = max(stepSize, (tFar - tNear) / 4095.0);
 
     // Light directions for better depth perception
     vec3 lightDir1 = normalize(vec3(0.5, 0.7, 1.0));   // Main light (front-top-right)
@@ -93,6 +101,7 @@ void main() {
     for (int i = 0; i < 4096; i++) {
         if (t >= tFar || accum.a > 0.98) break;
 
+        float segment = min(stepLen, tFar - t);
         vec3 pos = camPos + rayDir * t;
 
         // Sample normalized coordinate
@@ -101,7 +110,7 @@ void main() {
         // Clipping plane check (in texture space 0..1)
         if (enableClip) {
              if (dot(texPos, clipPlane.xyz) + clipPlane.w < 0.0) {
-                 t += stepSize;
+                 t += stepLen;
                  continue;
              }
         }
@@ -113,74 +122,59 @@ void main() {
         // Window/level normalization
         float normalized = clamp((density * 65535.0 + rescaleIntercept - windowMin) / windowRange, 0.0, 1.0);
 
-        if (normalized > densityThreshold) {
-            vec4 sampleColor = TF_SAMPLE(normalized);
-
-            // Alpha threshold skip: avoid lighting for nearly-transparent samples
-            if (sampleColor.a < 0.001) {
-                t += stepSize;
-                continue;
-            }
-
-            // Apply tint
-            sampleColor.rgb *= tintColor.rgb;
-
-            // Decode pre-computed gradient from GBA channels (encoding is per back end)
-            vec3 gradient = DECODE_GRAD(volSample.gba);
-            float gradLen = length(gradient);
-
-            // Edge enhancement: boost opacity at surfaces (high gradient)
-            float edgeFactor = smoothstep(0.001, 0.02, gradLen);
-
-            // Only compute full Phong lighting when gradient is significant
-            if (gradLen > 0.01) {
-                vec3 normal = normalize(gradient);
-
-                // Two-light Phong lighting for better depth
-                float NdotL1 = max(dot(normal, lightDir1), 0.0);
-                float NdotL2 = max(dot(normal, lightDir2), 0.0);
-
-                // Specular highlight (Blinn-Phong)
-                vec3 viewDir = -rayDir;
-                vec3 halfVec1 = normalize(lightDir1 + viewDir);
-                vec3 halfVec2 = normalize(lightDir2 + viewDir);
-                float spec1 = pow(max(dot(normal, halfVec1), 0.0), 32.0);
-                float spec2 = pow(max(dot(normal, halfVec2), 0.0), 32.0);
-
-                // Combined lighting
-                float ambient = ambientIntensity;
-                float diffuse = diffuseIntensity * (NdotL1 * 0.7 + NdotL2 * 0.3);
-                float specular = specularIntensity * (spec1 * 0.7 + spec2 * 0.3);
-
-                float lightFactor = ambient + diffuse;
-                sampleColor.rgb *= clamp(lightFactor, 0.4, 1.4);
-                sampleColor.rgb += vec3(specular * 0.3); // Subtle specular highlight
-
-                // Edge enhancement: increase opacity at boundaries
-                sampleColor.a *= (1.0 + edgeFactor * 0.5);
-            } else {
-                // Flat region: ambient-only lighting
-                sampleColor.rgb *= ambientIntensity;
-            }
-
-            // Depth cue: darken samples further along the ray (0 = off).
-            if (depthCue > 0.0) {
-                float depthFrac = clamp((t - tNear) / max(tFar - tNear, 1e-4), 0.0, 1.0);
-                sampleColor.rgb *= 1.0 - depthCue * depthFrac;
-            }
-
-            // Smoother opacity curve (cube root for softer falloff, then square for surfaces)
-            float alphaAdjust = pow(sampleColor.a, 1.5);
-            float sampleA = alphaAdjust * alphaScale;
-
-            if (sampleA > 0.0005) {
-                float oneMinusAccA = 1.0 - accum.a;
-                accum.rgb += oneMinusAccA * sampleA * sampleColor.rgb;
-                accum.a += oneMinusAccA * sampleA;
-            }
+        if (normalized <= densityThreshold) {
+            t += stepLen;
+            continue;
         }
 
-        t += stepSize;
+        vec4 sampleColor = TF_SAMPLE(normalized);
+        sampleColor.rgb *= tintColor.rgb;
+        float sampleA = sampleColor.a * alphaScale;
+
+        // Alpha threshold skip: avoid lighting for nearly-transparent samples
+        if (sampleA < 0.001) {
+            t += stepLen;
+            continue;
+        }
+
+        // Decode pre-computed gradient from GBA channels (encoding is per back end)
+        vec3 gradient = DECODE_GRAD(volSample.gba);
+        float gradLen = length(gradient);
+
+        if (gradLen > 0.0002) {
+            // The gradient is per voxel index: scale it to the physical box.
+            vec3 normal = normalize(gradient * dims / boxSize);
+
+            // Two-light diffuse, one Blinn-Phong highlight.
+            float NdotL1 = max(dot(normal, lightDir1), 0.0);
+            float NdotL2 = max(dot(normal, lightDir2), 0.0);
+            vec3 viewDir = normalize(camPos - pos);
+            vec3 halfVec = normalize(lightDir1 + viewDir);
+            float spec = pow(max(dot(normal, halfVec), 0.0), 32.0);
+
+            float diffuse = diffuseIntensity * (NdotL1 * 0.7 + NdotL2 * 0.3);
+            sampleColor.rgb = sampleColor.rgb * (ambientIntensity + diffuse) + vec3(spec * specularIntensity);
+
+            // Edge enhancement: increase opacity at boundaries
+            sampleA *= 1.0 + gradLen * 0.25;
+        } else {
+            // Flat region: ambient-only lighting
+            sampleColor.rgb *= ambientIntensity;
+        }
+
+        // Depth cue: darken samples further along the ray (0 = off).
+        float depthFrac = clamp((t - tNear) / max(tFar - tNear, 1e-4), 0.0, 1.0);
+        sampleColor.rgb *= 1.0 - depthCue * depthFrac;
+
+        sampleA = 1.0 - pow(1.0 - clamp(sampleA, 0.0, 1.0), segment / referenceStep);
+
+        if (sampleA > 0.0001) {
+            float oneMinusAccA = 1.0 - accum.a;
+            accum.rgb += oneMinusAccA * sampleA * sampleColor.rgb;
+            accum.a += oneMinusAccA * sampleA;
+        }
+
+        t += stepLen;
     }
 
     FragColor = accum;
