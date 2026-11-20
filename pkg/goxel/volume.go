@@ -34,8 +34,8 @@ type VolumeRenderer struct {
 	// Which renderer is active
 	useGPU bool
 
-	// Rendered image and canvas
-	img *canvas.Image
+	// The canvas object that shows the rendered image.
+	img *canvas.Raster
 
 	// State
 	mu sync.RWMutex
@@ -64,12 +64,16 @@ type VolumeRenderer struct {
 	// Ensures Destroy is only called once
 	destroyOnce sync.Once
 
-	// interacting is true while a drag or scroll is under way and shortly after:
-	// the render is then made at a cheaper size, and at the viewport's full
-	// device-pixel size once the view is at rest. idle ends it. Both are used on
-	// the UI goroutine only.
+	// interacting is true while a drag or scroll is under way and shortly after.
+	// The render is then made at dragScale times the viewport's device-pixel
+	// size: 1 while frames keep up, less on a machine where they do not (see
+	// frameTook). At rest the render is always the full size. idle ends the
+	// gesture. All are used on the UI goroutine only.
 	interacting bool
 	idle        *time.Timer
+	dragScale   float64
+	slowFrames  int
+	fastFrames  int
 
 	// DragPans, when set and true, makes a plain drag pan instead of orbit
 	// (the compact layouts' Orbit | Pan toggle).
@@ -94,6 +98,7 @@ func NewVolumeRenderer() *VolumeRenderer {
 		scaleZ:     1,
 		viewAspect: 1,
 		maxZoom:    5,
+		dragScale:  1,
 		renderChan: make(chan struct{}, 1), // Buffer size 1 for backpressure
 		Align: AlignParams{
 			FlipX:    true,
@@ -104,9 +109,9 @@ func NewVolumeRenderer() *VolumeRenderer {
 	}
 	vr.ExtendBaseWidget(vr)
 
-	// Try to initialize the GPU renderer. The browser reads every frame back
-	// through readPixels, so it renders at a lower resolution.
-	size := interactiveLongSide()
+	// Try to initialize the GPU renderer. The size is a placeholder: the first
+	// layout sets the viewport's.
+	size := minDragLongSide()
 	gpuRenderer, err := volume.NewGPUVolumeRenderer(size, size)
 	if err != nil {
 		slog.Warn("GPU renderer unavailable, falling back to CPU", slog.Any("error", err))
@@ -130,10 +135,13 @@ func (vr *VolumeRenderer) renderLoop() {
 	for range vr.renderChan {
 		if vr.gpuRenderer != nil {
 			vr.mu.Lock()
+			start := time.Now()
 			vr.gpuRenderer.Render() // Blocking render on background thread
+			took := time.Since(start)
 			vr.mu.Unlock()
 			fyne.Do(func() {
 				vr.Refresh()
+				vr.frameTook(took)
 			})
 		}
 	}
@@ -501,22 +509,14 @@ func (vr *VolumeRenderer) SetBoxScale(y, z float64) {
 
 // CreateRenderer creates a Fyne widget renderer
 func (vr *VolumeRenderer) CreateRenderer() fyne.WidgetRenderer {
-	if vr.useGPU && vr.gpuRenderer != nil {
-		vr.img = canvas.NewImageFromImage(vr.gpuRenderer.GetRendered())
-	} else if vr.cpuRenderer != nil {
-		vr.img = canvas.NewImageFromImage(vr.cpuRenderer.Rendered)
-	}
-
-	vr.img.FillMode = canvas.ImageFillStretch // Manual layout
-	// At rest the render is exactly the viewport's size in device pixels, so
-	// nothing is scaled. While dragging it is smaller and scaled up smoothly:
-	// by the GPU with linear filtering on the desktop. The browser driver has no
-	// ImageScaleFastest ("Invalid canvas.ImageScale value"), so it uses
-	// ImageScaleSmooth there (the driver skips scaling when sizes match).
-	vr.img.ScaleMode = canvas.ImageScaleFastest
-	if fyne.CurrentDevice().IsBrowser() {
-		vr.img.ScaleMode = canvas.ImageScaleSmooth
-	}
+	// A raster hands the driver the rendered frame as it is, whatever its size:
+	// the frame is uploaded once and the GPU stretches it over the widget with
+	// linear filtering. (A canvas.Image of another size than its widget is
+	// resampled in software first, on every frame in the browser, which is what
+	// used to hold the drag resolution down.) At rest the frame is exactly the
+	// widget's size in device pixels, so nothing is scaled at all.
+	vr.img = canvas.NewRaster(func(int, int) image.Image { return vr.frame() })
+	vr.img.ScaleMode = canvas.ImageScaleSmooth
 
 	r := &volumeWidgetRenderer{
 		vr:      vr,
@@ -545,45 +545,18 @@ func (vr *VolumeRenderer) CreateRenderer() fyne.WidgetRenderer {
 }
 
 // Dragged orbits the camera on any one-finger or primary-button drag; Shift,
-// two fingers or the phone Pan toggle pan instead (as in roxel).
+// two fingers or the phone Pan toggle pan instead (as in roxel). Speeds are
+// roxel's, which counts device pixels: a drag turns or pans as far on a
+// high-density screen as it does there.
 func (vr *VolumeRenderer) Dragged(e *fyne.DragEvent) {
 	if vr.useGPU && vr.gpuRenderer != nil {
 		vr.gesture()
+		scale := pixelScale(vr)
+		dx, dy := float64(e.Dragged.DX)*scale, float64(e.Dragged.DY)*scale
 		if vr.wantsPan() {
-			// Pan: translate the look-at center in screen space
-			zoom := vr.gpuRenderer.GetZoom()
-			panScale := 0.002 * zoom // Scale pan speed by zoom distance
-			vr.gpuRenderer.AdjustPan(
-				-float64(e.Dragged.DX)*panScale,
-				float64(e.Dragged.DY)*panScale,
-			)
+			vr.PanPixels(dx, dy)
 		} else {
-			// Rotate: turntable rotation
-			rotX, rotY := vr.gpuRenderer.GetRotation()
-
-			rotX += float64(e.Dragged.DX) * 0.005
-			for rotX < 0 {
-				rotX += 2 * math.Pi
-			}
-			for rotX >= 2*math.Pi {
-				rotX -= 2 * math.Pi
-			}
-
-			rotY -= float64(e.Dragged.DY) * 0.005
-			for rotY < 0 {
-				rotY += 2 * math.Pi
-			}
-			for rotY >= 2*math.Pi {
-				rotY -= 2 * math.Pi
-			}
-
-			vr.gpuRenderer.SetRotation(rotX, rotY)
-		}
-
-		// Non-blocking send to render channel - drops frame if GPU busy
-		select {
-		case vr.renderChan <- struct{}{}:
-		default:
+			vr.Orbit(dx*orbitPerPixel, -dy*orbitPerPixel)
 		}
 	} else if vr.cpuRenderer != nil {
 		vr.cpuRenderer.Dragged(e)
@@ -606,13 +579,20 @@ func (vr *VolumeRenderer) Orbit(dAz, dEl float64) {
 	vr.TriggerRender()
 }
 
-// PanPixels pans the camera as a drag of (dx, dy) screen pixels would.
+// PanPixels pans the camera as a drag of (dx, dy) device pixels does: the
+// orbit pivot moves in the plane of the screen, so what is under the pointer
+// follows it, whatever the viewing angle (roxel's Camera::pan_pixels).
 func (vr *VolumeRenderer) PanPixels(dx, dy float64) {
 	if vr.gpuRenderer == nil {
 		return
 	}
-	panScale := 0.002 * vr.gpuRenderer.GetZoom()
-	vr.gpuRenderer.AdjustPan(-dx*panScale, dy*panScale)
+	_, _, right, down := vr.cameraBasis()
+	step := panPerPixel * vr.gpuRenderer.GetZoom()
+	vr.gpuRenderer.AdjustPan(
+		-(right[0]*dx+down[0]*dy)*step,
+		-(right[1]*dx+down[1]*dy)*step,
+		-(right[2]*dx+down[2]*dy)*step,
+	)
 	vr.TriggerRender()
 }
 
@@ -677,7 +657,7 @@ func (vr *VolumeRenderer) FitView() {
 	d := fitDistance(vr.scaleY, vr.scaleZ, rotX, rotY, vr.viewAspect)
 	vr.maxZoom = math.Max(5, d*2)
 	vr.mu.Unlock()
-	vr.gpuRenderer.SetPan(0, 0)
+	vr.gpuRenderer.SetPan(0, 0, 0)
 	vr.gpuRenderer.SetZoom(d)
 	vr.TriggerRender()
 }
@@ -733,7 +713,9 @@ func (vr *VolumeRenderer) DragEnd() {
 	}
 }
 
-// Scrolled handles mouse scroll for zoom
+// Scrolled zooms: the camera distance is divided by 1.1 for each wheel notch
+// (and multiplied back the other way), as in roxel, so a notch is the same
+// step at any distance and no one event reaches a zoom limit.
 func (vr *VolumeRenderer) Scrolled(e *fyne.ScrollEvent) {
 	if vr.useGPU && vr.gpuRenderer != nil {
 		vr.gesture()
@@ -743,20 +725,9 @@ func (vr *VolumeRenderer) Scrolled(e *fyne.ScrollEvent) {
 			vr.ZoomBy(1 / r)
 			return
 		}
-		zoom := vr.gpuRenderer.GetZoom()
-		zoom -= float64(e.Scrolled.DY) * 0.05
-		zoom = math.Max(minZoom, math.Min(vr.maxZoom, zoom))
-		vr.gpuRenderer.SetZoom(zoom)
-
-		// Non-blocking send to render channel - drops frame if GPU busy
-		select {
-		case vr.renderChan <- struct{}{}:
-			// Render request queued
-		default:
-			// Channel full - GPU busy, skip this frame
-		}
+		vr.ZoomBy(1 / scrollZoom(vr, e))
 	} else if vr.cpuRenderer != nil {
-		vr.cpuRenderer.Scrolled(e)
+		vr.cpuRenderer.ZoomBy(1 / scrollZoom(vr, e))
 	}
 }
 
@@ -840,7 +811,7 @@ func (vr *VolumeRenderer) Destroy() {
 // volumeWidgetRenderer implements fyne.WidgetRenderer
 type volumeWidgetRenderer struct {
 	vr      *VolumeRenderer
-	img     *canvas.Image
+	img     *canvas.Raster
 	edges   [4]*canvas.Line
 	readout *canvas.Text
 	swatch  *canvas.Line // line sample before the readout, tying it to the outline
@@ -858,10 +829,10 @@ func (vr *VolumeRenderer) cameraBasis() (cam, f, r, u [3]float64) {
 	g := vr.gpuRenderer
 	rotX, rotY := g.GetRotation()
 	zoom := g.GetZoom()
-	panX, panY := g.GetPan()
+	panX, panY, panZ := g.GetPan()
 	sinAz, cosAz := math.Sin(rotX), math.Cos(rotX)
 	sinEl, cosEl := math.Sin(rotY), math.Cos(rotY)
-	c := [3]float64{0.5 + panX, vr.scaleY*0.5 + panY, vr.scaleZ * 0.5}
+	c := [3]float64{0.5 + panX, vr.scaleY*0.5 + panY, vr.scaleZ*0.5 + panZ}
 	cam = [3]float64{sinAz*cosEl*zoom + c[0], sinEl*zoom + c[1], cosAz*cosEl*zoom + c[2]}
 	f = [3]float64{c[0] - cam[0], c[1] - cam[1], c[2] - cam[2]}
 	fl := math.Sqrt(f[0]*f[0] + f[1]*f[1] + f[2]*f[2])
@@ -966,10 +937,24 @@ func (r *volumeWidgetRenderer) layoutGizmo(size fyne.Size) {
 	}
 }
 
-// interactiveLongSide is the longest edge of the render while the view is
-// being dragged: cheap enough to follow the pointer. The browser reads every
+// frame is the image the view shows: the renderer's last frame.
+func (vr *VolumeRenderer) frame() image.Image {
+	var img *image.RGBA
+	if vr.IsGPU() {
+		img, _ = vr.gpuRenderer.GetRendered().(*image.RGBA)
+	} else if vr.cpuRenderer != nil {
+		img = vr.cpuRenderer.Rendered
+	}
+	if img == nil || len(img.Pix) == 0 {
+		return image.NewRGBA(image.Rect(0, 0, 1, 1))
+	}
+	return img
+}
+
+// minDragLongSide is the longest edge the render is never taken below while
+// the view is being dragged, however slow the frames. The browser reads every
 // frame back through readPixels, so it is lower there.
-func interactiveLongSide() int {
+func minDragLongSide() int {
 	if fyne.CurrentDevice().IsBrowser() {
 		return 640
 	}
@@ -979,23 +964,80 @@ func interactiveLongSide() int {
 // idleDelay is how long after the last gesture the view counts as at rest.
 const idleDelay = 200 * time.Millisecond
 
-// renderTarget is the GL target for a widget of the given size: at rest, its
-// size in device pixels (so the image is shown one to one); while interacting,
-// the same aspect with the long side at most interactiveLongSide. The
-// rounding is Fyne's, so the driver sees an image of exactly the size it draws.
+// A drag is rendered at the viewport's full device-pixel size, as roxel's is,
+// for as long as the machine keeps up: the ray march costs the same there, so
+// goxel follows the pointer as roxel does and stays as sharp. Two frames in a
+// row slower than slowFrame (20 a second) take the size down a step, or two
+// steps when they are over twice that; a run of frames faster than fastFrame
+// brings it back. One step is a fifth off each edge (about a third fewer
+// pixels), so a size that was fast enough is still within slowFrame after the
+// step back up, and the size settles instead of hunting.
+const (
+	slowFrame     = 50 * time.Millisecond
+	fastFrame     = 20 * time.Millisecond
+	dragScaleStep = 0.8
+	slowFrameRun  = 2
+	fastFrameRun  = 6
+)
+
+// frameTook notes how long the frame just shown took to render and, during a
+// gesture, steps the drag size down or up to keep the view following the
+// pointer. A call that rendered nothing (no change was pending) is ignored.
+func (vr *VolumeRenderer) frameTook(took time.Duration) {
+	if !vr.interacting || took < time.Millisecond {
+		return
+	}
+	switch {
+	case took > slowFrame:
+		vr.slowFrames, vr.fastFrames = vr.slowFrames+1, 0
+	case took < fastFrame:
+		vr.slowFrames, vr.fastFrames = 0, vr.fastFrames+1
+	default:
+		vr.slowFrames, vr.fastFrames = 0, 0
+	}
+	switch {
+	case vr.slowFrames >= slowFrameRun && vr.dragScale > vr.minDragScale():
+		step := dragScaleStep
+		if took > 2*slowFrame {
+			step *= dragScaleStep
+		}
+		vr.dragScale = math.Max(vr.dragScale*step, vr.minDragScale())
+	case vr.fastFrames >= fastFrameRun && vr.dragScale < 1:
+		vr.dragScale = math.Min(vr.dragScale/dragScaleStep, 1)
+	default:
+		return
+	}
+	vr.slowFrames, vr.fastFrames = 0, 0
+	vr.applyRenderSize()
+}
+
+// devicePixels is the widget's size in device pixels, rounded as Fyne rounds
+// it, so that at rest the driver is given a frame of exactly the size it draws.
+func (vr *VolumeRenderer) devicePixels(size fyne.Size) (int, int) {
+	c := fyne.CurrentApp().Driver().CanvasForObject(vr)
+	if c == nil {
+		return int(math.Round(float64(size.Width))), int(math.Round(float64(size.Height)))
+	}
+	return c.PixelCoordinateForPosition(fyne.NewPos(size.Width, size.Height))
+}
+
+// minDragScale is the smallest dragScale for the widget as it is: the one that
+// leaves the long side at minDragLongSide.
+func (vr *VolumeRenderer) minDragScale() float64 {
+	w, h := vr.devicePixels(vr.Size())
+	return math.Min(1, float64(minDragLongSide())/float64(max(w, h, 1)))
+}
+
+// renderTarget is the GL target for a widget of the given size: its size in
+// device pixels (so the image is shown one to one), times dragScale while
+// interacting.
 func (vr *VolumeRenderer) renderTarget(size fyne.Size) (int, int) {
-	long := interactiveLongSide()
 	if size.Width <= 0 || size.Height <= 0 {
+		long := minDragLongSide()
 		return long, long
 	}
-	scale := float32(1)
-	if c := fyne.CurrentApp().Driver().CanvasForObject(vr); c != nil {
-		scale = c.Scale()
-	}
-	w := int(math.Round(float64(size.Width * scale)))
-	h := int(math.Round(float64(size.Height * scale)))
-	if vr.interacting && max(w, h) > long {
-		f := float64(long) / float64(max(w, h))
+	w, h := vr.devicePixels(size)
+	if f := math.Max(vr.dragScale, vr.minDragScale()); vr.interacting && f < 1 {
 		w, h = int(math.Round(float64(w)*f)), int(math.Round(float64(h)*f))
 	}
 	// Keep the aspect when a very large view hits the target's size limit.
@@ -1017,11 +1059,12 @@ func (vr *VolumeRenderer) applyRenderSize() {
 	}
 }
 
-// gesture notes a drag or scroll step: the render drops to its cheaper size
-// until the gesture has been over for a moment, then returns to full size.
+// gesture notes a drag or scroll step: until the gesture has been over for a
+// moment the render is made at the drag size, then at full size again.
 func (vr *VolumeRenderer) gesture() {
 	if !vr.interacting {
 		vr.interacting = true
+		vr.slowFrames, vr.fastFrames = 0, 0
 		vr.applyRenderSize()
 	}
 	if vr.idle != nil {
@@ -1070,18 +1113,8 @@ func (r *volumeWidgetRenderer) MinSize() fyne.Size {
 }
 
 func (r *volumeWidgetRenderer) Refresh() {
-	// r.vr.Render() // Disabled: Render should be triggered by events, not by repaint
-	if r.vr.useGPU && r.vr.gpuRenderer != nil {
-		r.img.Image = r.vr.gpuRenderer.GetRendered() // Get base image
-		// Draw finding overlays
-		if rgba, ok := r.img.Image.(*image.RGBA); ok {
-			// Deprecated: GPU renderer handles finding drawing internally now
-			// r.vr.drawFindings(rgba)
-			_ = rgba // keep variable usage
-		}
-	} else if r.vr.cpuRenderer != nil {
-		r.img.Image = r.vr.cpuRenderer.Rendered
-	}
+	// Rendering is triggered by events, not by a repaint; the raster reads the
+	// renderer's current frame when it is refreshed below.
 	r.layoutOverlay(r.vr.Size())
 	for _, e := range r.edges {
 		canvas.Refresh(e)

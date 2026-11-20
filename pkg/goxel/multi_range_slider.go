@@ -318,8 +318,10 @@ func (r *multiRangeSliderRenderer) Layout(size fyne.Size) {
 	for i, h := range r.handles {
 		x := s.xAt(float64(s.Bands[i].Threshold), size)
 		cy := (top + bottom) / 2
-		h.Move(fyne.NewPos(x-rad, cy-rad))
-		h.Resize(fyne.NewSize(2*rad, 2*rad))
+		// The outline goes outside the handle's radius, as egui draws it.
+		hr := rad + h.StrokeWidth
+		h.Move(fyne.NewPos(x-hr, cy-hr))
+		h.Resize(fyne.NewSize(2*hr, 2*hr))
 		h.StrokeColor = bandHandleStroke
 		if s.draggedHandle == i {
 			h.StrokeColor = colAccent

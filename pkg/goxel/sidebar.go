@@ -27,12 +27,19 @@ func (v *Viewer) studySection() fyne.CanvasObject {
 		label := text("Open now", 12, colAccent)
 		// The whole name, wrapped: nothing is cut off, on any screen.
 		name := newWrapped(v.st.loadedName, bodySize(), colHeading)
-		edge := rrect(colAccent, color.Transparent, 3, 0)
+		// The accent edge is 4 wide with only its left corners rounded: roxel
+		// asks for the card's 6, and a bar this narrow takes 2 of it.
+		edge := filled(colAccent)
+		edge.TopLeftCornerRadius, edge.BottomLeftCornerRadius = 2, 2
 		edge.SetMinSize(fyne.NewSize(4, 1))
 		body := container.New(insetsLayout{left: 14, right: 10, top: 8, bottom: 9},
 			vstack(2, minHeight(eguiRowHeight(12), leftCentre(label)), name))
-		items = append(items, container.NewStack(rrect(colOpenCard, color.Transparent, 6, 0),
-			border(nil, nil, edge, nil, nil), body))
+		path := v.st.loadedPath
+		if path == "" {
+			path = v.st.loadedName
+		}
+		items = append(items, newTipArea(container.NewStack(rrect(colOpenCard, color.Transparent, 6, 0),
+			border(nil, nil, edge, nil, nil), body), path))
 	} else {
 		items = append(items, note("No study open"))
 	}

@@ -51,6 +51,9 @@ func NewInteractive2DView(img *canvas.Image, v *Viewer) *Interactive2DView {
 		viewer:  v,
 		zoom:    1,
 	}
+	// The well's top corners are rounded, as roxel's are (the footer under it
+	// carries the bottom ones).
+	iv.well.TopLeftCornerRadius, iv.well.TopRightCornerRadius = 6, 6
 	iv.overlay.Hide()
 	iv.overlay.StrokeWidth = 2
 	iv.overlay.StrokeColor = color.RGBA{255, 0, 0, 255}

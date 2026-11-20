@@ -1080,6 +1080,22 @@ func (vr *CPUVolumeRenderer) Scrolled(e *fyne.ScrollEvent) {
 	}()
 }
 
+// ZoomBy multiplies the camera distance by f (below 1 zooms in), within the
+// same limits as Scrolled, and renders.
+func (vr *CPUVolumeRenderer) ZoomBy(f float64) {
+	vr.Mu.Lock()
+	vr.Zoom = math.Max(0.5, math.Min(5, vr.Zoom*f))
+	vr.NeedsRender = true
+	vr.Mu.Unlock()
+
+	go func() {
+		vr.Render()
+		fyne.Do(func() {
+			vr.Refresh()
+		})
+	}()
+}
+
 // MouseIn handles mouse enter
 func (vr *CPUVolumeRenderer) MouseIn(*desktop.MouseEvent) {}
 

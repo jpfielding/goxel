@@ -154,7 +154,7 @@ func (v *Viewer) slicePlanePage() fyne.CanvasObject {
 func (v *Viewer) shelf() fyne.CanvasObject {
 	cols := []fyne.CanvasObject{v.windowingGroup3D(), v.paletteGroup()}
 	if !v.narrowShelf {
-		cols = append(cols, vstack(6, sectionTitle("Lighting", ""), v.lightingRows()))
+		cols = append(cols, vstack(6, sectionTitle("Lighting", ""), v.lightingRows(false)))
 	}
 	// On very wide windows the rows keep a usable length.
 	body := container.New(&cappedCentre{max: shelfMaxWidth}, columns(24, cols...))
@@ -234,7 +234,7 @@ func (v *Viewer) paletteGroup() fyne.CanvasObject {
 	if v.narrowShelf {
 		btn := newButton("Lighting", nil)
 		btn.onTap = func() {
-			v.showMenuBelow(btn, vstack(6, sectionTitle("Lighting", ""), v.lightingRows()), 300)
+			v.showMenuBelow(btn, vstack(menuRowGap, sectionTitle("Lighting", ""), v.lightingRows(true)), 300)
 		}
 		menus = append(menus, btn)
 	}
@@ -413,9 +413,22 @@ func (v *Viewer) bandsEditor() fyne.CanvasObject {
 	}
 	items := []fyne.CanvasObject{sectionTitle("Band thresholds", "stored values"), strip, sectionTitle("Band opacity", "")}
 	for i := range bands {
-		items = append(items, v.bandOpacityRow(i, bands[i].Name, strip.GetBandAlpha(i)).obj)
+		items = append(items, inMenu(v.bandOpacityRow(i, bands[i].Name, strip.GetBandAlpha(i))).obj)
 	}
-	return vstack(6, items...)
+	return vstack(menuRowGap, items...)
+}
+
+// menuRowGap is the space between the rows of a menu panel: egui's own 8,
+// where the shelf's groups set 6.
+const menuRowGap = 8
+
+// inMenu gives a control row the look egui's menu style gives roxel's: the
+// value box has no frame until it is hovered or edited.
+func inMenu(r *sliderRow) *sliderRow {
+	if r.box != nil {
+		r.box.plain = true
+	}
+	return r
 }
 
 // bandOpacityRow is one band's opacity multiplier, 0 to 2 times.
@@ -426,14 +439,23 @@ func (v *Viewer) bandOpacityRow(i int, label string, alpha float64) *sliderRow {
 	}, nil)
 }
 
-// lightingRows: depth cue, ambient, diffuse and specular.
-func (v *Viewer) lightingRows() fyne.CanvasObject {
+// lightingRows: depth cue, ambient, diffuse and specular; menu is set for the
+// rows of the Lighting menu panel.
+func (v *Viewer) lightingRows(menu bool) fyne.CanvasObject {
+	gap := float32(6)
 	row := func(label string, p *float64) fyne.CanvasObject {
-		return newSliderRow(fraction(label, 0, 1), *p, func(x float64) {
+		r := newSliderRow(fraction(label, 0, 1), *p, func(x float64) {
 			*p = x
 			v.applyLighting()
-		}, nil).obj
+		}, nil)
+		if menu {
+			r = inMenu(r)
+		}
+		return r.obj
 	}
-	return vstack(6, row("Depth cue", &v.st.depthCue), row("Ambient", &v.st.ambient),
+	if menu {
+		gap = menuRowGap
+	}
+	return vstack(gap, row("Depth cue", &v.st.depthCue), row("Ambient", &v.st.ambient),
 		row("Diffuse", &v.st.diffuse), row("Specular", &v.st.specular))
 }

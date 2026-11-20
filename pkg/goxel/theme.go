@@ -25,9 +25,11 @@ var (
 	colControl  = color.NRGBA{38, 52, 66, 255}
 	colHover    = color.NRGBA{52, 70, 86, 255}
 	colOpenCard = color.NRGBA{27, 47, 52, 255}
-	// colDisabled is text of a disabled control: well apart from colText, as
-	// egui fades it.
-	colDisabled = color.NRGBA{98, 110, 122, 255}
+	// colDisabled is text of a disabled control: colText at half opacity, as
+	// egui fades everything disabled, so it reads the same on any background.
+	colDisabled = color.NRGBA{222, 231, 239, 128}
+	// colSpinner is the loading spinner: egui's strong text colour.
+	colSpinner = color.NRGBA{255, 255, 255, 255}
 )
 
 // goxelTheme is the one Fyne theme: dark only, with larger type and touch

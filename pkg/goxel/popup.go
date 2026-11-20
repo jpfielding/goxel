@@ -6,15 +6,16 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
-// menuPanelRadius and menuPanelMargin are the menu panel's corner radius and the
-// space between its outline and its content: egui's menu frame.
+// menuPanelRadius and menuPanelMargin are the corner radius of a menu panel or
+// tooltip and the space from its edge to its content: egui's pop-up frame,
+// whose 12 px margin starts inside its 1 px outline.
 const (
 	menuPanelRadius = 6
-	menuPanelMargin = 12
+	menuPanelMargin = 12 + 1
 )
 
 // menuPopup is a menu panel over the window: one rounded, outlined panel on the
-// panel colour, with nothing around it (Fyne's own pop-up adds a square shadowed
+// panel colour, casting egui's pop-up shadow (Fyne's own pop-up adds a square
 // frame and padding of its own). A tap anywhere else, or Esc, closes it.
 type menuPopup struct {
 	widget.BaseWidget
@@ -40,6 +41,7 @@ func (m *menuPopup) show(pos fyne.Position, contentWidth float32) {
 	m.cv.Overlays().Add(m)
 	m.Resize(m.cv.Size())
 	m.Refresh()
+	m.content.Refresh() // controls draw their state (selected, flat) on a refresh
 }
 
 // dismiss closes the panel; it is safe to call more than once.
@@ -71,16 +73,19 @@ func (m *menuPopup) TappedSecondary(e *fyne.PointEvent) {
 }
 
 func (m *menuPopup) CreateRenderer() fyne.WidgetRenderer {
-	return &menuPopupRenderer{m: m, panel: rrect(colPanel, colOutline, menuPanelRadius, 1)}
+	return &menuPopupRenderer{m: m, panel: rrect(colPanel, colOutline, menuPanelRadius, 1),
+		shadow: newPopupShadow(menuPanelRadius)}
 }
 
 type menuPopupRenderer struct {
-	m     *menuPopup
-	panel *canvas.Rectangle
+	m      *menuPopup
+	shadow *canvas.Raster
+	panel  *canvas.Rectangle
 }
 
 func (r *menuPopupRenderer) Layout(fyne.Size) {
 	m := r.m
+	placeShadow(r.shadow, m.pos, m.size)
 	r.panel.Move(m.pos)
 	r.panel.Resize(m.size)
 	m.content.Move(m.pos.Add(fyne.NewPos(menuPanelMargin, menuPanelMargin)))
@@ -95,19 +100,25 @@ func (r *menuPopupRenderer) Refresh() {
 }
 
 func (r *menuPopupRenderer) Objects() []fyne.CanvasObject {
-	return []fyne.CanvasObject{r.panel, r.m.content}
+	return []fyne.CanvasObject{r.shadow, r.panel, r.m.content}
 }
 
 func (r *menuPopupRenderer) Destroy() {}
 
-// showMenuBelow shows content in a menu panel under anchor (above it when there
-// is no room), contentWidth wide, and keeps anchor in its "open" state while the
-// panel is up.
-func (v *Viewer) showMenuBelow(anchor *button, content fyne.CanvasObject, contentWidth float32) {
+// showMenuBelow shows content in a menu panel directly under anchor, as egui
+// opens a menu (above it when there is no room), contentWidth wide. An anchor
+// with an "open" state (a combo box; egui's menu buttons have none) is kept in
+// it while the panel is up.
+func (v *Viewer) showMenuBelow(anchor fyne.CanvasObject, content fyne.CanvasObject, contentWidth float32) {
 	v.closeMenu()
-	anchor.SetOpen(true)
+	opener, _ := anchor.(interface{ SetOpen(bool) })
+	if opener != nil {
+		opener.SetOpen(true)
+	}
 	m := newMenuPopup(v.win.Canvas(), content, func() {
-		anchor.SetOpen(false)
+		if opener != nil {
+			opener.SetOpen(false)
+		}
 		v.menu = nil
 	})
 	v.menu = m
@@ -116,9 +127,9 @@ func (v *Viewer) showMenuBelow(anchor *button, content fyne.CanvasObject, conten
 	pos := fyne.CurrentApp().Driver().AbsolutePositionForObject(anchor)
 	cs := v.win.Canvas().Size()
 	x := min(pos.X, cs.Width-outer.Width-8)
-	y := pos.Y + anchor.Size().Height + 4
+	y := pos.Y + anchor.Size().Height
 	if y+outer.Height > cs.Height {
-		y = max(pos.Y-outer.Height-4, 8)
+		y = max(pos.Y-outer.Height, 8)
 	}
 	m.show(fyne.NewPos(max(x, 8), y), contentWidth)
 }

@@ -64,8 +64,9 @@ func mix(a, b color.NRGBA, t float32) color.NRGBA {
 	return color.NRGBA{l(a.R, b.R), l(a.G, b.G), l(a.B, b.B), 255}
 }
 
-// fade dims a colour towards the panel, for a disabled control.
-func fade(c color.NRGBA) color.NRGBA { return mix(c, colPanel, 0.55) }
+// fade dims a colour halfway to the panel, for a disabled control: egui draws
+// whatever is disabled at half opacity.
+func fade(c color.NRGBA) color.NRGBA { return mix(c, colPanel, 0.5) }
 
 func textWidth(s string, size float32) float32 {
 	return measure(s, size).Width
@@ -113,7 +114,7 @@ type button struct {
 	primary  bool // the one dominant action: filled with the accent
 	selected bool // a toggle that is on: SELECTED fill, accent outline
 	flat     bool // a selectable row: no frame until hovered, filled only when selected
-	open     bool // its menu is up: SELECTED fill, 1 px accent outline (egui's "open")
+	menu     bool // an item of a menu: its label at the left, never an outline
 	minW     float32
 	minH     float32
 	size     float32 // text size; 0 means the button size
@@ -193,14 +194,6 @@ func (b *button) Enable()        { b.disabled = false; b.Refresh() }
 func (b *button) Disable()       { b.disabled = true; b.Refresh() }
 func (b *button) Disabled() bool { return b.disabled }
 
-// SetOpen marks the button whose menu is up.
-func (b *button) SetOpen(on bool) {
-	if b.open != on {
-		b.open = on
-		b.Refresh()
-	}
-}
-
 // SetSelected marks a toggle as on.
 func (b *button) SetSelected(on bool) {
 	if b.selected != on {
@@ -252,6 +245,9 @@ func (r *buttonRenderer) padX() float32 {
 func (r *buttonRenderer) MinSize() fyne.Size {
 	b := r.b
 	w := textWidth(b.label, b.textPx()) + 2*r.padX()
+	if b.menu {
+		w = textWidth(b.label, b.textPx()) + 2*menuItemPad
+	}
 	if b.icon == iconEnlarge || b.icon == iconReduce {
 		w += iconSide() + iconGap
 	}
@@ -275,6 +271,9 @@ func (r *buttonRenderer) Layout(size fyne.Size) {
 		r.text.Move(fyne.NewPos(left+side+iconGap, cy-ts.Height/2))
 	default:
 		r.text.Move(fyne.NewPos(cx-ts.Width/2, cy-ts.Height/2))
+		if b.menu {
+			r.text.Move(fyne.NewPos(menuItemPad, cy-ts.Height/2))
+		}
 		r.layoutChevron(fyne.NewPos(cx, cy))
 	}
 	r.text.Resize(ts)
@@ -335,7 +334,7 @@ func (r *buttonRenderer) Refresh() {
 		if b.hovered {
 			fill = mix(colAccent, color.NRGBA{255, 255, 255, 255}, 0.15)
 		}
-	case b.pressed || b.selected || b.open:
+	case b.pressed || b.selected:
 		fill, stroke = colSelected, colAccent
 	case b.hovered:
 		fill, stroke = colHover, colThumb
@@ -346,6 +345,10 @@ func (r *buttonRenderer) Refresh() {
 	r.bg.StrokeWidth = 1
 	if b.selected && !b.disabled && !b.primary && !b.pressed {
 		r.bg.StrokeWidth = 2 // a selected item's outline is 2 px, as in roxel
+	}
+	if b.menu {
+		// egui's menu style: fills only.
+		r.bg.StrokeColor, r.bg.StrokeWidth = color.Transparent, 0
 	}
 	r.text.Color = fg
 	showWhen(r.ring, b.focused && !b.disabled)
@@ -767,6 +770,9 @@ func newTrack(lo, hi, value float64, decimals int) *track {
 	return t
 }
 
+// knobStroke is the width of the dark outline around a slider thumb.
+const knobStroke = 1.5
+
 func (t *track) radius() float32 {
 	if uiTouch {
 		return 12
@@ -928,8 +934,11 @@ func (r *trackRenderer) Layout(size fyne.Size) {
 		grow = 1
 	}
 	rr := rad + grow
-	r.knob.Move(fyne.NewPos(x-rr, y-rr))
-	r.knob.Resize(fyne.NewSize(2*rr, 2*rr))
+	// egui draws the thumb's dark outline outside its radius; Fyne strokes
+	// inside the circle it is given, so the circle is that much larger.
+	kr := rr + knobStroke
+	r.knob.Move(fyne.NewPos(x-kr, y-kr))
+	r.knob.Resize(fyne.NewSize(2*kr, 2*kr))
 	// The focus ring circles the thumb, 3 px out (its outer edge is 4 px out).
 	rg := rr + 2 + ringWidth
 	r.ring.Move(fyne.NewPos(x-rg, y-rg))
@@ -942,7 +951,7 @@ func (r *trackRenderer) Refresh() {
 		rail, fill, knob = fade(colRail), fade(colAccent), fade(colThumb)
 	}
 	r.rail.FillColor, r.fill.FillColor, r.knob.FillColor = rail, fill, knob
-	r.knob.StrokeColor, r.knob.StrokeWidth = colBG, 1.5
+	r.knob.StrokeColor, r.knob.StrokeWidth = colBG, knobStroke
 	r.ring.StrokeColor, r.ring.StrokeWidth = colAccent, ringWidth
 	showWhen(r.ring, r.t.focused && !r.t.disabled)
 	r.Layout(r.t.Size())
@@ -967,6 +976,10 @@ type valueBox struct {
 	apply    func(v float64, committed bool)
 	value    func() float64
 	disabled bool
+
+	// plain is a box in a menu panel: no frame until it is hovered or edited,
+	// as egui's menu style draws roxel's.
+	plain bool
 
 	editing bool
 	fresh   bool // the next typed character replaces the text
@@ -1119,6 +1132,12 @@ func (r *valueBoxRenderer) Refresh() {
 		fill, stroke = colBG, colAccent
 	case b.hovered:
 		fill, stroke = colHover, colThumb
+	}
+	if b.plain && !b.editing {
+		stroke = color.NRGBA{}
+		if !b.hovered || b.disabled {
+			fill = color.NRGBA{}
+		}
 	}
 	r.bg.FillColor, r.bg.StrokeColor = fill, stroke
 	r.text.Color = fg

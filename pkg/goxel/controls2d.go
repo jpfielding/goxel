@@ -239,14 +239,15 @@ func (v *Viewer) volumePicker() fyne.CanvasObject {
 	if len(keys) < 2 {
 		return nil
 	}
-	sel := widget.NewSelect(keys, func(s string) {
-		if s != v.currentVolumeKey {
-			v.set2DSource(s, false)
-			v.rebuild() // the windowing rows follow the source
-		}
+	sel := newCombo(keys, v.currentVolumeKey, func(s string) {
+		v.set2DSource(s, false)
+		v.rebuild() // the windowing rows follow the source
 	})
-	sel.Selected = v.currentVolumeKey
-	return flexRow(8, 1, fixedWidth(64, rowLabel("Volume")), sel)
+	sel.showMenu, sel.closeMenu = v.showMenuBelow, v.closeMenu
+	if uiTouch {
+		return touchRow("Volume", comboCell(sel))
+	}
+	return flexRow(8, 1, fixedWidth(64, rowLabel("Volume")), comboCell(sel))
 }
 
 func (v *Viewer) compositeToggle() *checkbox {

@@ -113,7 +113,7 @@ type GPUVolumeRenderer struct {
 	clipPlane  [4]float32
 	enableClip bool
 
-	panX, panY float64
+	panX, panY, panZ float64 // the orbit pivot's offset from the box centre
 
 	renderWidth, renderHeight int
 	wantWidth, wantHeight     int
@@ -571,26 +571,27 @@ func (gr *GPUVolumeRenderer) SetScaleZ(scale float64) {
 	gr.mu.Unlock()
 }
 
-// SetPan sets the screen-space pan offset.
-func (gr *GPUVolumeRenderer) SetPan(px, py float64) {
+// SetPan sets the orbit pivot's offset from the box centre, in box space.
+func (gr *GPUVolumeRenderer) SetPan(px, py, pz float64) {
 	gr.mu.Lock()
-	gr.panX, gr.panY = px, py
+	gr.panX, gr.panY, gr.panZ = px, py, pz
 	gr.needsRender = true
 	gr.mu.Unlock()
 }
 
-// GetPan returns the pan offset.
-func (gr *GPUVolumeRenderer) GetPan() (float64, float64) {
+// GetPan returns the orbit pivot's offset from the box centre.
+func (gr *GPUVolumeRenderer) GetPan() (x, y, z float64) {
 	gr.mu.RLock()
 	defer gr.mu.RUnlock()
-	return gr.panX, gr.panY
+	return gr.panX, gr.panY, gr.panZ
 }
 
-// AdjustPan adds to the pan offset.
-func (gr *GPUVolumeRenderer) AdjustPan(dx, dy float64) {
+// AdjustPan moves the orbit pivot by a box-space vector.
+func (gr *GPUVolumeRenderer) AdjustPan(dx, dy, dz float64) {
 	gr.mu.Lock()
 	gr.panX += dx
 	gr.panY += dy
+	gr.panZ += dz
 	gr.needsRender = true
 	gr.mu.Unlock()
 }
@@ -642,7 +643,7 @@ func (gr *GPUVolumeRenderer) ClearVolumes() {
 		}
 	}
 	gr.volumes = nil
-	gr.panX, gr.panY = 0, 0
+	gr.panX, gr.panY, gr.panZ = 0, 0, 0
 	gr.needsRender = true
 }
 
@@ -793,7 +794,7 @@ func (gr *GPUVolumeRenderer) Render() (result *image.RGBA) {
 		gr.renderWidth, gr.renderHeight = gr.wantWidth, gr.wantHeight
 		gr.rendered = image.NewRGBA(image.Rect(0, 0, gr.renderWidth, gr.renderHeight))
 	}
-	panX, panY := float32(gr.panX), float32(gr.panY)
+	panX, panY, panZ := float32(gr.panX), float32(gr.panY), float32(gr.panZ)
 	alpha := float32(gr.alphaScale)
 	density := float32(gr.densityThreshold)
 	amb, dif, spec := float32(gr.ambientIntensity), float32(gr.diffuseIntensity), float32(gr.specularIntensity)
@@ -826,7 +827,7 @@ func (gr *GPUVolumeRenderer) Render() (result *image.RGBA) {
 	// Orbit camera; identical math to the desktop renderer.
 	sinAz, cosAz := float32(math.Sin(rotX)), float32(math.Cos(rotX))
 	sinEl, cosEl := float32(math.Sin(rotY)), float32(math.Cos(rotY))
-	cx, cy, cz := float32(0.5)+panX, scaleY*0.5+panY, scaleZ*0.5
+	cx, cy, cz := float32(0.5)+panX, scaleY*0.5+panY, scaleZ*0.5+panZ
 	camX := sinAz*cosEl*float32(zoom) + cx
 	camY := sinEl*float32(zoom) + cy
 	camZ := cosAz*cosEl*float32(zoom) + cz

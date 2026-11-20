@@ -2,12 +2,15 @@ package goxel
 
 import (
 	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/driver/desktop"
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/widget"
 )
 
-// appBar: mark, name, and the open study's file name (middle-elided) on the right.
+// appBar: mark, name, and the open study's file name on the right, cut in the
+// middle to the room there is; its full path shows on hover.
 func (v *Viewer) appBar() fyne.CanvasObject {
 	compact := v.st.layout.compact()
 	markSize, nameSize := float32(24), float32(21)
@@ -17,11 +20,7 @@ func (v *Viewer) appBar() fyne.CanvasObject {
 	left := hrow(8, markImage(markSize), text("goxel", nameSize, colHeading))
 	var right fyne.CanvasObject
 	if v.st.loadedName != "" && v.loaded() {
-		maxRunes := 64
-		if compact {
-			maxRunes = 28
-		}
-		right = rightCentre(text(elideMiddle(v.st.loadedName, maxRunes), 13, colMuted))
+		right = newFileLabel(v.st.loadedName, v.st.loadedPath)
 	}
 	vpad := float32(8)
 	if compact {
@@ -30,6 +29,86 @@ func (v *Viewer) appBar() fyne.CanvasObject {
 	bar := panel(colPanel, 0, inset(16, vpad, minHeight(28, border(nil, nil, left, nil, shrinkable(orSpacer(right))))))
 	return edged(bar, edgeBottom)
 }
+
+// fileLabel is the open study's name at the right of the app bar: muted, cut
+// in the middle to fit the room it is given (as roxel cuts it: both ends of a
+// name tell two studies apart), with the full path as its tooltip.
+type fileLabel struct {
+	widget.BaseWidget
+	name, path string
+	at         fyne.Position // where the text is drawn, for the pointer
+	extent     fyne.Size
+	over       bool
+}
+
+// The file name's type size, the gap roxel leaves before it and the limits of
+// the room it may take.
+const (
+	fileLabelSize    = 13
+	fileLabelGap     = 8
+	fileLabelMargin  = 16
+	fileLabelMinRoom = 40
+	fileLabelMaxRoom = 520
+)
+
+func newFileLabel(name, path string) *fileLabel {
+	if path == "" {
+		path = name
+	}
+	l := &fileLabel{name: name, path: path}
+	l.ExtendBaseWidget(l)
+	return l
+}
+
+func (l *fileLabel) MouseIn(e *desktop.MouseEvent) { l.MouseMoved(e) }
+func (l *fileLabel) MouseOut()                     { l.setOver(false) }
+
+// MouseMoved: the tip belongs to the name, not to the empty bar beside it.
+func (l *fileLabel) MouseMoved(e *desktop.MouseEvent) {
+	l.setOver(e.Position.X >= l.at.X && e.Position.X <= l.at.X+l.extent.Width)
+}
+
+func (l *fileLabel) setOver(over bool) {
+	if over == l.over {
+		return
+	}
+	l.over = over
+	if over {
+		tooltips.hoverRect(l, l.at, l.extent, l.path)
+	} else {
+		tooltips.hide(l)
+	}
+}
+
+func (l *fileLabel) CreateRenderer() fyne.WidgetRenderer {
+	return &fileLabelRenderer{l: l, text: text("", fileLabelSize, colMuted)}
+}
+
+type fileLabelRenderer struct {
+	l    *fileLabel
+	text *canvas.Text
+}
+
+func (r *fileLabelRenderer) MinSize() fyne.Size {
+	return fyne.NewSize(1, textHeight(fileLabelSize))
+}
+
+func (r *fileLabelRenderer) Layout(size fyne.Size) {
+	room := min(max(size.Width-fileLabelGap-fileLabelMargin, fileLabelMinRoom), fileLabelMaxRoom)
+	r.text.Text = elideToWidth(r.l.name, fileLabelSize, room)
+	ts := measure(r.text.Text, fileLabelSize)
+	r.l.at, r.l.extent = fyne.NewPos(size.Width-ts.Width, (size.Height-ts.Height)/2), ts
+	r.text.Move(r.l.at)
+	r.text.Resize(ts)
+}
+
+func (r *fileLabelRenderer) Refresh() {
+	r.Layout(r.l.Size())
+	canvas.Refresh(r.text)
+}
+
+func (r *fileLabelRenderer) Objects() []fyne.CanvasObject { return []fyne.CanvasObject{r.text} }
+func (r *fileLabelRenderer) Destroy()                     {}
 
 // orSpacer returns o, or an empty object when o is nil.
 func orSpacer(o fyne.CanvasObject) fyne.CanvasObject {
@@ -186,13 +265,19 @@ func (v *Viewer) openButtons(primary bool) fyne.CanvasObject {
 	return vstack(8, open, second)
 }
 
-// loadStatus: a spinner while loading, or the last error with a retry hint;
-// nil when there is neither.
+// loadStatus: roxel's spinner beside "Loading <name>…" while loading, or the
+// last error with a retry hint; nil when there is neither.
 func (v *Viewer) loadStatus() fyne.CanvasObject {
 	switch {
 	case v.st.loadingFile != "":
-		bar := widget.NewProgressBarInfinite()
-		return vstack(4, note("Loading "+elideMiddle(v.st.loadingFile, 40)+"…"), bar)
+		loading := func() bool { return v.st.loadingFile != "" }
+		gap := float32(8)
+		if uiTouch {
+			gap = 10
+		}
+		// The spinner, then the whole name, wrapped, centred on it.
+		return container.New(keyValueLayout{col: controlHeight(), gap: gap, h: controlHeight()},
+			newSpinner(loading), bodyNote("Loading "+v.st.loadingFile+"…"))
 	case v.st.loadError != "":
 		return vstack(4, newWrapped(v.st.loadError, bodySize(), colDanger), note("Choose a DICOM .dcm or .dcs file to try again."))
 	}

@@ -347,7 +347,7 @@ func (v *Viewer) volumeSheet() fyne.CanvasObject {
 		page = vstack(8, v.palettePicker(), minHeight(touchTarget, legendRow),
 			touchRow("Quality", v.qualityPicker()), v.densityRow().obj)
 	default:
-		page = v.lightingRows()
+		page = v.lightingRows(false)
 	}
 	return vstack(8, sel, page)
 }
