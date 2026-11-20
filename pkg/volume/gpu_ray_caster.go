@@ -991,17 +991,9 @@ func (gr *GPUVolumeRenderer) uploadVolume(vol *ActiveVolume) {
 				// R = density (raw uint16)
 				rgba[outIdx] = vol.Data[idx]
 
-				// Central-difference gradients (zero at volume boundaries)
-				var dx, dy, dz float64
-				if x > 0 && x < dimX-1 {
-					dx = float64(vol.Data[idx+1]) - float64(vol.Data[idx-1])
-				}
-				if y > 0 && y < dimY-1 {
-					dy = float64(vol.Data[idx+dimX]) - float64(vol.Data[idx-dimX])
-				}
-				if z > 0 && z < dimZ-1 {
-					dz = float64(vol.Data[idx+sliceSize]) - float64(vol.Data[idx-sliceSize])
-				}
+				dx := voxelDiff(vol.Data, idx, x, dimX, 1)
+				dy := voxelDiff(vol.Data, idx, y, dimY, dimX)
+				dz := voxelDiff(vol.Data, idx, z, dimZ, sliceSize)
 
 				// Encode gradients: map [-65535, +65535] to [0, 65535]
 				rgba[outIdx+1] = uint16(math.Max(0, math.Min(65535, (dx+65535.0)/2.0)))

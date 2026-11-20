@@ -524,7 +524,7 @@ func (vr *VolumeRenderer) CreateRenderer() fyne.WidgetRenderer {
 		readout: canvas.NewText("", colAccent),
 		swatch:  canvas.NewLine(colAccent),
 	}
-	r.readout.TextSize = 12.5
+	setFace(r.readout, 12.5)
 	r.readout.Alignment = fyne.TextAlignTrailing
 	r.swatch.StrokeWidth = 1.5
 	r.swatch.Hide()
@@ -544,58 +544,12 @@ func (vr *VolumeRenderer) CreateRenderer() fyne.WidgetRenderer {
 	return r
 }
 
-// isBackgroundAt checks whether the given widget-relative position is over
-// the background (empty space) by sampling the last rendered image.
-func (vr *VolumeRenderer) isBackgroundAt(pos fyne.Position) bool {
-	if vr.img == nil || vr.img.Image == nil {
-		return false
-	}
-	rendered, ok := vr.img.Image.(*image.RGBA)
-	if !ok {
-		return false
-	}
-	bounds := rendered.Bounds()
-	shown, at := vr.img.Size(), vr.img.Position()
-	if shown.Width <= 0 || shown.Height <= 0 {
-		return false
-	}
-	// Map widget coordinates to image coordinates (the image is centred).
-	imgX := int(float64(pos.X-at.X) / float64(shown.Width) * float64(bounds.Dx()))
-	imgY := int(float64(pos.Y-at.Y) / float64(shown.Height) * float64(bounds.Dy()))
-	if imgX < bounds.Min.X || imgX >= bounds.Max.X || imgY < bounds.Min.Y || imgY >= bounds.Max.Y {
-		return true // Out of bounds = background
-	}
-	c := rendered.RGBAAt(imgX, imgY)
-	// Background pixels have very low accumulated alpha from ray casting.
-	// The GPU renderer clears to bgColor and composites on top.
-	// Compare against the background color from config.
-	cfg := volume.GetConfig()
-	bgR := uint8(cfg.BackgroundColor[0])
-	bgG := uint8(cfg.BackgroundColor[1])
-	bgB := uint8(cfg.BackgroundColor[2])
-	// Allow small tolerance for anti-aliasing
-	dr := int(c.R) - int(bgR)
-	dg := int(c.G) - int(bgG)
-	db := int(c.B) - int(bgB)
-	if dr < 0 {
-		dr = -dr
-	}
-	if dg < 0 {
-		dg = -dg
-	}
-	if db < 0 {
-		db = -db
-	}
-	return dr < 5 && dg < 5 && db < 5
-}
-
-// Dragged handles mouse drag for rotation (on volume) or pan (on background)
+// Dragged orbits the camera on any one-finger or primary-button drag; Shift,
+// two fingers or the phone Pan toggle pan instead (as in roxel).
 func (vr *VolumeRenderer) Dragged(e *fyne.DragEvent) {
 	if vr.useGPU && vr.gpuRenderer != nil {
 		vr.gesture()
-		// Pan with Shift held (desktop), when the Pan toggle is on, or when
-		// dragging on empty background (the only option without modifiers).
-		if vr.wantsPan(e.Position) {
+		if vr.wantsPan() {
 			// Pan: translate the look-at center in screen space
 			zoom := vr.gpuRenderer.GetZoom()
 			panScale := 0.002 * zoom // Scale pan speed by zoom distance
@@ -636,15 +590,10 @@ func (vr *VolumeRenderer) Dragged(e *fyne.DragEvent) {
 	}
 }
 
-// wantsPan reports whether a drag at pos should pan rather than orbit.
-func (vr *VolumeRenderer) wantsPan(pos fyne.Position) bool {
-	if vr.DragPans != nil && vr.DragPans() {
-		return true
-	}
-	if panModifierDown() {
-		return true
-	}
-	return vr.isBackgroundAt(pos)
+// wantsPan reports whether a drag should pan rather than orbit: the Pan
+// toggle is on, Shift is held or two fingers are down.
+func (vr *VolumeRenderer) wantsPan() bool {
+	return vr.DragPans != nil && vr.DragPans() || panModifierDown()
 }
 
 // Orbit rotates the camera by the given angles (radians).
@@ -963,7 +912,7 @@ func (r *volumeWidgetRenderer) layoutOverlay(size fyne.Size) {
 	corners, readout := r.vr.Overlay()
 	r.readout.Text = readout
 	r.readout.Color = colAccent
-	ts := fyne.MeasureText(readout, r.readout.TextSize, r.readout.TextStyle)
+	ts := measure(readout, 12.5)
 	pos := fyne.NewPos(size.Width-ts.Width-16, size.Height-ts.Height-14)
 	r.readout.Move(pos)
 	r.readout.Resize(ts)
@@ -1011,7 +960,7 @@ func (r *volumeWidgetRenderer) layoutGizmo(size fyne.Size) {
 		}
 		reach := math.Max(n*20+9, 17)
 		r.letters[i].Text = [3]string{"X", "Y", "Z"}[i]
-		ts := fyne.MeasureText(r.letters[i].Text, r.letters[i].TextSize, r.letters[i].TextStyle)
+		ts := measure(r.letters[i].Text, 12)
 		r.letters[i].Move(fyne.NewPos(origin.X+float32(ox*reach)-ts.Width/2, origin.Y+float32(oy*reach)-ts.Height/2))
 		r.letters[i].Resize(ts)
 	}

@@ -10,7 +10,6 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/widget"
 )
 
 func f0(x float64) string { return fmt.Sprintf("%.0f", x) }
@@ -235,7 +234,7 @@ func (v *Viewer) paletteGroup() fyne.CanvasObject {
 	if v.narrowShelf {
 		btn := newButton("Lighting", nil)
 		btn.onTap = func() {
-			v.showPopupBelow(btn, vstack(6, sectionTitle("Lighting", ""), v.lightingRows()), 300)
+			v.showMenuBelow(btn, vstack(6, sectionTitle("Lighting", ""), v.lightingRows()), 300)
 		}
 		menus = append(menus, btn)
 	}
@@ -272,9 +271,17 @@ func (v *Viewer) bandsButton() *button {
 			v.rebuild()
 			return
 		}
-		v.showPopupBelow(btn, v.bandsEditor(), 340)
+		v.showMenuBelow(btn, v.bandsEditor(), 340)
 	}
 	return btn
+}
+
+// legendSize is the legend's type size: roxel sets it 13 on touch layouts.
+func legendSize() float32 {
+	if uiTouch {
+		return 13
+	}
+	return 12
 }
 
 // legendHeight is fixed, so switching palettes moves nothing.
@@ -317,7 +324,7 @@ func (l *legendLayout) Layout(_ []fyne.CanvasObject, size fyne.Size) {
 				}
 			}
 		}
-		line := textHeight(12) + 4
+		line := textHeight(legendSize()) + 4
 		lines := float32(1)
 		if first != len(widths) {
 			lines = 2
@@ -373,11 +380,8 @@ func (v *Viewer) paletteLegend() fyne.CanvasObject {
 	switch v.st.preset {
 	case paletteMaterials:
 		for _, b := range v.st.bands {
-			if b.IsTransparent {
-				continue
-			}
 			l.dots = append(l.dots, canvas.NewCircle(color.NRGBA{b.Color.R, b.Color.G, b.Color.B, 255}))
-			l.names = append(l.names, text(b.Name, 12, colText))
+			l.names = append(l.names, text(b.Name, legendSize(), colText))
 		}
 	case paletteGrayscale:
 		l.bar = canvas.NewImageFromImage(grayRamp())
@@ -386,11 +390,11 @@ func (v *Viewer) paletteLegend() fyne.CanvasObject {
 		l.frame = rrect(color.Transparent, colHairline, 0, 1)
 		lo := v.st.windowCenter3D - v.st.windowWidth3D/2
 		hi := v.st.windowCenter3D + v.st.windowWidth3D/2
-		l.labels = [3]*canvas.Text{text(f0(lo), 12, colMuted), text("Stored value", 12, colMuted), text(f0(hi), 12, colMuted)}
+		l.labels = [3]*canvas.Text{text(f0(lo), legendSize(), colMuted), text("Stored value", legendSize(), colMuted), text(f0(hi), legendSize(), colMuted)}
 		objs = append(objs, l.bar, l.frame, l.labels[0], l.labels[1], l.labels[2])
 	default:
 		l.dots = []*canvas.Circle{canvas.NewCircle(color.NRGBA{235, 80, 70, 255})}
-		l.names = []*canvas.Text{text("Dense material in red", 12, colText)}
+		l.names = []*canvas.Text{text("Dense material in red", legendSize(), colText)}
 	}
 	for i := range l.dots {
 		objs = append(objs, l.dots[i], l.names[i])
@@ -409,9 +413,6 @@ func (v *Viewer) bandsEditor() fyne.CanvasObject {
 	}
 	items := []fyne.CanvasObject{sectionTitle("Band thresholds", "stored values"), strip, sectionTitle("Band opacity", "")}
 	for i := range bands {
-		if bands[i].IsTransparent {
-			continue
-		}
 		items = append(items, v.bandOpacityRow(i, bands[i].Name, strip.GetBandAlpha(i)).obj)
 	}
 	return vstack(6, items...)
@@ -435,19 +436,4 @@ func (v *Viewer) lightingRows() fyne.CanvasObject {
 	}
 	return vstack(6, row("Depth cue", &v.st.depthCue), row("Ambient", &v.st.ambient),
 		row("Diffuse", &v.st.diffuse), row("Specular", &v.st.specular))
-}
-
-// showPopupBelow shows content in a popup under anchor, at the given width.
-func (v *Viewer) showPopupBelow(anchor fyne.CanvasObject, content fyne.CanvasObject, width float32) {
-	pop := widget.NewPopUp(frame(colOutline, 6, 12, 10, content), v.win.Canvas())
-	pos := fyne.CurrentApp().Driver().AbsolutePositionForObject(anchor)
-	size := fyne.NewSize(width, pop.MinSize().Height)
-	canvasSize := v.win.Canvas().Size()
-	x := min(pos.X, canvasSize.Width-width-8)
-	y := pos.Y + anchor.Size().Height + 4
-	if y+size.Height > canvasSize.Height {
-		y = max(pos.Y-size.Height-4, 8)
-	}
-	pop.ShowAtPosition(fyne.NewPos(max(x, 8), y))
-	pop.Resize(size)
 }

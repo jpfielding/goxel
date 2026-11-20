@@ -19,6 +19,31 @@
     <div id="goxel-status">Loading goxel… (about 12 MB)</div>
     <div id="goxel-error" role="alert"></div>
     <noscript>goxel needs JavaScript, WebAssembly and WebGL.</noscript>
+    <script>
+      // Fyne's browser driver re-applies its theme when the OS colour scheme
+      // changes (a "change" event on matchMedia("(prefers-color-scheme: dark)"),
+      // which browsers also fire when a hidden window is restored). That path
+      // reloads every text texture from the JS event goroutine, where no GL
+      // context is current, and Go panics: "syscall/js: call of Value.Call on
+      // null" from (*window).RescaleContext, and the page stops responding.
+      // goxel's theme is dark whatever the browser prefers, so hand Fyne the
+      // query's current answer and never tell it about changes.
+      (() => {
+        const real = window.matchMedia.bind(window);
+        const quiet = new Set(["addEventListener", "removeEventListener", "addListener", "removeListener"]);
+        window.matchMedia = (query) => {
+          const list = real(query);
+          if (!/prefers-color-scheme/.test(query)) return list;
+          return new Proxy(list, {
+            get: (target, key) => {
+              if (quiet.has(key)) return () => {};
+              const value = Reflect.get(target, key, target);
+              return typeof value === "function" ? value.bind(target) : value;
+            },
+          });
+        };
+      })();
+    </script>
     <script src="wasm_exec.js"></script>
     <script>
       // Input shim. Fyne's browser driver only listens to mouse and wheel

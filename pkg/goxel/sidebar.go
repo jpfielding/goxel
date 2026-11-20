@@ -29,7 +29,8 @@ func (v *Viewer) studySection() fyne.CanvasObject {
 		name := newWrapped(v.st.loadedName, bodySize(), colHeading)
 		edge := rrect(colAccent, color.Transparent, 3, 0)
 		edge.SetMinSize(fyne.NewSize(4, 1))
-		body := container.New(insetsLayout{left: 14, right: 10, top: 8, bottom: 9}, vstack(0, leftCentre(label), name))
+		body := container.New(insetsLayout{left: 14, right: 10, top: 8, bottom: 9},
+			vstack(2, minHeight(eguiRowHeight(12), leftCentre(label)), name))
 		items = append(items, container.NewStack(rrect(colOpenCard, color.Transparent, 6, 0),
 			border(nil, nil, edge, nil, nil), body))
 	} else {
@@ -76,6 +77,7 @@ func (v *Viewer) volumesSection() fyne.CanvasObject {
 			}
 		})
 		b.selected = k == v.active3D
+		b.flat = true
 		items = append(items, b)
 	}
 	return vstack(8, items...)

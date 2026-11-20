@@ -75,17 +75,18 @@ func (lr *listRowRenderer) Layout(size fyne.Size) {
 	lr.swatch.Move(fyne.NewPos(9, (size.Height-10)/2))
 	lr.swatch.Resize(fyne.NewSize(10, 10))
 	right := size.Width - 8
-	lr.conf.Text, lr.conf.TextSize = lr.r.confidence, bodySize()
+	lr.conf.Text = lr.r.confidence
+	setFace(lr.conf, bodySize())
 	if lr.r.confidence != "" {
-		ts := fyne.MeasureText(lr.r.confidence, bodySize(), fyne.TextStyle{})
+		ts := measure(lr.r.confidence, bodySize())
 		lr.conf.Move(fyne.NewPos(right-ts.Width, (size.Height-ts.Height)/2))
 		lr.conf.Resize(ts)
 		right -= ts.Width + 8
 	}
 	left := float32(28)
-	lr.name.TextSize = bodySize()
+	setFace(lr.name, bodySize())
 	lr.name.Text = elideToWidth(lr.r.name, bodySize(), right-left)
-	ts := fyne.MeasureText(lr.name.Text, bodySize(), fyne.TextStyle{})
+	ts := measure(lr.name.Text, bodySize())
 	lr.name.Move(fyne.NewPos(left, (size.Height-ts.Height)/2))
 	lr.name.Resize(ts)
 }

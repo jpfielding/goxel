@@ -68,11 +68,11 @@ func mix(a, b color.NRGBA, t float32) color.NRGBA {
 func fade(c color.NRGBA) color.NRGBA { return mix(c, colPanel, 0.55) }
 
 func textWidth(s string, size float32) float32 {
-	return fyne.MeasureText(s, size, fyne.TextStyle{}).Width
+	return measure(s, size).Width
 }
 
 func textHeight(size float32) float32 {
-	return fyne.MeasureText("Ag", size, fyne.TextStyle{}).Height
+	return measure("Ag", size).Height
 }
 
 func rrect(fill, stroke color.Color, radius, width float32) *canvas.Rectangle {
@@ -112,6 +112,8 @@ type button struct {
 	onTap    func()
 	primary  bool // the one dominant action: filled with the accent
 	selected bool // a toggle that is on: SELECTED fill, accent outline
+	flat     bool // a selectable row: no frame until hovered, filled only when selected
+	open     bool // its menu is up: SELECTED fill, 1 px accent outline (egui's "open")
 	minW     float32
 	minH     float32
 	size     float32 // text size; 0 means the button size
@@ -191,6 +193,14 @@ func (b *button) Enable()        { b.disabled = false; b.Refresh() }
 func (b *button) Disable()       { b.disabled = true; b.Refresh() }
 func (b *button) Disabled() bool { return b.disabled }
 
+// SetOpen marks the button whose menu is up.
+func (b *button) SetOpen(on bool) {
+	if b.open != on {
+		b.open = on
+		b.Refresh()
+	}
+}
+
 // SetSelected marks a toggle as on.
 func (b *button) SetSelected(on bool) {
 	if b.selected != on {
@@ -252,8 +262,8 @@ func (r *buttonRenderer) Layout(size fyne.Size) {
 	b := r.b
 	r.bg.Resize(size)
 	ringRect(r.ring, size)
-	ts := fyne.MeasureText(b.label, b.textPx(), fyne.TextStyle{})
-	r.text.TextSize = b.textPx()
+	ts := measure(b.label, b.textPx())
+	setFace(r.text, b.textPx())
 	r.text.Text = b.label
 	cx, cy := size.Width/2, size.Height/2
 	switch b.icon {
@@ -325,10 +335,12 @@ func (r *buttonRenderer) Refresh() {
 		if b.hovered {
 			fill = mix(colAccent, color.NRGBA{255, 255, 255, 255}, 0.15)
 		}
-	case b.pressed || b.selected:
+	case b.pressed || b.selected || b.open:
 		fill, stroke = colSelected, colAccent
 	case b.hovered:
 		fill, stroke = colHover, colThumb
+	case b.flat:
+		fill, stroke = color.NRGBA{}, color.NRGBA{}
 	}
 	r.bg.FillColor, r.bg.StrokeColor = fill, stroke
 	r.bg.StrokeWidth = 1
@@ -516,8 +528,8 @@ func (r *segmentedRenderer) Layout(size fyne.Size) {
 	for i, w := range r.s.widths(size.Width - 6) {
 		r.segs[i].Move(fyne.NewPos(x, 3))
 		r.segs[i].Resize(fyne.NewSize(w, h))
-		ts := fyne.MeasureText(r.s.labels[i], segmentedSize(), fyne.TextStyle{})
-		r.texts[i].TextSize = segmentedSize()
+		ts := measure(r.s.labels[i], segmentedSize())
+		setFace(r.texts[i], segmentedSize())
 		r.texts[i].Move(fyne.NewPos(x+(w-ts.Width)/2, 3+(h-ts.Height)/2))
 		r.texts[i].Resize(ts)
 		if i == r.s.selected {
@@ -686,8 +698,8 @@ func (r *checkboxRenderer) Layout(size fyne.Size) {
 	top := (size.Height - side) / 2
 	r.box.Move(fyne.NewPos(0, top))
 	r.box.Resize(fyne.NewSize(side, side))
-	ts := fyne.MeasureText(c.label, bodySize(), fyne.TextStyle{})
-	r.text.TextSize = bodySize()
+	ts := measure(c.label, bodySize())
+	setFace(r.text, bodySize())
 	r.text.Move(fyne.NewPos(side+c.gap(), (size.Height-ts.Height)/2))
 	r.text.Resize(ts)
 	ringRect(r.ring, size)
@@ -1062,8 +1074,10 @@ func (b *valueBox) Disable()                       { b.disabled = true; b.Refres
 func (b *valueBox) Disabled() bool                 { return b.disabled }
 
 func (b *valueBox) CreateRenderer() fyne.WidgetRenderer {
-	return &valueBoxRenderer{b: b, bg: rrect(colControl, colOutline, 5, 1),
+	r := &valueBoxRenderer{b: b, bg: rrect(colControl, colOutline, 5, 1),
 		text: canvas.NewText("", colText), caret: line(colAccent, 1)}
+	r.caret.Hide() // shown only while editing
+	return r
 }
 
 type valueBoxRenderer struct {
@@ -1082,8 +1096,9 @@ func (r *valueBoxRenderer) Layout(size fyne.Size) {
 	if b.editing {
 		s = b.buf
 	}
-	r.text.Text, r.text.TextSize = s, bodySize()
-	ts := fyne.MeasureText(s, bodySize(), fyne.TextStyle{})
+	r.text.Text = s
+	setFace(r.text, bodySize())
+	ts := measure(s, bodySize())
 	x := (size.Width - ts.Width) / 2
 	if ts.Width > size.Width-8 {
 		x = size.Width - 4 - ts.Width // keep the end, where typing happens
@@ -1275,9 +1290,9 @@ func newSliderRow(spec sliderSpec, value float64, onChanged, onCommitted func(fl
 	r.minus = newButton("−", func() { step(-r.spec.step) }).textSize(22).sized(touchTarget, touchTarget)
 	r.plus = newButton("+", func() { step(r.spec.step) }).textSize(22).sized(touchTarget, touchTarget)
 	label := canvas.NewText(spec.label, colMuted)
-	label.TextSize = 13
+	setFace(label, 13)
 	r.value = canvas.NewText("", colText)
-	r.value.TextSize = 15
+	setFace(r.value, 15)
 	cell := container.New(touchLabelLayout{label: label, value: r.value}, label, r.value)
 	r.obj = flexRow(10, 2, cell, r.minus, r.track, r.plus)
 	r.show(value)

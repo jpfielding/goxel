@@ -28,3 +28,22 @@ func rayStep(plain, voxels float64, v *ActiveVolume, scaleY, scaleZ, distance fl
 	voxel := min(1/float64(v.DimX), min(scaleY/float64(v.DimY), scaleZ/float64(v.DimZ)))
 	return max(0.0005, min(0.02, voxel*voxels/d))
 }
+
+// voxelDiff is the density gradient of the voxel at idx along one axis, per
+// two voxels: the central difference inside the volume and, on the outermost
+// layer, the one-sided difference doubled to the same scale. A zero there
+// would leave that layer lit with the flat-region (ambient only) model and
+// draw a dark line along the face of any shell that reaches the volume's edge.
+// pos is the voxel's coordinate on the axis, n the axis length and stride the
+// index step along it.
+func voxelDiff[T ~uint16](data []T, idx, pos, n, stride int) float64 {
+	switch {
+	case n < 2:
+		return 0
+	case pos == 0:
+		return 2 * (float64(data[idx+stride]) - float64(data[idx]))
+	case pos == n-1:
+		return 2 * (float64(data[idx]) - float64(data[idx-stride]))
+	}
+	return float64(data[idx+stride]) - float64(data[idx-stride])
+}

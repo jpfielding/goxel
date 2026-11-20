@@ -346,16 +346,9 @@ func (gr *GPUVolumeRenderer) uploadVolume(vol *ActiveVolume) {
 		for y := 0; y < dimY; y++ {
 			for x := 0; x < dimX; x++ {
 				idx := z*sliceSize + y*dimX + x
-				var dx, dy, dz float32
-				if x > 0 && x < dimX-1 {
-					dx = float32(data[idx+1]) - float32(data[idx-1])
-				}
-				if y > 0 && y < dimY-1 {
-					dy = float32(data[idx+dimX]) - float32(data[idx-dimX])
-				}
-				if z > 0 && z < dimZ-1 {
-					dz = float32(data[idx+sliceSize]) - float32(data[idx-sliceSize])
-				}
+				dx := float32(voxelDiff(data, idx, x, dimX, 1))
+				dy := float32(voxelDiff(data, idx, y, dimY, dimX))
+				dz := float32(voxelDiff(data, idx, z, dimZ, sliceSize))
 				o := (y*dimX + x) * 4
 				half[o] = float16Bits(float32(data[idx]) * inv)
 				half[o+1] = float16Bits(dx * inv)

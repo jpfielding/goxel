@@ -44,7 +44,8 @@ type Viewer struct {
 
 	isAnnotating   bool
 	rebuildPending bool
-	narrowShelf    bool // the shelf the tree was built with has two columns
+	menu           *menuPopup // the open menu panel, if any
+	narrowShelf    bool       // the shelf the tree was built with has two columns
 
 	// syncers re-read state into the live widgets of the current tree, for
 	// changes that do not warrant a rebuild (slice stepping, value readouts).
@@ -135,6 +136,7 @@ func (v *Viewer) loaded() bool { return v.scan != nil }
 // has keyboard focus keeps it: the same position in the new tree takes it.
 func (v *Viewer) rebuild() {
 	v.syncers = nil
+	v.closeMenu()
 	tooltips.hide(nil)
 	publishTouchArea(fyne.Position{}, fyne.Size{}) // the 3D view says where it is when it lays out
 	canvas := v.win.Canvas()
@@ -195,6 +197,10 @@ func (v *Viewer) debounced(key string, d time.Duration, fn func()) {
 func (v *Viewer) onKey(e *fyne.KeyEvent) {
 	switch e.Name {
 	case fyne.KeyEscape:
+		if v.menu != nil {
+			v.menu.dismiss()
+			return
+		}
 		if v.win.Canvas().Overlays().Top() != nil {
 			return
 		}

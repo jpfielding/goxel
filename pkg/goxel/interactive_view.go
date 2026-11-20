@@ -83,11 +83,17 @@ const (
 )
 
 // Scrolled zooms about the pointer: a touch pinch (a ratio from the page) or
-// Ctrl + scroll. A plain scroll does nothing here.
+// Ctrl + scroll. A plain scroll moves the zoomed image in the well, as it
+// scrolls roxel's.
 func (iv *Interactive2DView) Scrolled(e *fyne.ScrollEvent) {
 	f := takePinch()
 	if f == 0 {
 		if !zoomModifierDown() {
+			if iv.zoom > 1 {
+				iv.panX += e.Scrolled.DX
+				iv.panY += e.Scrolled.DY
+				iv.Refresh()
+			}
 			return
 		}
 		f = math.Exp(math.Max(-0.2, math.Min(0.2, float64(e.Scrolled.DY)*0.01)))
@@ -232,8 +238,10 @@ func (r *interactive2DRenderer) Layout(size fyne.Size) {
 	iv.well.Resize(size)
 
 	imgW, imgH := iv.imageSize()
-	upright := min(size.Width/imgW, size.Height/imgH)
-	onSide := min(size.Width/imgH, size.Height/imgW)
+	// The slice fits inside the well less a 1 px margin, as roxel's does.
+	room := fyne.NewSize(max(size.Width-2, 1), max(size.Height-2, 1))
+	upright := min(room.Width/imgW, room.Height/imgH)
+	onSide := min(room.Width/imgH, room.Height/imgW)
 	turned := iv.TurnToFit && onSide >= upright*turnGain
 	if turned != iv.turned {
 		iv.turned = turned

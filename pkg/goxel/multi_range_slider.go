@@ -1,13 +1,13 @@
 package goxel
 
 import (
-	"fmt"
 	"image/color"
+	"math"
+	"strconv"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/driver/desktop"
-	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 	"github.com/jpfielding/goxel/pkg/volume"
 )
@@ -105,145 +105,150 @@ func (s *MultiRangeSlider) SetBandAlpha(bandIdx int, alpha float64) {
 
 func (s *MultiRangeSlider) CreateRenderer() fyne.WidgetRenderer {
 	r := &multiRangeSliderRenderer{
-		s:      s,
-		tracks: make([]*canvas.Rectangle, len(s.Bands)),
-		labels: make([]*canvas.Text, len(s.Bands)),
-		titles: make([]*canvas.Text, len(s.Bands)),
+		s:     s,
+		track: rrect(colControl, color.Transparent, 3, 0),
 	}
-
-	// Create track segments
-	for i, band := range s.Bands {
-		r.tracks[i] = canvas.NewRectangle(band.Color)
+	for range s.Bands {
+		r.segments = append(r.segments, rrect(color.Transparent, color.Transparent, 2, 0))
+		r.names = append(r.names, text("", 12, colText))
 	}
-
-	// Create handles (N-1 for N bands)
-	r.handles = make([]*canvas.Circle, len(s.Bands)-1)
-	r.handleLabels = make([]*canvas.Text, len(s.Bands)-1)
-	for i := range r.handles {
-		h := canvas.NewCircle(theme.BackgroundColor())
-		h.StrokeColor = theme.ForegroundColor()
-		h.StrokeWidth = 2
-		r.handles[i] = h
-
-		lbl := canvas.NewText("", theme.ForegroundColor())
-		lbl.TextSize = 10
-		lbl.Alignment = fyne.TextAlignCenter
-		r.handleLabels[i] = lbl
+	mono := fyne.TextStyle{Monospace: true}
+	for i := 0; i < len(s.Bands)-1; i++ {
+		h := canvas.NewCircle(colBG)
+		h.StrokeColor = bandHandleStroke
+		h.StrokeWidth = 1.5
+		r.handles = append(r.handles, h)
+		l := text("", 11, colText)
+		l.TextStyle = mono
+		r.values = append(r.values, l)
 	}
-
-	// Create end dots
-	if len(s.Bands) > 0 {
-		r.dotStart = canvas.NewCircle(s.Bands[0].Color)
-		r.dotEnd = canvas.NewCircle(s.Bands[len(s.Bands)-1].Color)
-	} else {
-		r.dotStart = canvas.NewCircle(color.Gray{128})
-		r.dotEnd = canvas.NewCircle(color.Gray{128})
-	}
-
-	// Create titles for each band
-	for i, band := range s.Bands {
-		t := canvas.NewText(band.Name, theme.ForegroundColor())
-		t.TextStyle = fyne.TextStyle{Bold: true}
-		t.Alignment = fyne.TextAlignCenter
-		t.TextSize = 11
-		r.titles[i] = t
-	}
-
 	return r
 }
 
-// Mouse Interactions
+// bandHandleStroke is the outline of a resting handle: egui's inactive widget
+// stroke.
+var bandHandleStroke = color.NRGBA{180, 180, 180, 255}
 
-func (s *MultiRangeSlider) Tapped(e *fyne.PointEvent) {
-	if len(s.Bands) <= 1 {
-		return
+// Handle radius and the strip's height: bigger where a finger does the dragging.
+func (s *MultiRangeSlider) handleRadius() float32 {
+	if s.Compact {
+		return 11
 	}
-	val := s.valueFromPos(e.Position.X, s.Size().Width)
-
-	// Find nearest handle
-	nearest := s.findNearestHandle(val)
-	if nearest >= 0 {
-		s.Bands[nearest].Threshold = int(val)
-		s.clampValues()
-		s.Refresh()
-		s.notifyChange()
-	}
+	return 6
 }
+
+func (s *MultiRangeSlider) stripHeight() float32 {
+	if s.Compact {
+		return 96
+	}
+	return 84
+}
+
+// track is the band bar's extent: inset by the handle radius (and 2 px) so a
+// handle at either end stays inside the widget; 12 px tall (16 on touch), its
+// bottom 26 px (28) above the widget's.
+func (s *MultiRangeSlider) trackRect(size fyne.Size) (left, right, top, bottom float32) {
+	r := s.handleRadius()
+	if s.Compact {
+		return r + 2, size.Width - r - 2, size.Height - 44, size.Height - 28
+	}
+	return r + 2, size.Width - r - 2, size.Height - 38, size.Height - 26
+}
+
+// xAt is the x of a value, and valueAt its inverse, over the track.
+func (s *MultiRangeSlider) xAt(v float64, size fyne.Size) float32 {
+	left, right, _, _ := s.trackRect(size)
+	return left + float32((v-s.Min)/s.span())*(right-left)
+}
+
+func (s *MultiRangeSlider) valueAt(x float32, size fyne.Size) float64 {
+	left, right, _, _ := s.trackRect(size)
+	if right <= left {
+		return s.Min
+	}
+	t := math.Max(0, math.Min(1, float64((x-left)/(right-left))))
+	return math.Round(s.Min + t*s.span())
+}
+
+func (s *MultiRangeSlider) span() float64 {
+	if s.Max <= s.Min {
+		return 1
+	}
+	return s.Max - s.Min
+}
+
+// Mouse interactions: a press takes the handle nearest the pointer and moves it
+// there; dragging moves it with the pointer, between its neighbours.
 
 func (s *MultiRangeSlider) MouseDown(e *desktop.MouseEvent) {
 	if len(s.Bands) <= 1 {
 		return
 	}
-	val := s.valueFromPos(e.Position.X, s.Size().Width)
-	s.draggedHandle = s.findNearestHandle(val)
+	s.draggedHandle = s.nearestHandle(e.Position.X)
+	s.moveHandle(e.Position.X)
+}
+
+func (s *MultiRangeSlider) MouseUp(*desktop.MouseEvent) { s.release() }
+
+func (s *MultiRangeSlider) DragEnd() { s.release() }
+
+func (s *MultiRangeSlider) Dragged(e *fyne.DragEvent) { s.moveHandle(e.Position.X) }
+
+func (s *MultiRangeSlider) Tapped(*fyne.PointEvent) {}
+
+func (s *MultiRangeSlider) release() {
 	if s.draggedHandle >= 0 {
-		s.Bands[s.draggedHandle].Threshold = int(val)
-		s.clampValues()
+		s.draggedHandle = -1
 		s.Refresh()
-		s.notifyChange()
 	}
 }
 
-func (s *MultiRangeSlider) MouseUp(e *desktop.MouseEvent) {
-	s.draggedHandle = -1
-}
-
-func (s *MultiRangeSlider) MouseMoved(e *desktop.MouseEvent) {}
-
-func (s *MultiRangeSlider) DragEnd() {
-	s.draggedHandle = -1
-}
-
-func (s *MultiRangeSlider) Dragged(e *fyne.DragEvent) {
-	if s.draggedHandle < 0 || s.draggedHandle >= len(s.Bands)-1 {
-		return
-	}
-
-	width := s.Size().Width
-	dVal := (float64(e.Dragged.DX) / float64(width)) * (s.Max - s.Min)
-	s.Bands[s.draggedHandle].Threshold += int(dVal)
-
-	s.clampValues()
-	s.Refresh()
-	s.notifyChange()
-}
-
-func (s *MultiRangeSlider) findNearestHandle(val float64) int {
-	if len(s.Bands) <= 1 {
-		return -1
-	}
-
-	nearest := 0
-	minDist := abs(val - float64(s.Bands[0].Threshold))
-
-	for i := 1; i < len(s.Bands)-1; i++ {
-		dist := abs(val - float64(s.Bands[i].Threshold))
-		if dist < minDist {
-			minDist = dist
-			nearest = i
+// nearestHandle is the handle whose x is closest to x.
+func (s *MultiRangeSlider) nearestHandle(x float32) int {
+	size := s.Size()
+	nearest, best := -1, float32(math.MaxFloat32)
+	for i := 0; i < len(s.Bands)-1; i++ {
+		d := x - s.xAt(float64(s.Bands[i].Threshold), size)
+		if d < 0 {
+			d = -d
+		}
+		if d < best {
+			nearest, best = i, d
 		}
 	}
 	return nearest
 }
 
+// moveHandle puts the dragged handle at x, between its neighbours, and says so.
+func (s *MultiRangeSlider) moveHandle(x float32) {
+	i := s.draggedHandle
+	if i < 0 || i >= len(s.Bands)-1 {
+		return
+	}
+	lo, hi := s.Min, s.Max
+	if i > 0 {
+		lo = float64(s.Bands[i-1].Threshold)
+	}
+	if i+1 < len(s.Bands)-1 {
+		hi = float64(s.Bands[i+1].Threshold)
+	}
+	v := int(math.Max(lo, math.Min(hi, s.valueAt(x, s.Size()))))
+	if s.Bands[i].Threshold == v {
+		return
+	}
+	s.Bands[i].Threshold = v
+	s.Refresh()
+	s.notifyChange()
+}
+
 func (s *MultiRangeSlider) clampValues() {
 	for i := range s.Bands {
-		if s.Bands[i].Threshold < int(s.Min) {
-			s.Bands[i].Threshold = int(s.Min)
-		}
-		if s.Bands[i].Threshold > int(s.Max) {
-			s.Bands[i].Threshold = int(s.Max)
-		}
+		s.Bands[i].Threshold = max(int(s.Min), min(int(s.Max), s.Bands[i].Threshold))
 	}
-
-	// Ensure ordering (each threshold >= previous)
+	// Each threshold is at least the one before.
 	for i := 1; i < len(s.Bands)-1; i++ {
 		if s.Bands[i].Threshold < s.Bands[i-1].Threshold {
-			if s.draggedHandle == i {
-				s.Bands[i].Threshold = s.Bands[i-1].Threshold
-			} else {
-				s.Bands[i-1].Threshold = s.Bands[i].Threshold
-			}
+			s.Bands[i].Threshold = s.Bands[i-1].Threshold
 		}
 	}
 }
@@ -254,154 +259,103 @@ func (s *MultiRangeSlider) notifyChange() {
 	}
 }
 
-func (s *MultiRangeSlider) valueFromPos(x float32, width float32) float64 {
-	if width <= 0 {
-		return s.Min
-	}
-	pct := float64(x / width)
-	return s.Min + pct*(s.Max-s.Min)
-}
-
-// Renderer
+// Renderer, after roxel's band_slider.rs.
 
 type multiRangeSliderRenderer struct {
-	s            *MultiRangeSlider
-	tracks       []*canvas.Rectangle
-	handles      []*canvas.Circle
-	handleLabels []*canvas.Text
-	titles       []*canvas.Text
-	labels       []*canvas.Text
-	dotStart     *canvas.Circle
-	dotEnd       *canvas.Circle
+	s        *MultiRangeSlider
+	track    *canvas.Rectangle
+	segments []*canvas.Rectangle
+	names    []*canvas.Text
+	handles  []*canvas.Circle
+	values   []*canvas.Text
 }
 
+// minNameSegment is the narrowest segment that still carries its band's name.
+const minNameSegment = 36
+
 func (r *multiRangeSliderRenderer) Layout(size fyne.Size) {
-	trackHeight := float32(6)
-	handleSize := float32(16)
-	if r.s.Compact {
-		handleSize = 22
-	}
-	dotSize := float32(8)
+	s := r.s
+	rad := s.handleRadius()
+	left, right, top, bottom := s.trackRect(size)
+	r.track.Move(fyne.NewPos(left, top))
+	r.track.Resize(fyne.NewSize(max(right-left, 0), bottom-top))
 
-	midY := size.Height - 12
-	if midY < 50 {
-		midY = 50
-	}
-
-	rangeW := r.s.Max - r.s.Min
-	if rangeW <= 0 {
-		rangeW = 1
-	}
-
-	// Calculate x positions for each threshold
-	xPositions := make([]float32, len(r.s.Bands))
-	for i := range r.s.Bands {
-		if i == len(r.s.Bands)-1 {
-			xPositions[i] = size.Width
+	for i, seg := range r.segments {
+		start, end := s.Min, s.Max
+		if i > 0 {
+			start = float64(s.Bands[i-1].Threshold)
+		}
+		if i < len(s.Bands)-1 {
+			end = float64(s.Bands[i].Threshold)
+		}
+		sx, ex := s.xAt(start, size), s.xAt(end, size)
+		c := s.Bands[i].Color
+		fill := color.NRGBA{c.R, c.G, c.B, 255}
+		if s.Bands[i].IsTransparent {
+			fill.A = 64 // the colour at a quarter, as roxel fades the transparent band
+		}
+		seg.FillColor = fill
+		name := r.names[i]
+		if ex <= sx {
+			seg.Hide()
+			name.Hide()
+			continue
+		}
+		seg.Show()
+		seg.Move(fyne.NewPos(sx, top))
+		seg.Resize(fyne.NewSize(ex-sx, bottom-top))
+		name.Text = s.Bands[i].Name
+		if ex-sx > minNameSegment {
+			ts := measure(name.Text, 12)
+			name.Move(fyne.NewPos((sx+ex-ts.Width)/2, bottom+rad+1))
+			name.Resize(ts)
+			name.Show()
 		} else {
-			xPositions[i] = float32((float64(r.s.Bands[i].Threshold)-r.s.Min)/rangeW) * size.Width
+			name.Hide()
 		}
 	}
 
-	// Layout tracks
-	prevX := float32(0)
-	for i, track := range r.tracks {
-		track.FillColor = r.s.Bands[i].Color
-		// Use lower opacity and add stroke for transparent bands
-		if r.s.Bands[i].IsTransparent {
-			c := r.s.Bands[i].Color
-			track.FillColor = color.RGBA{c.R, c.G, c.B, 32}    // Very low alpha
-			track.StrokeColor = color.RGBA{c.R, c.G, c.B, 180} // Visible stroke
-			track.StrokeWidth = 1
-		} else {
-			track.StrokeColor = color.Transparent
-			track.StrokeWidth = 0
+	for i, h := range r.handles {
+		x := s.xAt(float64(s.Bands[i].Threshold), size)
+		cy := (top + bottom) / 2
+		h.Move(fyne.NewPos(x-rad, cy-rad))
+		h.Resize(fyne.NewSize(2*rad, 2*rad))
+		h.StrokeColor = bandHandleStroke
+		if s.draggedHandle == i {
+			h.StrokeColor = colAccent
 		}
-		track.Move(fyne.NewPos(prevX, midY-trackHeight/2))
-		track.Resize(fyne.NewSize(xPositions[i]-prevX, trackHeight))
-		prevX = xPositions[i]
-	}
-
-	// End dots
-	r.dotStart.Resize(fyne.NewSize(dotSize, dotSize))
-	r.dotStart.Move(fyne.NewPos(0, midY-dotSize/2))
-	if len(r.s.Bands) > 0 {
-		r.dotStart.FillColor = r.s.Bands[0].Color
-	}
-
-	r.dotEnd.Resize(fyne.NewSize(dotSize, dotSize))
-	r.dotEnd.Move(fyne.NewPos(size.Width-dotSize, midY-dotSize/2))
-	if len(r.s.Bands) > 0 {
-		r.dotEnd.FillColor = r.s.Bands[len(r.s.Bands)-1].Color
-	}
-
-	// Layout handles (N-1 handles between bands)
-	for i, handle := range r.handles {
-		x := xPositions[i]
-		handle.Resize(fyne.NewSize(handleSize, handleSize))
-		handle.Move(fyne.NewPos(x-handleSize/2, midY-handleSize/2))
-		handle.FillColor = theme.BackgroundColor()
-
-		// Handle label (threshold value)
-		r.handleLabels[i].Text = fmt.Sprintf("%d", r.s.Bands[i].Threshold)
-		r.handleLabels[i].Move(fyne.NewPos(x-20, midY-handleSize-15))
-		r.handleLabels[i].Resize(fyne.NewSize(40, 15))
-	}
-
-	// Layout titles (centered in each band segment)
-	for i, title := range r.titles {
-		var startX, endX float32
-		if i == 0 {
-			startX = 0
-		} else {
-			startX = xPositions[i-1]
-		}
-		endX = xPositions[i]
-
-		centerX := startX + (endX-startX)/2
-		title.Move(fyne.NewPos(centerX-30, midY-handleSize-35))
-		title.Resize(fyne.NewSize(60, 15))
+		l := r.values[i]
+		l.Text = strconv.Itoa(s.Bands[i].Threshold)
+		ts := fyne.MeasureText(l.Text, l.TextSize, l.TextStyle)
+		l.Move(fyne.NewPos(x-ts.Width/2, top-rad+1-ts.Height))
+		l.Resize(ts)
 	}
 }
 
 func (r *multiRangeSliderRenderer) MinSize() fyne.Size {
-	if r.s.Compact {
-		return fyne.NewSize(200, 96)
-	}
-	return fyne.NewSize(200, 84)
+	return fyne.NewSize(180, r.s.stripHeight())
 }
 
 func (r *multiRangeSliderRenderer) Refresh() {
-	// Update colors from bands
-	for i, track := range r.tracks {
-		if i < len(r.s.Bands) {
-			track.FillColor = r.s.Bands[i].Color
-		}
-	}
-
-	for _, handle := range r.handles {
-		handle.FillColor = theme.BackgroundColor()
-	}
-
 	r.Layout(r.s.Size())
-	canvas.Refresh(r.s)
+	for _, o := range r.Objects() {
+		canvas.Refresh(o)
+	}
 }
 
 func (r *multiRangeSliderRenderer) Objects() []fyne.CanvasObject {
-	objs := make([]fyne.CanvasObject, 0, len(r.tracks)+len(r.handles)*2+len(r.titles)+2)
-
-	for _, track := range r.tracks {
-		objs = append(objs, track)
+	objs := []fyne.CanvasObject{r.track}
+	for _, o := range r.segments {
+		objs = append(objs, o)
 	}
-	objs = append(objs, r.dotStart, r.dotEnd)
-	for _, handle := range r.handles {
-		objs = append(objs, handle)
+	for _, o := range r.names {
+		objs = append(objs, o)
 	}
-	for _, lbl := range r.handleLabels {
-		objs = append(objs, lbl)
+	for _, o := range r.handles {
+		objs = append(objs, o)
 	}
-	for _, title := range r.titles {
-		objs = append(objs, title)
+	for _, o := range r.values {
+		objs = append(objs, o)
 	}
 	return objs
 }

@@ -77,7 +77,9 @@ func (v *Viewer) sliceHeader(focusLabel string) fyne.CanvasObject {
 func (v *Viewer) sliceFocusView() fyne.CanvasObject {
 	label := "Exit focus"
 	header := panel(colPanel, 0, inset(16, 10, v.sliceHeader(label)))
-	groups := panel(colPanel, 0, inset(16, 12, columns(24, v.sliceGroup(), v.windowingGroup2D(), v.imageGroup())))
+	// On very wide windows the groups keep a usable length, as the 3D shelf's do.
+	dock := container.New(&cappedCentre{max: shelfMaxWidth}, columns(24, v.sliceGroup(), v.windowingGroup2D(), v.imageGroup()))
+	groups := panel(colPanel, 0, inset(16, 12, dock))
 	well := panel(colPanel, 0, inset(16, 0, v.sliceWell()))
 	return border(edged(header, edgeBottom), edged(groups, edgeTop), nil, nil, well)
 }
@@ -343,7 +345,7 @@ func (r *wellFooterRenderer) Layout(size fyne.Size) {
 		r.left.Show()
 		r.right.Show()
 		r.length.Text = fmt.Sprintf("%g mm", mm)
-		ts := fyne.MeasureText(r.length.Text, 12, fyne.TextStyle{})
+		ts := measure(r.length.Text, 12)
 		r.length.Move(fyne.NewPos(x+w+8, y-ts.Height/2))
 		r.length.Resize(ts)
 		x += w + 8 + ts.Width + 16
@@ -358,7 +360,7 @@ func (r *wellFooterRenderer) Layout(size fyne.Size) {
 			break
 		}
 	}
-	ts := fyne.MeasureText(r.caption.Text, 12, fyne.TextStyle{})
+	ts := measure(r.caption.Text, 12)
 	r.caption.Move(fyne.NewPos(size.Width-12-ts.Width, y-ts.Height/2))
 	r.caption.Resize(ts)
 }

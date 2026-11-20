@@ -204,7 +204,7 @@ func (r *tabRenderer) Layout(size fyne.Size) {
 	r.ring.Resize(fyne.NewSize(size.Width-6+2*ringWidth, size.Height-6+2*ringWidth))
 	r.bar.Move(fyne.NewPos(14, 2))
 	r.bar.Resize(fyne.NewSize(size.Width-28, 3))
-	ts := fyne.MeasureText(c.label, 14, fyne.TextStyle{})
+	ts := measure(c.label, 14)
 	extra := float32(0)
 	if c.toggles {
 		extra = 13
@@ -227,7 +227,7 @@ func (r *tabRenderer) Layout(size fyne.Size) {
 		r.badgeDot.Move(fyne.NewPos(cx-8, cy-8))
 		r.badgeDot.Resize(fyne.NewSize(16, 16))
 		r.count.Text = fmt.Sprintf("%d", c.badge)
-		cs := fyne.MeasureText(r.count.Text, 11, fyne.TextStyle{})
+		cs := measure(r.count.Text, 11)
 		r.count.Move(fyne.NewPos(cx-cs.Width/2, cy-cs.Height/2))
 		r.count.Resize(cs)
 	}
@@ -374,20 +374,16 @@ func (v *Viewer) bandsPage() fyne.CanvasObject {
 	strip := NewMultiRangeSlider(0, float64(bands[len(bands)-1].Threshold), bands)
 	strip.Compact = true
 	strip.OnChanged = func([]int) { v.debounced("bands", 60*time.Millisecond, v.applyPalette) }
-	var names []string
-	var idx []int
+	names := make([]string, len(bands))
 	for i, b := range bands {
-		if !b.IsTransparent {
-			names = append(names, b.Name)
-			idx = append(idx, i)
-		}
+		names[i] = b.Name
 	}
 	v.st.selectedBand = max(0, min(v.st.selectedBand, len(names)-1))
 	picker := newSegmented(names, v.st.selectedBand, func(i int) {
 		v.st.selectedBand = i
 		v.rebuild()
 	})
-	i := idx[v.st.selectedBand]
+	i := v.st.selectedBand
 	return vstack(8, head, strip, picker, v.bandOpacityRow(i, "Opacity", strip.GetBandAlpha(i)).obj)
 }
 

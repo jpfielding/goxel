@@ -73,7 +73,7 @@ func shrinkable(o fyne.CanvasObject) *fyne.Container {
 // text is one line of regular-weight text.
 func text(s string, size float32, c color.Color) *canvas.Text {
 	t := canvas.NewText(s, c)
-	t.TextSize = size
+	setFace(t, size)
 	return t
 }
 
@@ -196,15 +196,36 @@ func rowLabel(s string) fyne.CanvasObject {
 }
 
 // keyValue is a muted caption, then its value starting in the same column:
-// `Voxels   256 × 256 × 128`.
+// `Voxels   256 × 256 × 128`. A value too long for the row wraps, as roxel's
+// does, instead of widening the panel.
 func keyValue(key, value string) fyne.CanvasObject {
 	h, col, gap, size, keySize := float32(22), float32(68), float32(8), bodySize(), float32(13)
 	if uiTouch {
 		h, col, gap, keySize = 28, 84, 10, 14
 	}
-	// The value starts a row gap after the label column.
-	return minHeight(h, flexRow(gap, 1, fixedWidth(col, leftCentre(text(key, keySize, colMuted))),
-		leftCentre(text(value, size, colText))))
+	return container.New(keyValueLayout{col: col, gap: gap, h: h},
+		text(key, keySize, colMuted), newWrapped(value, size, colText))
+}
+
+// keyValueLayout places [key, value]: the key in a column of its own, the
+// value, wrapped, in the rest of the row. Both centre on the row, which is at
+// least h tall and as tall as the wrapped value needs.
+type keyValueLayout struct{ col, gap, h float32 }
+
+func (l keyValueLayout) Layout(objs []fyne.CanvasObject, size fyne.Size) {
+	key, value := objs[0], objs[1]
+	vw := max(size.Width-l.col-l.gap, 0)
+	value.Resize(fyne.NewSize(vw, l.h)) // wrapped text takes its height from its width
+	vs := fyne.NewSize(vw, value.MinSize().Height)
+	value.Resize(vs)
+	value.Move(fyne.NewPos(l.col+l.gap, (size.Height-vs.Height)/2))
+	ks := key.MinSize()
+	key.Resize(ks)
+	key.Move(fyne.NewPos(0, (size.Height-ks.Height)/2))
+}
+
+func (l keyValueLayout) MinSize(objs []fyne.CanvasObject) fyne.Size {
+	return fyne.NewSize(l.col+l.gap+objs[1].MinSize().Width, max(l.h, objs[1].MinSize().Height))
 }
 
 // note is wrapped muted body text.
@@ -442,7 +463,11 @@ func (r *wrappedRenderer) wrap(width float32) []string {
 	return wrapWords(r.w.text, r.w.size, width)
 }
 
-func (r *wrappedRenderer) lineHeight() float32 { return textHeight(r.w.size) + 2 }
+// eguiRowHeight is the height of one row of Ubuntu Light text as egui sets it:
+// ascent, descent and line gap (932, 189 and 28 units of a 1000-unit em).
+func eguiRowHeight(size float32) float32 { return size * 1.149 }
+
+func (r *wrappedRenderer) lineHeight() float32 { return eguiRowHeight(r.w.size) }
 
 func (r *wrappedRenderer) MinSize() fyne.Size {
 	return fyne.NewSize(40, r.lineHeight()*float32(len(r.wrap(r.w.Size().Width))))
@@ -460,8 +485,9 @@ func (r *wrappedRenderer) Layout(size fyne.Size) {
 			continue
 		}
 		t.Show()
-		t.Text, t.TextSize, t.Color = lines[i], r.w.size, r.w.color
-		ts := fyne.MeasureText(lines[i], r.w.size, fyne.TextStyle{})
+		t.Text, t.Color = lines[i], r.w.color
+		setFace(t, r.w.size)
+		ts := measure(lines[i], r.w.size)
 		x := float32(0)
 		if r.w.centre {
 			x = (size.Width - ts.Width) / 2
