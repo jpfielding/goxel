@@ -124,6 +124,9 @@ type FindingData struct {
 	Zeff    float64
 	Mass    float64
 
+	// Confidence is the source's own score, 0-1; zero when it gave none.
+	Confidence float64
+
 	Overlay *VolumeData
 	BBox    FindingBoundingBox
 

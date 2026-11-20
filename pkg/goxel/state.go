@@ -40,6 +40,14 @@ func layoutFromSize(w, h float32) layoutClass {
 
 func (l layoutClass) compact() bool { return l != layoutDesktop }
 
+// shelfInset is the shelf's padding at each side; the breakpoint measures the
+// column inside it, as roxel does.
+const shelfInset = 16
+
+// shelfThreeColumns is the shelf's inner width from which it has three columns
+// (windowing, palette, lighting); below it, two, with lighting in a menu.
+const shelfThreeColumns = 720
+
 // slicePanelWidth is the desktop 2D panel width: about a third of the window
 // so the slice is large, but never at the cost of the 3D column.
 func slicePanelWidth(window float32) float32 {
@@ -129,14 +137,15 @@ const (
 
 var qualityLabels = []string{"Fast", "Balanced", "High"}
 
-func (q renderQuality) stepSize() float64 {
+// stepVoxels is the ray step, in smallest voxels, as roxel steps.
+func (q renderQuality) stepVoxels() float64 {
 	switch q {
 	case qualityFast:
-		return 0.004
+		return 1.5
 	case qualityBalanced:
-		return 0.002
+		return 1.0
 	default:
-		return 0.001
+		return 0.5
 	}
 }
 
@@ -164,6 +173,11 @@ type uiState struct {
 	showSlicePlane bool
 	cutaway        bool
 	reverseCutaway bool
+
+	// Findings: boxes in the 3D view (on by default, as in roxel) and the
+	// selected row, or -1.
+	showFindingBoxes bool
+	selectedFinding  int
 
 	preset  palettePreset
 	bands   []volume.ColorBand
@@ -208,10 +222,13 @@ func newUIState() uiState {
 		specular:       volume.DefaultSpecular,
 		depthCue:       volume.DefaultDepthCue,
 		showSlicePlane: true,
-		orientation:    Coronal,
-		zoom2D:         100,
-		range3D:        windowRangeFor(32768, 65536),
-		range2D:        windowRangeFor(32768, 65536),
+
+		showFindingBoxes: true,
+		selectedFinding:  -1,
+		orientation:      Coronal,
+		zoom2D:           100,
+		range3D:          windowRangeFor(32768, 65536),
+		range2D:          windowRangeFor(32768, 65536),
 	}
 }
 

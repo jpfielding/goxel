@@ -116,8 +116,9 @@ type button struct {
 	minH     float32
 	size     float32 // text size; 0 means the button size
 	disabled bool
+	tipper
 
-	hovered, pressed bool
+	hovered, pressed, focused bool
 }
 
 func newButton(label string, onTap func()) *button {
@@ -149,12 +150,42 @@ func (b *button) Tapped(*fyne.PointEvent) {
 	}
 }
 
-func (b *button) MouseIn(*desktop.MouseEvent)    { b.hovered = true; b.Refresh() }
+func (b *button) MouseIn(*desktop.MouseEvent) {
+	b.hovered = true
+	b.hoverIn(b)
+	b.Refresh()
+}
 func (b *button) MouseMoved(*desktop.MouseEvent) {}
-func (b *button) MouseOut()                      { b.hovered, b.pressed = false, false; b.Refresh() }
-func (b *button) MouseDown(*desktop.MouseEvent)  { b.pressed = true; b.Refresh() }
-func (b *button) MouseUp(*desktop.MouseEvent)    { b.pressed = false; b.Refresh() }
-func (b *button) Cursor() desktop.Cursor         { return desktop.PointerCursor }
+func (b *button) MouseOut() {
+	b.hovered, b.pressed = false, false
+	b.hoverOut(b)
+	b.Refresh()
+}
+func (b *button) MouseDown(*desktop.MouseEvent) {
+	b.pressed = true
+	b.hoverOut(b)
+	unfocus(b) // a click is not keyboard focus
+	b.Refresh()
+}
+func (b *button) MouseUp(*desktop.MouseEvent) { b.pressed = false; b.Refresh() }
+func (b *button) Cursor() desktop.Cursor      { return desktop.PointerCursor }
+
+func (b *button) FocusGained()   { b.focused = true; b.Refresh() }
+func (b *button) FocusLost()     { b.focused = false; b.Refresh() }
+func (b *button) TypedRune(rune) {}
+func (b *button) TypedKey(e *fyne.KeyEvent) {
+	if isActivate(e) {
+		b.Tapped(nil)
+		return
+	}
+	passKey(b, e)
+}
+
+// withTip sets the tooltip shown after a short hover.
+func (b *button) withTip(s string) *button {
+	b.tip = s
+	return b
+}
 
 func (b *button) Enable()        { b.disabled = false; b.Refresh() }
 func (b *button) Disable()       { b.disabled = true; b.Refresh() }
@@ -175,6 +206,9 @@ func (b *button) textPx() float32 {
 	return buttonSize()
 }
 
+// iconGap is the space between a bracket icon and its label.
+const iconGap = 8
+
 func iconSide() float32 {
 	if uiTouch {
 		return 14
@@ -183,7 +217,7 @@ func iconSide() float32 {
 }
 
 func (b *button) CreateRenderer() fyne.WidgetRenderer {
-	r := &buttonRenderer{b: b, bg: rrect(colControl, colOutline, 5, 1), text: canvas.NewText("", colText)}
+	r := &buttonRenderer{b: b, bg: rrect(colControl, colOutline, 5, 1), text: canvas.NewText("", colText), ring: newRing(5)}
 	for i := range r.lines {
 		r.lines[i] = line(colText, 1.5)
 	}
@@ -193,6 +227,7 @@ func (b *button) CreateRenderer() fyne.WidgetRenderer {
 type buttonRenderer struct {
 	b     *button
 	bg    *canvas.Rectangle
+	ring  *canvas.Rectangle
 	text  *canvas.Text
 	lines [8]*canvas.Line
 }
@@ -208,7 +243,7 @@ func (r *buttonRenderer) MinSize() fyne.Size {
 	b := r.b
 	w := textWidth(b.label, b.textPx()) + 2*r.padX()
 	if b.icon == iconEnlarge || b.icon == iconReduce {
-		w += iconSide() + 4
+		w += iconSide() + iconGap
 	}
 	return fyne.NewSize(max(w, b.minW), max(controlHeight(), b.minH))
 }
@@ -216,6 +251,7 @@ func (r *buttonRenderer) MinSize() fyne.Size {
 func (r *buttonRenderer) Layout(size fyne.Size) {
 	b := r.b
 	r.bg.Resize(size)
+	ringRect(r.ring, size)
 	ts := fyne.MeasureText(b.label, b.textPx(), fyne.TextStyle{})
 	r.text.TextSize = b.textPx()
 	r.text.Text = b.label
@@ -223,10 +259,10 @@ func (r *buttonRenderer) Layout(size fyne.Size) {
 	switch b.icon {
 	case iconEnlarge, iconReduce:
 		side := iconSide()
-		total := side + 4 + ts.Width
+		total := side + iconGap + ts.Width
 		left := cx - total/2
 		r.layoutBracket(fyne.NewPos(left, cy-side/2), side)
-		r.text.Move(fyne.NewPos(left+side+4, cy-ts.Height/2))
+		r.text.Move(fyne.NewPos(left+side+iconGap, cy-ts.Height/2))
 	default:
 		r.text.Move(fyne.NewPos(cx-ts.Width/2, cy-ts.Height/2))
 		r.layoutChevron(fyne.NewPos(cx, cy))
@@ -295,7 +331,12 @@ func (r *buttonRenderer) Refresh() {
 		fill, stroke = colHover, colThumb
 	}
 	r.bg.FillColor, r.bg.StrokeColor = fill, stroke
+	r.bg.StrokeWidth = 1
+	if b.selected && !b.disabled && !b.primary && !b.pressed {
+		r.bg.StrokeWidth = 2 // a selected item's outline is 2 px, as in roxel
+	}
 	r.text.Color = fg
+	showWhen(r.ring, b.focused && !b.disabled)
 	for _, l := range r.lines {
 		l.StrokeColor = fg
 		l.Hide()
@@ -320,7 +361,7 @@ func (r *buttonRenderer) Objects() []fyne.CanvasObject {
 	for _, l := range r.lines {
 		objs = append(objs, l)
 	}
-	return objs
+	return append(objs, r.ring)
 }
 
 func (r *buttonRenderer) Destroy() {}
@@ -337,6 +378,7 @@ type segmented struct {
 	selected int
 	onSelect func(int)
 	disabled bool
+	focused  bool
 }
 
 func newSegmented(labels []string, selected int, onSelect func(int)) *segmented {
@@ -407,12 +449,42 @@ func (s *segmented) Tapped(e *fyne.PointEvent) {
 }
 
 func (s *segmented) Cursor() desktop.Cursor { return desktop.PointerCursor }
-func (s *segmented) Enable()                { s.disabled = false; s.Refresh() }
-func (s *segmented) Disable()               { s.disabled = true; s.Refresh() }
-func (s *segmented) Disabled() bool         { return s.disabled }
+
+// A click is not keyboard focus: it also hands keys back to the window.
+func (s *segmented) MouseDown(*desktop.MouseEvent) { unfocus(s) }
+func (s *segmented) MouseUp(*desktop.MouseEvent)   {}
+
+func (s *segmented) FocusGained()   { s.focused = true; s.Refresh() }
+func (s *segmented) FocusLost()     { s.focused = false; s.Refresh() }
+func (s *segmented) TypedRune(rune) {}
+
+// TypedKey: Left and Right move the selection, as in a group of radio buttons.
+func (s *segmented) TypedKey(e *fyne.KeyEvent) {
+	d := 0
+	switch e.Name {
+	case fyne.KeyLeft:
+		d = -1
+	case fyne.KeyRight:
+		d = 1
+	default:
+		passKey(s, e)
+		return
+	}
+	if i := s.selected + d; i >= 0 && i < len(s.labels) && !s.disabled {
+		s.selected = i
+		s.Refresh()
+		if s.onSelect != nil {
+			s.onSelect(i)
+		}
+	}
+}
+
+func (s *segmented) Enable()        { s.disabled = false; s.Refresh() }
+func (s *segmented) Disable()       { s.disabled = true; s.Refresh() }
+func (s *segmented) Disabled() bool { return s.disabled }
 
 func (s *segmented) CreateRenderer() fyne.WidgetRenderer {
-	r := &segmentedRenderer{s: s, frame: rrect(colBG, colHairline, 7, 1)}
+	r := &segmentedRenderer{s: s, frame: rrect(colBG, colHairline, 7, 1), ring: newRing(5)}
 	for range s.labels {
 		r.segs = append(r.segs, rrect(color.Transparent, color.Transparent, 5, 1))
 		r.texts = append(r.texts, canvas.NewText("", colMuted))
@@ -422,6 +494,7 @@ func (s *segmented) CreateRenderer() fyne.WidgetRenderer {
 
 type segmentedRenderer struct {
 	s     *segmented
+	ring  *canvas.Rectangle
 	frame *canvas.Rectangle
 	segs  []*canvas.Rectangle
 	texts []*canvas.Text
@@ -447,6 +520,11 @@ func (r *segmentedRenderer) Layout(size fyne.Size) {
 		r.texts[i].TextSize = segmentedSize()
 		r.texts[i].Move(fyne.NewPos(x+(w-ts.Width)/2, 3+(h-ts.Height)/2))
 		r.texts[i].Resize(ts)
+		if i == r.s.selected {
+			// The ring goes around the selected segment.
+			r.ring.Move(fyne.NewPos(x-ringWidth, 3-ringWidth))
+			r.ring.Resize(fyne.NewSize(w+2*ringWidth, h+2*ringWidth))
+		}
 		x += w + 2
 	}
 }
@@ -467,6 +545,7 @@ func (r *segmentedRenderer) Refresh() {
 		r.segs[i].FillColor, r.segs[i].StrokeColor = fill, stroke
 		r.texts[i].Text, r.texts[i].Color = r.s.labels[i], fg
 	}
+	showWhen(r.ring, r.s.focused && !r.s.disabled)
 	r.Layout(r.s.Size())
 	canvas.Refresh(r.frame)
 }
@@ -476,7 +555,7 @@ func (r *segmentedRenderer) Objects() []fyne.CanvasObject {
 	for i := range r.segs {
 		objs = append(objs, r.segs[i], r.texts[i])
 	}
-	return objs
+	return append(objs, r.ring)
 }
 
 func (r *segmentedRenderer) Destroy() {}
@@ -492,6 +571,8 @@ type checkbox struct {
 	onChanged func(bool)
 	disabled  bool
 	hovered   bool
+	focused   bool
+	tipper
 }
 
 func newCheckbox(label string, checked bool, onChanged func(bool)) *checkbox {
@@ -500,14 +581,9 @@ func newCheckbox(label string, checked bool, onChanged func(bool)) *checkbox {
 	return c
 }
 
-// newCheck is a checkbox that gives keyboard focus back after each toggle.
+// newCheck is a checkbox whose toggle calls onChanged.
 func newCheck(label string, checked bool, onChanged func(bool)) *checkbox {
-	c := newCheckbox(label, checked, nil)
-	c.onChanged = func(b bool) {
-		onChanged(b)
-		unfocus(c)
-	}
-	return c
+	return newCheckbox(label, checked, onChanged)
 }
 
 // SetChecked changes the box without calling onChanged.
@@ -529,13 +605,43 @@ func (c *checkbox) Tapped(*fyne.PointEvent) {
 	}
 }
 
-func (c *checkbox) MouseIn(*desktop.MouseEvent)    { c.hovered = true; c.Refresh() }
+func (c *checkbox) MouseIn(*desktop.MouseEvent) {
+	c.hovered = true
+	c.hoverIn(c)
+	c.Refresh()
+}
 func (c *checkbox) MouseMoved(*desktop.MouseEvent) {}
-func (c *checkbox) MouseOut()                      { c.hovered = false; c.Refresh() }
-func (c *checkbox) Cursor() desktop.Cursor         { return desktop.PointerCursor }
-func (c *checkbox) Enable()                        { c.disabled = false; c.Refresh() }
-func (c *checkbox) Disable()                       { c.disabled = true; c.Refresh() }
-func (c *checkbox) Disabled() bool                 { return c.disabled }
+func (c *checkbox) MouseOut() {
+	c.hovered = false
+	c.hoverOut(c)
+	c.Refresh()
+}
+func (c *checkbox) MouseDown(*desktop.MouseEvent) {
+	c.hoverOut(c)
+	unfocus(c) // a click is not keyboard focus
+}
+func (c *checkbox) MouseUp(*desktop.MouseEvent) {}
+func (c *checkbox) Cursor() desktop.Cursor      { return desktop.PointerCursor }
+
+func (c *checkbox) FocusGained()   { c.focused = true; c.Refresh() }
+func (c *checkbox) FocusLost()     { c.focused = false; c.Refresh() }
+func (c *checkbox) TypedRune(rune) {}
+func (c *checkbox) TypedKey(e *fyne.KeyEvent) {
+	if isActivate(e) {
+		c.Tapped(nil)
+		return
+	}
+	passKey(c, e)
+}
+
+// withTip sets the tooltip shown after a short hover.
+func (c *checkbox) withTip(s string) *checkbox {
+	c.tip = s
+	return c
+}
+func (c *checkbox) Enable()        { c.disabled = false; c.Refresh() }
+func (c *checkbox) Disable()       { c.disabled = true; c.Refresh() }
+func (c *checkbox) Disabled() bool { return c.disabled }
 
 func (c *checkbox) side() float32 {
 	if uiTouch {
@@ -555,13 +661,14 @@ func (c *checkbox) gap() float32 {
 }
 
 func (c *checkbox) CreateRenderer() fyne.WidgetRenderer {
-	r := &checkboxRenderer{c: c, box: rrect(colBG, colOutline, 4, 1.5), text: canvas.NewText("", colText)}
+	r := &checkboxRenderer{c: c, box: rrect(colBG, colOutline, 4, 1.5), text: canvas.NewText("", colText), ring: newRing(4)}
 	r.tick[0], r.tick[1] = line(colBG, 2), line(colBG, 2)
 	return r
 }
 
 type checkboxRenderer struct {
 	c    *checkbox
+	ring *canvas.Rectangle
 	box  *canvas.Rectangle
 	tick [2]*canvas.Line
 	text *canvas.Text
@@ -583,6 +690,7 @@ func (r *checkboxRenderer) Layout(size fyne.Size) {
 	r.text.TextSize = bodySize()
 	r.text.Move(fyne.NewPos(side+c.gap(), (size.Height-ts.Height)/2))
 	r.text.Resize(ts)
+	ringRect(r.ring, size)
 	s := side * 0.26
 	cx, cy := side/2, top+side/2
 	r.tick[0].Position1, r.tick[0].Position2 = fyne.NewPos(cx-s, cy), fyne.NewPos(cx-s*0.25, cy+s*0.75)
@@ -610,12 +718,13 @@ func (r *checkboxRenderer) Refresh() {
 		}
 	}
 	r.text.Text, r.text.Color = c.label, fg
+	showWhen(r.ring, c.focused && !c.disabled)
 	r.Layout(c.Size())
 	canvas.Refresh(r.box)
 }
 
 func (r *checkboxRenderer) Objects() []fyne.CanvasObject {
-	return []fyne.CanvasObject{r.box, r.tick[0], r.tick[1], r.text}
+	return []fyne.CanvasObject{r.box, r.tick[0], r.tick[1], r.text, r.ring}
 }
 
 func (r *checkboxRenderer) Destroy() {}
@@ -630,13 +739,18 @@ type track struct {
 	value     float64
 	decimals  int
 	onChanged func(float64)
-	onEnd     func(float64) // a drag ended or the rail was tapped
+	onEnd     func(float64) // a drag ended, the rail was tapped or a key moved it
 	disabled  bool
 	dragging  bool
+	focused   bool
+
+	// What an arrow key does: one step, kept inside [limLo, limHi].
+	step         float64
+	limLo, limHi float64
 }
 
 func newTrack(lo, hi, value float64, decimals int) *track {
-	t := &track{lo: lo, hi: hi, value: value, decimals: decimals}
+	t := &track{lo: lo, hi: hi, value: value, decimals: decimals, step: 1, limLo: lo, limHi: hi}
 	t.ExtendBaseWidget(t)
 	return t
 }
@@ -713,9 +827,49 @@ func (t *track) DragEnd() {
 }
 
 func (t *track) Cursor() desktop.Cursor { return desktop.PointerCursor }
-func (t *track) Enable()                { t.disabled = false; t.Refresh() }
-func (t *track) Disable()               { t.disabled = true; t.Refresh() }
-func (t *track) Disabled() bool         { return t.disabled }
+
+// A click is not keyboard focus: it hands keys back to the window (Esc, arrow
+// keys stepping slices) and commits a number being typed.
+func (t *track) MouseDown(*desktop.MouseEvent) { unfocus(t) }
+func (t *track) MouseUp(*desktop.MouseEvent)   {}
+
+func (t *track) FocusGained()   { t.focused = true; t.Refresh() }
+func (t *track) FocusLost()     { t.focused = false; t.Refresh() }
+func (t *track) TypedRune(rune) {}
+
+// TypedKey: the arrow keys move the thumb one step; each press is final, like
+// a stepper press.
+func (t *track) TypedKey(e *fyne.KeyEvent) {
+	d := 0.0
+	switch e.Name {
+	case fyne.KeyLeft, fyne.KeyDown:
+		d = -t.step
+	case fyne.KeyRight, fyne.KeyUp:
+		d = t.step
+	case fyne.KeyHome:
+		d = t.limLo - t.value
+	case fyne.KeyEnd:
+		d = t.limHi - t.value
+	default:
+		passKey(t, e)
+		return
+	}
+	if t.disabled {
+		return
+	}
+	v := math.Max(t.limLo, math.Min(t.limHi, t.snap(t.value+d)))
+	if v == t.value {
+		return
+	}
+	t.set(v)
+	if t.onEnd != nil {
+		t.onEnd(v)
+	}
+}
+
+func (t *track) Enable()        { t.disabled = false; t.Refresh() }
+func (t *track) Disable()       { t.disabled = true; t.Refresh() }
+func (t *track) Disabled() bool { return t.disabled }
 
 func (t *track) CreateRenderer() fyne.WidgetRenderer {
 	return &trackRenderer{
@@ -723,6 +877,7 @@ func (t *track) CreateRenderer() fyne.WidgetRenderer {
 		rail: rrect(colRail, color.Transparent, 2, 0),
 		fill: rrect(colAccent, color.Transparent, 2, 0),
 		knob: canvas.NewCircle(colThumb),
+		ring: canvas.NewCircle(color.Transparent),
 	}
 }
 
@@ -731,6 +886,7 @@ type trackRenderer struct {
 	rail *canvas.Rectangle
 	fill *canvas.Rectangle
 	knob *canvas.Circle
+	ring *canvas.Circle
 }
 
 func (r *trackRenderer) MinSize() fyne.Size { return fyne.NewSize(40, rowHeight()) }
@@ -762,6 +918,10 @@ func (r *trackRenderer) Layout(size fyne.Size) {
 	rr := rad + grow
 	r.knob.Move(fyne.NewPos(x-rr, y-rr))
 	r.knob.Resize(fyne.NewSize(2*rr, 2*rr))
+	// The focus ring circles the thumb, 3 px out (its outer edge is 4 px out).
+	rg := rr + 2 + ringWidth
+	r.ring.Move(fyne.NewPos(x-rg, y-rg))
+	r.ring.Resize(fyne.NewSize(2*rg, 2*rg))
 }
 
 func (r *trackRenderer) Refresh() {
@@ -771,12 +931,14 @@ func (r *trackRenderer) Refresh() {
 	}
 	r.rail.FillColor, r.fill.FillColor, r.knob.FillColor = rail, fill, knob
 	r.knob.StrokeColor, r.knob.StrokeWidth = colBG, 1.5
+	r.ring.StrokeColor, r.ring.StrokeWidth = colAccent, ringWidth
+	showWhen(r.ring, r.t.focused && !r.t.disabled)
 	r.Layout(r.t.Size())
 	canvas.Refresh(r.rail)
 }
 
 func (r *trackRenderer) Objects() []fyne.CanvasObject {
-	return []fyne.CanvasObject{r.rail, r.fill, r.knob}
+	return []fyne.CanvasObject{r.rail, r.fill, r.knob, r.ring}
 }
 
 func (r *trackRenderer) Destroy() {}
@@ -1039,6 +1201,7 @@ func (r *sliderRow) updateSteppers() {
 // SetRange changes what the track covers and the total shown beside the value.
 func (r *sliderRow) SetRange(lo, hi float64, total int) {
 	r.spec.lo, r.spec.hi, r.spec.limLo, r.spec.limHi, r.spec.total = lo, hi, lo, hi, total
+	r.track.limLo, r.track.limHi = lo, hi
 	r.track.SetRange(lo, hi)
 	r.show(r.track.value)
 }
@@ -1066,6 +1229,7 @@ func newSliderRow(spec sliderSpec, value float64, onChanged, onCommitted func(fl
 	value = math.Max(spec.limLo, math.Min(spec.limHi, value))
 	r := &sliderRow{spec: spec, change: onChanged, onEnd: onCommitted}
 	r.track = newTrack(spec.lo, spec.hi, value, spec.decimals)
+	r.track.step, r.track.limLo, r.track.limHi = spec.step, spec.limLo, spec.limHi
 	r.track.onChanged = func(v float64) {
 		r.show(v)
 		if onChanged != nil {
@@ -1073,8 +1237,7 @@ func newSliderRow(spec sliderSpec, value float64, onChanged, onCommitted func(fl
 		}
 	}
 	r.track.onEnd = func(v float64) {
-		// Hand keys back to the window (Esc, arrow-key slice stepping).
-		unfocus(r.track)
+		r.show(v)
 		if onCommitted != nil {
 			onCommitted(v)
 		}

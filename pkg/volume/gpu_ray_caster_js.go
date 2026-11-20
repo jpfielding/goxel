@@ -103,6 +103,7 @@ type GPUVolumeRenderer struct {
 	scaleY            float64
 	scaleZ            float64
 	stepSize          float64
+	stepVoxels        float64 // when above zero, the step in voxels (see rayStep); else stepSize
 	densityThreshold  float64
 	ambientIntensity  float64
 	diffuseIntensity  float64
@@ -541,6 +542,16 @@ func (gr *GPUVolumeRenderer) SetStepSize(step float64) {
 	gr.mu.Unlock()
 }
 
+// SetStepVoxels sets the ray step as a fraction of the smallest voxel, as roxel
+// does: the step shrinks as the camera backs off, so a thin shell is still
+// sampled from far away.
+func (gr *GPUVolumeRenderer) SetStepVoxels(n float64) {
+	gr.mu.Lock()
+	gr.stepVoxels = n
+	gr.needsRender = true
+	gr.mu.Unlock()
+}
+
 // SetRenderSize asks for a new render target size, applied before the next frame.
 func (gr *GPUVolumeRenderer) SetRenderSize(width, height int) {
 	width, height = clampRenderSize(width), clampRenderSize(height)
@@ -783,7 +794,7 @@ func (gr *GPUVolumeRenderer) Render() (result *image.RGBA) {
 	gr.needsTransferUpload = false
 	rotX, rotY, zoom := gr.rotationX, gr.rotationY, gr.zoom
 	scaleY, scaleZ := float32(gr.scaleY), float32(gr.scaleZ)
-	stepSize := gr.stepSize
+	stepSize, stepVoxels := gr.stepSize, gr.stepVoxels
 	resize := gr.wantWidth != gr.renderWidth || gr.wantHeight != gr.renderHeight
 	if resize {
 		gr.renderWidth, gr.renderHeight = gr.wantWidth, gr.wantHeight
@@ -842,7 +853,11 @@ func (gr *GPUVolumeRenderer) Render() (result *image.RGBA) {
 	gl.Call("uniform3f", u["camUp"], ux, uy, uz)
 	gl.Call("uniform1f", u["fov"], 0.8)
 	gl.Call("uniform1f", u["aspectRatio"], float32(w)/float32(h))
-	gl.Call("uniform1f", u["stepSize"], stepSize*math.Max(0.5, math.Min(5.0, zoom)))
+	var first *ActiveVolume
+	if len(vols) > 0 {
+		first = vols[0]
+	}
+	gl.Call("uniform1f", u["stepSize"], rayStep(stepSize, stepVoxels, first, float64(scaleY), float64(scaleZ), zoom))
 	gl.Call("uniform1f", u["scaleY"], scaleY)
 	gl.Call("uniform1f", u["scaleZ"], scaleZ)
 	gl.Call("uniform1f", u["ambientIntensity"], amb)

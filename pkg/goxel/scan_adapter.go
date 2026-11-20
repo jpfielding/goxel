@@ -60,28 +60,6 @@ func (v *Viewer) SetScanData(scan *ScanCollection) error {
 		}
 	}
 
-	// Finding overlays become disabled composite entries with a bounding box.
-	for _, finding := range scan.Findings {
-		if finding.Overlay == nil {
-			continue
-		}
-		ov := finding.Overlay
-		name := "finding_" + finding.Name
-		v.compositeVolumes[name] = &CompositeVolume{
-			Name:      name,
-			PixelData: framesOf(ov.Data, ov.Width, ov.Height, ov.Depth),
-			Rows:      ov.Height,
-			Cols:      ov.Width,
-			Alpha:     0.1,
-			BBox: &BoundingBox3D{
-				X: finding.BBox.MinX, Y: finding.BBox.MinY, Z: finding.BBox.MinZ,
-				Width:  finding.BBox.MaxX - finding.BBox.MinX,
-				Height: finding.BBox.MaxY - finding.BBox.MinY,
-				Depth:  finding.BBox.MaxZ - finding.BBox.MinZ,
-			},
-		}
-	}
-
 	// Projections are 2D only.
 	v.projections = make(map[string]*CompositeVolume)
 	for name, proj := range scan.Projections {
@@ -100,30 +78,24 @@ func (v *Viewer) SetScanData(scan *ScanCollection) error {
 
 	// Display defaults for a new study, as roxel opens one: the coronal plane
 	// at its middle slice, the file's own window (or one derived from the
-	// data), the slice plane outlined in the 3D view.
-	pc := v.compositeVolumes[primaryKey]
-	v.st.windowCenter3D, v.st.windowWidth3D = pc.WindowCenter, pc.WindowWidth
-	v.st.windowCenter2D, v.st.windowWidth2D = pc.WindowCenter, pc.WindowWidth
-	v.st.range3D = windowRangeFor(pc.WindowCenter, pc.WindowWidth)
-	v.st.range2D = v.st.range3D
+	// data), the slice plane outlined in the 3D view, every finding shown.
 	v.st.orientation = Coronal
 	v.st.composite = false
 	v.st.zoom2D = 100
 	v.st.cutaway = false
 	v.st.reverseCutaway = false
+	v.prepareFindings()
+	// A study opened on a phone starts on the 3D view with its controls open.
+	v.st.phoneTab = tabView3D
+	v.st.sheetOpen = true
+	v.st.bandsOpen = false
 
-	v.dicox.SetRescale(pc.RescaleIntercept)
-	v.dicox.SetWindowLevel(int(v.st.windowCenter2D))
-	v.dicox.SetWindowWidth(int(v.st.windowWidth2D))
 	v.dicox.SetCompositeMode(false)
 	v.dicox.SetAlphaScale(v.st.opacity)
 	v.interactiveView.SetZoom(100)
-	v.set2DSource(primaryKey)
-
-	v.volumeRenderer.SetBoxScale(boxScaleFor(primary))
-	v.setup3DView()
+	v.interactiveView.centre()
 	v.volumeRenderer.ResetView()
-	v.volumeRenderer.FitView()
+	v.showVolume(primaryKey, true)
 
 	slog.Info("Scan data loaded",
 		slog.String("primary", primaryKey),

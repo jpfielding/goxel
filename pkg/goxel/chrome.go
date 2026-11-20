@@ -28,7 +28,7 @@ func (v *Viewer) appBar() fyne.CanvasObject {
 		vpad = 6
 	}
 	bar := panel(colPanel, 0, inset(16, vpad, minHeight(28, border(nil, nil, left, nil, shrinkable(orSpacer(right))))))
-	return border(nil, hairline(), nil, nil, bar)
+	return edged(bar, edgeBottom)
 }
 
 // orSpacer returns o, or an empty object when o is nil.
@@ -45,11 +45,11 @@ func navigationText(st *uiState, touch bool) string {
 		if touch {
 			return "Drag to pan  ·  Pinch to zoom"
 		}
-		return "Drag to pan  ·  Zoom with the slider  ·  Esc to exit focus"
+		return "Drag to pan  ·  Ctrl + scroll to zoom  ·  Esc to exit focus"
 	}
 	switch {
 	case touch:
-		return "Drag to orbit  ·  Pinch to zoom  ·  Use Pan on the Camera page to pan"
+		return "Drag to orbit  ·  Pinch to zoom  ·  Two fingers to pan"
 	case st.focusVolume:
 		return "Drag to orbit  ·  Shift + drag to pan  ·  Scroll to zoom  ·  Esc to exit focus"
 	default:
@@ -59,10 +59,12 @@ func navigationText(st *uiState, touch bool) string {
 
 func (v *Viewer) statusBar() fyne.CanvasObject {
 	t := text(navigationText(&v.st, hasTouch()), 12, colMuted)
-	return border(hairline(), nil, nil, nil, panel(colBG, 0, inset(16, 5, shrinkable(leftCentre(t)))))
+	return edged(panel(colBG, 0, inset(16, 5, shrinkable(leftCentre(t)))), edgeTop)
 }
 
-// emptyState is the first-use card: what this is and the one action.
+// emptyState is the first-use card: what this is and the one action. In
+// landscape on a phone it is too short to stack, so the message is on the
+// left and the actions on the right.
 func (v *Viewer) emptyState() fyne.CanvasObject {
 	compact := v.st.layout.compact()
 	markSize := float32(64)
@@ -85,24 +87,57 @@ func (v *Viewer) emptyState() fyne.CanvasObject {
 	fmtNote.centre = true
 	fmtNote.size = 12
 
-	card := vstack(8,
-		container.NewCenter(markImage(markSize)),
-		container.NewCenter(title),
-		intro,
-		v.openButtons(true),
-		v.loadStatus(),
-		fmtNote,
-	)
-	width := float32(320)
+	// Gaps are roxel's: its row spacing (8) plus the space it adds by hand.
+	message := vstack(0, container.NewCenter(markImage(markSize)), gap(20),
+		container.NewCenter(title), gap(12), intro)
+	actions := []fyne.CanvasObject{v.openButtons(true), gap(12)}
+	if v.st.loadingFile != "" || v.st.loadError != "" {
+		actions = append(actions, v.loadStatus(), gap(8))
+	}
+	actions = append(actions, fmtNote)
+	acts := vstack(0, actions...)
+
+	if v.st.layout == layoutPhoneLandscape {
+		return panel(colBG, 24, container.NewVScroll(container.New(&splitEmpty{gap: 10}, message, acts)))
+	}
+	width := float32(280)
 	if compact {
 		width = 340
 	}
-	top := float32(0.22)
+	top := float32(0.26)
+	if compact {
+		top = 0.2
+	}
+	card := vstack(0, message, gap(28), acts)
 	return panel(colBG, 24, container.NewVScroll(container.New(&centredColumn{width: width, top: top}, card)))
 }
 
+// gap is empty vertical space of height h in a vstack(0).
+func gap(h float32) fyne.CanvasObject { return minHeight(h, vstack(0)) }
+
+// splitEmpty lays out the landscape empty state: two equal columns, the
+// message left and the actions right (at most 320 wide, a little lower).
+type splitEmpty struct{ gap float32 }
+
+func (l *splitEmpty) Layout(objs []fyne.CanvasObject, size fyne.Size) {
+	message, actions := objs[0], objs[1]
+	col := (size.Width - l.gap) / 2
+	mh, ah := message.MinSize().Height, actions.MinSize().Height
+	top := max((size.Height-190)/2, 4)
+	message.Resize(fyne.NewSize(col, mh))
+	message.Move(fyne.NewPos(0, top))
+	aw := min(col, 320)
+	actions.Resize(fyne.NewSize(aw, ah))
+	actions.Move(fyne.NewPos(col+l.gap+(col-aw)/2, top+30))
+}
+
+func (l *splitEmpty) MinSize(objs []fyne.CanvasObject) fyne.Size {
+	h := max(objs[0].MinSize().Height, objs[1].MinSize().Height+30)
+	return fyne.NewSize(240, h+4)
+}
+
 // centredColumn centres one child horizontally at a fixed width and places
-// it a fraction of the way down.
+// it a fraction of the area's height down (at least 16 from the top).
 type centredColumn struct {
 	width, top float32
 }
@@ -112,7 +147,7 @@ func (c *centredColumn) Layout(objs []fyne.CanvasObject, size fyne.Size) {
 		w := min(c.width, size.Width)
 		h := o.MinSize().Height
 		o.Resize(fyne.NewSize(w, h))
-		o.Move(fyne.NewPos((size.Width-w)/2, max((size.Height-h)*c.top, 0)))
+		o.Move(fyne.NewPos((size.Width-w)/2, max(size.Height*c.top, 16)))
 	}
 }
 
@@ -121,7 +156,7 @@ func (c *centredColumn) MinSize(objs []fyne.CanvasObject) fyne.Size {
 	for _, o := range objs {
 		h = max(h, o.MinSize().Height)
 	}
-	return fyne.NewSize(min(c.width, 240), h)
+	return fyne.NewSize(min(c.width, 240), h+16)
 }
 
 // openButtons: "Open file…" (primary on first use) and "Open folder…" on
@@ -151,7 +186,8 @@ func (v *Viewer) openButtons(primary bool) fyne.CanvasObject {
 	return vstack(8, open, second)
 }
 
-// loadStatus: a spinner while loading, or the last error with a retry hint.
+// loadStatus: a spinner while loading, or the last error with a retry hint;
+// nil when there is neither.
 func (v *Viewer) loadStatus() fyne.CanvasObject {
 	switch {
 	case v.st.loadingFile != "":
@@ -160,5 +196,5 @@ func (v *Viewer) loadStatus() fyne.CanvasObject {
 	case v.st.loadError != "":
 		return vstack(4, newWrapped(v.st.loadError, bodySize(), colDanger), note("Choose a DICOM .dcm or .dcs file to try again."))
 	}
-	return vstack(0)
+	return nil
 }

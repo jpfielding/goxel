@@ -7,6 +7,7 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/driver/desktop"
 	"fyne.io/fyne/v2/widget"
 )
 
@@ -101,6 +102,24 @@ func (l marginLayout) MinSize(objs []fyne.CanvasObject) fyne.Size {
 	return m.Add(fyne.NewSize(2*l.x, 2*l.y))
 }
 
+// insetsLayout insets its children by a different amount on each side.
+type insetsLayout struct{ left, right, top, bottom float32 }
+
+func (l insetsLayout) Layout(objs []fyne.CanvasObject, size fyne.Size) {
+	for _, o := range objs {
+		o.Move(fyne.NewPos(l.left, l.top))
+		o.Resize(fyne.NewSize(max(size.Width-l.left-l.right, 0), max(size.Height-l.top-l.bottom, 0)))
+	}
+}
+
+func (l insetsLayout) MinSize(objs []fyne.CanvasObject) fyne.Size {
+	var m fyne.Size
+	for _, o := range objs {
+		m = m.Max(o.MinSize())
+	}
+	return m.Add(fyne.NewSize(l.left+l.right, l.top+l.bottom))
+}
+
 func inset(x, y float32, o fyne.CanvasObject) *fyne.Container {
 	return container.New(marginLayout{x, y}, o)
 }
@@ -145,16 +164,17 @@ func markImage(size float32) fyne.CanvasObject {
 // sectionTitle is a group heading with an optional muted note at the right,
 // such as the scale its numbers are in.
 func sectionTitle(title, note string) fyne.CanvasObject {
-	size, noteSize := float32(14.5), float32(12)
+	size, noteSize, height := float32(14.5), float32(12), float32(28)
 	if uiTouch {
-		size, noteSize = 16, 13
+		size, noteSize, height = 16, 13, touchTarget
 	}
 	h := leftCentre(text(title, size, colHeading))
 	var row fyne.CanvasObject = h
 	if note != "" {
 		row = border(nil, nil, nil, rightCentre(text(note, noteSize, colMuted)), h)
 	}
-	return minHeight(20, row)
+	// A heading is a full row, as in roxel: its text sits mid-row.
+	return minHeight(height, row)
 }
 
 // pageTitle is the name of a panel or page: its largest text.
@@ -178,11 +198,12 @@ func rowLabel(s string) fyne.CanvasObject {
 // keyValue is a muted caption, then its value starting in the same column:
 // `Voxels   256 × 256 × 128`.
 func keyValue(key, value string) fyne.CanvasObject {
-	h, col, size, keySize := float32(22), float32(68), bodySize(), float32(13)
+	h, col, gap, size, keySize := float32(22), float32(68), float32(8), bodySize(), float32(13)
 	if uiTouch {
-		h, col, keySize = 28, 84, 14
+		h, col, gap, keySize = 28, 84, 10, 14
 	}
-	return minHeight(h, flexRow(0, 1, fixedWidth(col, leftCentre(text(key, keySize, colMuted))),
+	// The value starts a row gap after the label column.
+	return minHeight(h, flexRow(gap, 1, fixedWidth(col, leftCentre(text(key, keySize, colMuted))),
 		leftCentre(text(value, size, colText))))
 }
 
@@ -196,6 +217,44 @@ func hairline() fyne.CanvasObject {
 	r := filled(colHairline)
 	r.SetMinSize(fyne.NewSize(1, 1))
 	return r
+}
+
+// edgeSide is the side of a panel its separator line is on.
+type edgeSide int
+
+const (
+	edgeTop edgeSide = iota
+	edgeBottom
+	edgeLeft
+	edgeRight
+)
+
+// edgeLayout draws a one-pixel line along one side of the area it is given.
+type edgeLineLayout struct{ side edgeSide }
+
+func (l edgeLineLayout) Layout(objs []fyne.CanvasObject, size fyne.Size) {
+	switch l.side {
+	case edgeTop:
+		objs[0].Move(fyne.NewPos(0, 0))
+		objs[0].Resize(fyne.NewSize(size.Width, 1))
+	case edgeBottom:
+		objs[0].Move(fyne.NewPos(0, size.Height-1))
+		objs[0].Resize(fyne.NewSize(size.Width, 1))
+	case edgeLeft:
+		objs[0].Move(fyne.NewPos(0, 0))
+		objs[0].Resize(fyne.NewSize(1, size.Height))
+	default:
+		objs[0].Move(fyne.NewPos(size.Width-1, 0))
+		objs[0].Resize(fyne.NewSize(1, size.Height))
+	}
+}
+
+func (edgeLineLayout) MinSize([]fyne.CanvasObject) fyne.Size { return fyne.NewSize(1, 1) }
+
+// edged draws a panel's separator line on one of its sides, over the panel
+// rather than beside it: as in roxel, the line takes no room of its own.
+func edged(content fyne.CanvasObject, side edgeSide) fyne.CanvasObject {
+	return container.NewStack(content, container.New(edgeLineLayout{side}, filled(colHairline)))
 }
 
 // ruleLayout centres a one-pixel line in a nine-pixel row.
@@ -230,11 +289,13 @@ func unfocus(o fyne.CanvasObject) {
 	}
 }
 
-// tapArea makes any content tappable.
+// tapArea makes any content tappable; it takes keyboard focus (Space or
+// Enter taps) and rings its content while it has it.
 type tapArea struct {
 	widget.BaseWidget
 	content fyne.CanvasObject
 	onTap   func()
+	focused bool
 }
 
 func newTapArea(content fyne.CanvasObject, onTap func()) *tapArea {
@@ -249,9 +310,45 @@ func (t *tapArea) Tapped(*fyne.PointEvent) {
 	}
 }
 
-func (t *tapArea) CreateRenderer() fyne.WidgetRenderer {
-	return widget.NewSimpleRenderer(t.content)
+func (t *tapArea) MouseDown(*desktop.MouseEvent) { unfocus(t) }
+func (t *tapArea) MouseUp(*desktop.MouseEvent)   {}
+func (t *tapArea) Cursor() desktop.Cursor        { return desktop.PointerCursor }
+
+func (t *tapArea) FocusGained()   { t.focused = true; t.Refresh() }
+func (t *tapArea) FocusLost()     { t.focused = false; t.Refresh() }
+func (t *tapArea) TypedRune(rune) {}
+func (t *tapArea) TypedKey(e *fyne.KeyEvent) {
+	if isActivate(e) {
+		t.Tapped(nil)
+		return
+	}
+	passKey(t, e)
 }
+
+func (t *tapArea) CreateRenderer() fyne.WidgetRenderer {
+	return &tapAreaRenderer{t: t, ring: newRing(4)}
+}
+
+type tapAreaRenderer struct {
+	t    *tapArea
+	ring *canvas.Rectangle
+}
+
+func (r *tapAreaRenderer) MinSize() fyne.Size { return r.t.content.MinSize() }
+func (r *tapAreaRenderer) Layout(size fyne.Size) {
+	r.t.content.Move(fyne.NewPos(0, 0))
+	r.t.content.Resize(size)
+	ringRect(r.ring, size)
+}
+func (r *tapAreaRenderer) Refresh() {
+	showWhen(r.ring, r.t.focused)
+	r.Layout(r.t.Size())
+	canvas.Refresh(r.ring)
+}
+func (r *tapAreaRenderer) Objects() []fyne.CanvasObject {
+	return []fyne.CanvasObject{r.t.content, r.ring}
+}
+func (r *tapAreaRenderer) Destroy() {}
 
 // chevronLayout draws a small chevron: down when open, right when closed.
 type chevronLayout struct{ open bool }
@@ -304,16 +401,38 @@ func wrapWords(s string, size, width float32) []string {
 		return []string{""}
 	}
 	var lines []string
-	cur := words[0]
-	for _, word := range words[1:] {
-		if textWidth(cur+" "+word, size) <= width {
+	cur := ""
+	for _, word := range words {
+		if cur != "" && textWidth(cur+" "+word, size) <= width {
 			cur += " " + word
 			continue
 		}
-		lines = append(lines, cur)
+		if cur != "" {
+			lines = append(lines, cur)
+		}
+		// A word wider than the line is broken where it must be.
+		for width > 8 && textWidth(word, size) > width {
+			cut := breakAt(word, size, width)
+			lines = append(lines, word[:cut])
+			word = word[cut:]
+		}
 		cur = word
 	}
 	return append(lines, cur)
+}
+
+// breakAt is the byte length of the longest prefix of s that fits width (at
+// least one character).
+func breakAt(s string, size, width float32) int {
+	cut := 0
+	for i, r := range s {
+		end := i + len(string(r))
+		if textWidth(s[:end], size) > width && cut > 0 {
+			break
+		}
+		cut = end
+	}
+	return cut
 }
 
 func (r *wrappedRenderer) wrap(width float32) []string {

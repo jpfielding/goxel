@@ -76,6 +76,7 @@ type GPUVolumeRenderer struct {
 	scaleY            float64 // Y extent of the box relative to X
 	scaleZ            float64 // Z extent of the box relative to X
 	stepSize          float64
+	stepVoxels        float64 // when above zero, the step in voxels (see rayStep); else stepSize
 	densityThreshold  float64 // Clips voxels below this normalized density (0-1)
 	ambientIntensity  float64 // Ambient lighting coefficient (0-1)
 	diffuseIntensity  float64 // Diffuse lighting coefficient (0-1)
@@ -656,6 +657,16 @@ func (gr *GPUVolumeRenderer) SetStepSize(step float64) {
 	gr.mu.Unlock()
 }
 
+// SetStepVoxels sets the ray step as a fraction of the smallest voxel, as roxel
+// does: the step shrinks as the camera backs off, so a thin shell is still
+// sampled from far away.
+func (gr *GPUVolumeRenderer) SetStepVoxels(n float64) {
+	gr.mu.Lock()
+	gr.stepVoxels = n
+	gr.needsRender = true
+	gr.mu.Unlock()
+}
+
 // SetRenderSize asks for a new render target size; it is applied before the
 // next frame. Sizes are clamped to a sane range.
 func (gr *GPUVolumeRenderer) SetRenderSize(width, height int) {
@@ -1082,7 +1093,7 @@ func (gr *GPUVolumeRenderer) renderInternal() *image.RGBA {
 	zoom := gr.zoom
 	alpha := float32(gr.alphaScale)
 	scaleY, scaleZ := float32(gr.scaleY), float32(gr.scaleZ)
-	stepSize := gr.stepSize
+	stepSize, stepVoxels := gr.stepSize, gr.stepVoxels
 	resize := gr.wantWidth != gr.renderWidth || gr.wantHeight != gr.renderHeight
 	if resize {
 		gr.renderWidth, gr.renderHeight = gr.wantWidth, gr.wantHeight
@@ -1193,8 +1204,11 @@ func (gr *GPUVolumeRenderer) renderInternal() *image.RGBA {
 	gl.Uniform1f(gr.uniforms.aspectRatio, float32(width)/float32(height))
 	// Adaptive step size: scale by zoom for better interactivity when zoomed out,
 	// finer quality when zoomed in. At zoom=1.0, step equals the configured base.
-	clampedZoom := math.Max(0.5, math.Min(5.0, zoom))
-	adaptiveStep := stepSize * clampedZoom
+	var first *ActiveVolume
+	if len(volumesToRender) > 0 {
+		first = volumesToRender[0]
+	}
+	adaptiveStep := rayStep(stepSize, stepVoxels, first, float64(scaleY), float64(scaleZ), zoom)
 	gl.Uniform1f(gr.uniforms.stepSize, float32(adaptiveStep))
 	gl.Uniform1f(gr.uniforms.scaleY, scaleY)
 	gl.Uniform1f(gr.uniforms.scaleZ, scaleZ)

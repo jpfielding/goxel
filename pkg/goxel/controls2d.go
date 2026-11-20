@@ -19,8 +19,13 @@ const wellFooterHeight = 30
 // slicePanelLayout is the desktop right column's layout: header, the well
 // sized to the tallest slice that fits, then the control groups right under it.
 type slicePanelLayout struct {
-	tallest func(width float32) float32 // tallest fitted slice at this width
+	tallest   func(width float32) float32 // tallest fitted slice at this width
+	hasPicker bool                        // the Image group has a Volume row
 }
+
+// desktopControlsHeight is the room roxel keeps for the three groups under the
+// well (30 more when the Image group has a Volume row): the well gets the rest.
+const desktopControlsHeight = 326
 
 const (
 	panelHeaderGap = 8
@@ -33,7 +38,11 @@ func (l slicePanelLayout) Layout(objs []fyne.CanvasObject, size fyne.Size) {
 	ch := controls.MinSize().Height
 	header.Move(fyne.NewPos(0, 0))
 	header.Resize(fyne.NewSize(size.Width, hh))
-	room := size.Height - hh - panelHeaderGap - panelGroupGap - ch
+	reserve := float32(desktopControlsHeight)
+	if l.hasPicker {
+		reserve += 30
+	}
+	room := size.Height - hh - panelHeaderGap - reserve
 	tall := l.tallest(size.Width) + wellFooterHeight + 2
 	wh := max(min(room, tall), 140)
 	well.Move(fyne.NewPos(0, hh+panelHeaderGap))
@@ -53,14 +62,15 @@ func (l slicePanelLayout) MinSize(objs []fyne.CanvasObject) fyne.Size {
 func (v *Viewer) slicePanel() fyne.CanvasObject {
 	header := v.sliceHeader("Focus slice")
 	controls := vstack(panelGroupGap, v.sliceGroup(), v.windowingGroup2D(), v.imageGroup())
-	body := container.New(slicePanelLayout{tallest: v.tallestFit}, header, v.sliceWell(), controls)
-	return border(nil, nil, hairline(), nil, panel(colPanel, 0, inset(16, 10, body)))
+	body := container.New(slicePanelLayout{tallest: v.tallestFit, hasPicker: len(v.sliceSourceKeys()) > 1}, header, v.sliceWell(), controls)
+	return edged(panel(colPanel, 0, inset(16, 16, body)), edgeLeft)
 }
 
 // sliceHeader mirrors the 3D view's header: title and the two image actions.
 func (v *Viewer) sliceHeader(focusLabel string) fyne.CanvasObject {
-	focus := focusButton(focusLabel, v.st.focusSlice, v.toggleFocusSlice)
-	return minHeight(28, border(nil, nil, pageTitle("2D slice"), hrow(8, newButton("Fit image", v.fitImage), focus), nil))
+	focus := focusButton(focusLabel, v.st.focusSlice, "2D slice", v.toggleFocusSlice)
+	return minHeight(28, border(nil, nil, pageTitle("2D slice"),
+		hrow(8, newButton("Fit image", v.fitImage).withTip("Show the whole slice"), focus), nil))
 }
 
 // sliceFocusView: the slice fills the workspace with its groups docked below.
@@ -69,7 +79,7 @@ func (v *Viewer) sliceFocusView() fyne.CanvasObject {
 	header := panel(colPanel, 0, inset(16, 10, v.sliceHeader(label)))
 	groups := panel(colPanel, 0, inset(16, 12, columns(24, v.sliceGroup(), v.windowingGroup2D(), v.imageGroup())))
 	well := panel(colPanel, 0, inset(16, 0, v.sliceWell()))
-	return border(border(nil, hairline(), nil, nil, header), border(hairline(), nil, nil, nil, groups), nil, nil, well)
+	return border(edged(header, edgeBottom), edged(groups, edgeTop), nil, nil, well)
 }
 
 func (v *Viewer) toggleFocusSlice() {
@@ -82,6 +92,12 @@ func (v *Viewer) toggleFocusSlice() {
 func (v *Viewer) fitImage() {
 	v.st.zoom2D = 100
 	v.interactiveView.SetZoom(100)
+	v.sync()
+}
+
+// zoomChanged follows a zoom made by a gesture: the Zoom slider moves with it.
+func (v *Viewer) zoomChanged(percent float64) {
+	v.st.zoom2D = percent
 	v.sync()
 }
 
@@ -155,8 +171,8 @@ func (v *Viewer) sliceRow() *sliderRow {
 
 // pager is "Previous" / "Next" under the slice track, for exact single-slice steps.
 func (v *Viewer) pager() fyne.CanvasObject {
-	prev := newButton("Previous", func() { v.stepSlice(-1) })
-	next := newButton("Next", func() { v.stepSlice(1) })
+	prev := newButton("Previous", func() { v.stepSlice(-1) }).withTip("Previous slice")
+	next := newButton("Next", func() { v.stepSlice(1) }).withTip("Next slice")
 	sync := func() {
 		scrub := !v.st.composite && v.dicox.MaxSlice() > 0
 		if scrub && v.st.sliceIndex > 0 {
@@ -223,7 +239,8 @@ func (v *Viewer) volumePicker() fyne.CanvasObject {
 	}
 	sel := widget.NewSelect(keys, func(s string) {
 		if s != v.currentVolumeKey {
-			v.set2DSource(s)
+			v.set2DSource(s, false)
+			v.rebuild() // the windowing rows follow the source
 		}
 	})
 	sel.Selected = v.currentVolumeKey
@@ -234,12 +251,13 @@ func (v *Viewer) compositeToggle() *checkbox {
 	return newCheck("Composite projection", v.st.composite, func(b bool) {
 		v.setComposite(b)
 		v.sync()
-	})
+	}).withTip("Blend every slice along this plane into one image")
 }
 
 // addFindingButton draws a rectangle on the slice to record a finding. It is a
-// toggle: lit while the next drag will draw.
-func (v *Viewer) addFindingButton() *button {
+// toggle: lit while the next drag will draw. It is not in the interface until
+// findings can be stored; the annotation code stays for when they can.
+func (v *Viewer) addFindingButton() *button { //nolint:unused
 	b := newButton("Add Finding", nil)
 	b.onTap = func() {
 		v.isAnnotating = !v.isAnnotating
@@ -251,17 +269,13 @@ func (v *Viewer) addFindingButton() *button {
 	return b
 }
 
-// imageGroup: zoom, volume, composite projection and Add Finding (desktop).
+// imageGroup: zoom, volume and composite projection.
 func (v *Viewer) imageGroup() fyne.CanvasObject {
 	items := []fyne.CanvasObject{sectionTitle("Image", ""), v.zoomRow().obj}
 	if p := v.volumePicker(); p != nil {
 		items = append(items, p)
 	}
-	if v.st.layout.compact() {
-		return vstack(6, append(items, v.compositeToggle())...)
-	}
-	items = append(items, border(nil, nil, v.compositeToggle(), v.addFindingButton(), nil))
-	return vstack(6, items...)
+	return vstack(6, append(items, v.compositeToggle())...)
 }
 
 // --- Footer of the image well ------------------------------------------------------

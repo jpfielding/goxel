@@ -40,10 +40,11 @@ type Viewer struct {
 	compositeVolumes map[string]*CompositeVolume
 	projections      map[string]*CompositeVolume
 	currentVolumeKey string // volume shown in 2D
+	active3D         string // volume shown in 3D (and, after picking it, in 2D)
 
 	isAnnotating   bool
 	rebuildPending bool
-	narrowShelf    bool
+	narrowShelf    bool // the shelf the tree was built with has two columns
 
 	// syncers re-read state into the live widgets of the current tree, for
 	// changes that do not warrant a rebuild (slice stepping, value readouts).
@@ -80,7 +81,9 @@ func NewViewer(a fyne.App) *Viewer {
 	v.volumeRenderer.Overlay = v.slicePlaneOverlay
 
 	v.content = container.NewStack()
-	v.root = container.New(&responsiveLayout{v: v}, v.content)
+	tooltips = newTipLayer()
+	keyFallback = v.onKey
+	v.root = container.New(&responsiveLayout{v: v}, v.content, tooltips.Container)
 	v.win.SetPadded(false) // panels meet edge to edge, separated by hairlines
 	v.win.SetContent(v.root)
 	v.win.Canvas().SetOnTypedKey(v.onKey)
@@ -128,15 +131,31 @@ func (v *Viewer) LoadKeys() {}
 // loaded reports whether a study is open.
 func (v *Viewer) loaded() bool { return v.scan != nil }
 
-// rebuild replaces the widget tree with one built from state.
+// rebuild replaces the widget tree with one built from state. A control that
+// has keyboard focus keeps it: the same position in the new tree takes it.
 func (v *Viewer) rebuild() {
 	v.syncers = nil
+	tooltips.hide(nil)
+	publishTouchArea(fyne.Position{}, fyne.Size{}) // the 3D view says where it is when it lays out
+	canvas := v.win.Canvas()
+	keep := -1
+	if f := canvas.Focused(); f != nil {
+		if _, typing := f.(*valueBox); !typing {
+			for i, c := range focusables(v.content) {
+				if c == f {
+					keep = i
+				}
+			}
+		}
+	}
 	// The theme reads its compact flag on every size lookup, and the tree is
 	// rebuilt below, so no SetTheme is needed. (SetTheme at runtime also
 	// crashes Fyne 2.7's wasm driver while it reloads textures.)
 	compact := v.st.layout.compact()
 	v.theme.compact = compact
 	uiTouch = compact
+	v.narrowShelf = !compact && shelfNarrow(v.root.Size().Width, v.st.focusVolume)
+	v.interactiveView.TurnToFit = compact && v.st.focusSlice
 	var c fyne.CanvasObject
 	if compact {
 		c = v.phoneRoot()
@@ -145,6 +164,11 @@ func (v *Viewer) rebuild() {
 	}
 	v.content.Objects = []fyne.CanvasObject{c}
 	v.content.Refresh()
+	if keep >= 0 {
+		if fs := focusables(v.content); keep < len(fs) {
+			canvas.Focus(fs[keep])
+		}
+	}
 }
 
 // sync pushes state into the live widgets after a change made outside them.
@@ -264,48 +288,110 @@ func (v *Viewer) findingCount() int {
 	return len(v.scan.Findings)
 }
 
-// setup3DView (re)loads every enabled volume and finding into the renderer.
+// setup3DView (re)loads the volume shown in 3D and its findings into the
+// renderer.
 func (v *Viewer) setup3DView() {
 	vr := v.volumeRenderer
 	vr.ClearVolumes()
-	vr.ClearFindings()
-
 	keys := make([]string, 0, len(v.compositeVolumes))
 	for k := range v.compositeVolumes {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-
-	findingPalette := []color.RGBA{
-		{255, 0, 0, 255}, {255, 128, 0, 255}, {255, 0, 255, 255}, {0, 255, 255, 255},
-		{255, 255, 0, 255}, {128, 0, 255, 255}, {0, 255, 128, 255}, {255, 128, 128, 255},
-	}
-	var refX, refY, refZ int
-	if p := v.primary; p != nil {
-		refX, refY, refZ = p.Width, p.Height, p.Depth
-	}
-	fi := 0
 	for _, k := range keys {
 		vol := v.compositeVolumes[k]
 		if !vol.Enabled {
 			continue
 		}
-		if strings.Contains(strings.ToLower(k), "finding") && vol.BBox != nil {
-			if vol.Color.A == 0 {
-				vol.Color = findingPalette[fi%len(findingPalette)]
-			}
-			fi++
-			vr.AddFinding(k, 0, *vol.BBox, vol.Color, refX, refY, refZ)
-			continue
-		}
 		_ = vr.AddVolume(vol.PixelData, vol.Rows, vol.Cols, vol.PixelRep, vol.Color,
 			v.st.windowCenter3D, v.st.windowWidth3D, vol.RescaleIntercept, vol.Alpha)
 	}
+	v.syncFindings()
 	v.applyAll3D()
 }
 
-// set2DSource shows a volume or projection in the 2D view.
-func (v *Viewer) set2DSource(key string) {
+// findingPalette colours findings that arrive without a colour.
+var findingPalette = []color.RGBA{
+	{255, 0, 0, 255}, {255, 128, 0, 255}, {255, 0, 255, 255}, {0, 255, 255, 255},
+	{255, 255, 0, 255}, {128, 0, 255, 255}, {0, 255, 128, 255}, {255, 128, 128, 255},
+}
+
+// prepareFindings opens a study's findings as roxel does: every one shown,
+// each with a colour, none selected.
+func (v *Viewer) prepareFindings() {
+	v.st.showFindingBoxes = true
+	v.st.selectedFinding = -1
+	for i, f := range v.scan.Findings {
+		f.Visible = true
+		if f.Color.A == 0 {
+			f.Color = findingPalette[i%len(findingPalette)]
+		}
+	}
+}
+
+// syncFindings draws a box in the 3D view for each finding that is shown, when
+// boxes are on.
+func (v *Viewer) syncFindings() {
+	vr := v.volumeRenderer
+	vr.ClearFindings()
+	if v.scan != nil && v.primary != nil && v.st.showFindingBoxes {
+		p := v.primary
+		for _, f := range v.scan.Findings {
+			if !f.Visible {
+				continue
+			}
+			bb := volume.BoundingBox3D{
+				X: f.BBox.MinX, Y: f.BBox.MinY, Z: f.BBox.MinZ,
+				Width: f.BBox.MaxX - f.BBox.MinX, Height: f.BBox.MaxY - f.BBox.MinY, Depth: f.BBox.MaxZ - f.BBox.MinZ,
+			}
+			vr.AddFinding(f.Name, f.Type, bb, f.Color, p.Width, p.Height, p.Depth)
+		}
+	}
+	vr.Redraw()
+}
+
+// selectedFinding is the selected finding's index, or -1.
+func (v *Viewer) selectedFinding() int {
+	if i := v.st.selectedFinding; v.scan != nil && i >= 0 && i < len(v.scan.Findings) {
+		return i
+	}
+	return -1
+}
+
+// showFindings shows the findings keep accepts and hides the rest.
+func (v *Viewer) showFindings(keep func(i int) bool) {
+	for i, f := range v.scan.Findings {
+		f.Visible = keep(i)
+	}
+	v.syncFindings()
+	v.rebuild() // the rows' boxes follow
+}
+
+// showVolume makes key the volume shown in 3D and in 2D, with its own window
+// and proportions: what picking it under Volumes does. A new study (fresh)
+// opens at its middle slice.
+func (v *Viewer) showVolume(key string, fresh bool) {
+	cv, vol := v.compositeVolumes[key], v.scan.Volumes[key]
+	if cv == nil || vol == nil {
+		return
+	}
+	v.active3D, v.primary = key, vol
+	for k, c := range v.compositeVolumes {
+		c.Enabled = k == key
+	}
+	v.st.windowCenter3D, v.st.windowWidth3D = cv.WindowCenter, cv.WindowWidth
+	v.st.range3D = windowRangeFor(cv.WindowCenter, cv.WindowWidth)
+	v.st.selectedFinding = -1
+	v.set2DSource(key, fresh)
+	v.volumeRenderer.SetBoxScale(boxScaleFor(vol))
+	v.setup3DView()
+	v.volumeRenderer.FitView()
+}
+
+// set2DSource shows a volume or projection in the 2D view, with its own
+// window. A new study opens at its middle slice; picking another source keeps
+// the slice index, clamped.
+func (v *Viewer) set2DSource(key string, fresh bool) {
 	cv, ok := v.compositeVolumes[key]
 	if !ok {
 		cv, ok = v.projections[key]
@@ -327,8 +413,19 @@ func (v *Viewer) set2DSource(key string) {
 			data[z][y] = row
 		}
 	}
+	prev := v.st.sliceIndex
+	v.st.windowCenter2D, v.st.windowWidth2D = cv.WindowCenter, cv.WindowWidth
+	v.st.range2D = windowRangeFor(cv.WindowCenter, cv.WindowWidth)
+	v.dicox.SetRescale(cv.RescaleIntercept)
+	v.dicox.SetWindowLevel(int(v.st.windowCenter2D))
+	v.dicox.SetWindowWidth(int(v.st.windowWidth2D))
 	v.dicox.SetVolume(data, w, h, d)
 	v.dicox.SetOrientation(v.st.orientation)
+	if fresh {
+		v.dicox.SetSliceIndex((v.dicox.MaxSlice() + 1) / 2)
+	} else {
+		v.dicox.SetSliceIndex(max(0, min(prev, v.dicox.MaxSlice())))
+	}
 	v.st.sliceIndex = v.dicox.SliceIndex()
 	v.applyCutaway()
 	v.sync()
@@ -406,9 +503,10 @@ func (v *Viewer) applyPalette() {
 	}
 }
 
-// cutawayAvailable: the cutaway follows a single 2D slice of a 3D volume.
+// cutawayAvailable: the cutaway follows a single 2D slice of the volume shown in 3D.
 func (v *Viewer) cutawayAvailable() bool {
-	return v.loaded() && !v.st.composite && v.compositeVolumes[v.currentVolumeKey] != nil
+	return v.loaded() && !v.st.composite && v.currentVolumeKey == v.active3D &&
+		v.compositeVolumes[v.currentVolumeKey] != nil
 }
 
 func (v *Viewer) applyCutaway() {
@@ -423,7 +521,7 @@ func (v *Viewer) applyCutaway() {
 }
 
 func (v *Viewer) refresh2D() {
-	v.image.Image = v.dicox
+	v.interactiveView.applySource()
 	canvas.Refresh(v.image)
 	v.interactiveView.Refresh()
 }
@@ -455,6 +553,7 @@ func (v *Viewer) setOrientation(o ViewOrientation) {
 	v.dicox.SetOrientation(o)
 	v.st.sliceIndex = v.dicox.SliceIndex()
 	v.interactiveView.SetZoom(v.st.zoom2D)
+	v.interactiveView.centre()
 	v.sync()
 	v.refresh2D()
 	if v.st.cutaway {
@@ -469,7 +568,12 @@ func (v *Viewer) setComposite(on bool) {
 	v.applyCutaway()
 }
 
-// sliceCaption is "Axial 12 / 128 · 640 × 440 mm", as under roxel's well.
+// captionSep is the separator of the slice caption: a dot between two spaces
+// on each side, as in roxel.
+const captionSep = "  ·  "
+
+// sliceCaption is "Axial 12 / 128  ·  640 × 440 mm", as under roxel's well, or
+// "Axial 12 / 128  ·  turned 90°" when the slice is drawn on its side.
 func (v *Viewer) sliceCaption() string {
 	if !v.loaded() {
 		return ""
@@ -479,9 +583,12 @@ func (v *Viewer) sliceCaption() string {
 	if v.st.composite {
 		where = name + " projection"
 	}
+	if v.interactiveView.turned {
+		return where + captionSep + "turned 90°"
+	}
 	if cv := v.compositeVolumes[v.currentVolumeKey]; cv != nil {
 		w, h := v.planeExtentMM(cv)
-		return fmt.Sprintf("%s · %.0f × %.0f mm", where, w, h)
+		return fmt.Sprintf("%s%s%.0f × %.0f mm", where, captionSep, w, h)
 	}
 	return where
 }
@@ -546,6 +653,6 @@ func slicePlaneCorners(o ViewOrientation, slice, count int, scaleY, scaleZ float
 
 // captionPosition is the part of a slice caption before its size: "Coronal 129 / 256".
 func captionPosition(caption string) string {
-	pos, _, _ := strings.Cut(caption, " · ")
+	pos, _, _ := strings.Cut(caption, captionSep)
 	return pos
 }

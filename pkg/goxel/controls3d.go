@@ -16,13 +16,14 @@ import (
 func f0(x float64) string { return fmt.Sprintf("%.0f", x) }
 func f2(x float64) string { return fmt.Sprintf("%.2f", x) }
 
-// focusButton is "Focus volume" / "Exit focus" with roxel's bracket icon.
-func focusButton(label string, focused bool, onTap func()) *button {
-	icon := iconEnlarge
+// focusButton is "Focus volume" / "Exit focus" with roxel's bracket icon; what
+// names the view it enlarges in the tooltip.
+func focusButton(label string, focused bool, what string, onTap func()) *button {
+	icon, tip := iconEnlarge, "Enlarge the "+what+" to fill the workspace"
 	if focused {
-		icon = iconReduce
+		icon, tip = iconReduce, "Back to the workspace (Esc)"
 	}
-	return newIconButton(icon, label, onTap)
+	return newIconButton(icon, label, onTap).withTip(tip)
 }
 
 // volumeHeader is the 3D column's two header rows: title and camera actions,
@@ -34,19 +35,17 @@ func (v *Viewer) volumeHeader() fyne.CanvasObject {
 	}
 	actions := hrow(16,
 		hrow(8, rowLabel("View along"), v.viewAlongButtons()),
-		hrow(8, newButton("Fit view", v.volumeRenderer.FitView), focusButton(focusLabel, v.st.focusVolume, v.toggleFocusVolume)))
+		hrow(8, newButton("Fit view", v.volumeRenderer.FitView).withTip("Center and fit the whole volume"),
+			focusButton(focusLabel, v.st.focusVolume, "3D view", v.toggleFocusVolume)))
 	row1 := minHeight(28, border(nil, nil, pageTitle("3D view"), actions, nil))
 	row2 := minHeight(32, v.slicePlaneTools())
-	rows := []fyne.CanvasObject{row1, row2}
-	if v.st.focusVolume {
-		rows = append(rows, columns(16, natural(v.planePicker()), v.sliceRow().obj))
-	}
-	return border(nil, hairline(), nil, nil, panel(colPanel, 0, inset(16, 10, vstack(8, rows...))))
+	return edged(panel(colPanel, 0, inset(16, 10, vstack(8, row1, row2))), edgeBottom)
 }
 
 func (v *Viewer) viewAlongButtons() fyne.CanvasObject {
 	axis := func(label string, a int) fyne.CanvasObject {
-		return newButton(label, func() { v.volumeRenderer.LookAlong(a) }).sized(30, 0)
+		return newButton(label, func() { v.volumeRenderer.LookAlong(a) }).sized(30, 0).
+			withTip("Look along the " + label + " axis")
 	}
 	return hrow(4, axis("X", 0), axis("Y", 1), axis("Z", 2))
 }
@@ -64,11 +63,11 @@ func (v *Viewer) slicePlaneChecks() (plane, cut, reverse *checkbox, unavailable 
 	plane = newCheck("Slice plane", v.st.showSlicePlane, func(b bool) {
 		v.st.showSlicePlane = b
 		v.volumeRenderer.Refresh()
-	})
+	}).withTip("Outline the 2D slice in the 3D view")
 	reverse = newCheck("Reverse cutaway", v.st.reverseCutaway, func(b bool) {
 		v.st.reverseCutaway = b
 		v.applyCutaway()
-	})
+	}).withTip("Hide the other side instead")
 	cut = newCheck("Cutaway", v.st.cutaway, func(b bool) {
 		v.st.cutaway = b
 		if b {
@@ -77,7 +76,7 @@ func (v *Viewer) slicePlaneChecks() (plane, cut, reverse *checkbox, unavailable 
 			reverse.Disable()
 		}
 		v.applyCutaway()
-	})
+	}).withTip("Hide the volume on one side of the slice plane")
 	unavailable = text("Needs a single 2D slice of this volume", 12, colMuted)
 	sync := func() {
 		if v.cutawayAvailable() {
@@ -101,11 +100,46 @@ func (v *Viewer) slicePlaneChecks() (plane, cut, reverse *checkbox, unavailable 
 	return plane, cut, reverse, unavailable
 }
 
+// cutawayGap is the space between "Cutaway" and its dependent "Reverse
+// cutaway": roxel's 8 px item spacing plus the box's 6 px of padding.
+const cutawayGap = 14
+
 // slicePlaneTools (desktop header): "Slice plane", then "Cutaway" with its
-// dependent "Reverse cutaway" enclosed with it in one frame.
+// dependent "Reverse cutaway" enclosed with it in one frame. In focus the
+// plane picker and the slice slider (at most 340 wide) join them, because the
+// 2D panel that normally holds them is hidden.
 func (v *Viewer) slicePlaneTools() fyne.CanvasObject {
 	plane, cut, reverse, unavailable := v.slicePlaneChecks()
-	return hrow(14, plane, frame(colHairline, 6, 10, 2, hrow(8, cut, reverse)), unavailable)
+	items := []fyne.CanvasObject{plane, frame(colHairline, 6, 10, 2, hrow(cutawayGap, cut, reverse)), unavailable}
+	if !v.st.focusVolume || !v.cutawayAvailable() {
+		return hrow(14, items...)
+	}
+	items = append(items[:2], v.planePicker())
+	left := hrow(14, items...)
+	if v.dicox.MaxSlice() < 1 {
+		return left
+	}
+	return container.New(cappedLayout{gap: 14, max: 340}, left, v.sliceRow().obj)
+}
+
+// cappedLayout places [left, last]: left at its own width, then last, at most
+// max wide, a gap after it.
+type cappedLayout struct{ gap, max float32 }
+
+func (l cappedLayout) Layout(objs []fyne.CanvasObject, size fyne.Size) {
+	left, last := objs[0], objs[1]
+	lw := left.MinSize().Width
+	left.Move(fyne.NewPos(0, (size.Height-left.MinSize().Height)/2))
+	left.Resize(fyne.NewSize(lw, left.MinSize().Height))
+	w := min(l.max, max(size.Width-lw-l.gap, 0))
+	h := last.MinSize().Height
+	last.Move(fyne.NewPos(lw+l.gap, (size.Height-h)/2))
+	last.Resize(fyne.NewSize(w, h))
+}
+
+func (l cappedLayout) MinSize(objs []fyne.CanvasObject) fyne.Size {
+	left, last := objs[0].MinSize(), objs[1].MinSize()
+	return fyne.NewSize(left.Width+l.gap+last.Width, max(left.Height, last.Height))
 }
 
 // slicePlanePage (compact): the three options one to a touch row, the
@@ -120,10 +154,34 @@ func (v *Viewer) slicePlanePage() fyne.CanvasObject {
 // behind a menu button).
 func (v *Viewer) shelf() fyne.CanvasObject {
 	cols := []fyne.CanvasObject{v.windowingGroup3D(), v.paletteGroup()}
-	if !(v.narrowShelf && !v.st.focusVolume) {
+	if !v.narrowShelf {
 		cols = append(cols, vstack(6, sectionTitle("Lighting", ""), v.lightingRows()))
 	}
-	return border(hairline(), nil, nil, nil, panel(colPanel, 0, inset(16, 12, columns(24, cols...))))
+	// On very wide windows the rows keep a usable length.
+	body := container.New(&cappedCentre{max: shelfMaxWidth}, columns(24, cols...))
+	return edged(panel(colPanel, 0, inset(16, 12, body)), edgeTop)
+}
+
+// shelfMaxWidth is the widest the shelf's columns grow.
+const shelfMaxWidth = 1440
+
+// cappedCentre centres its child at most max wide.
+type cappedCentre struct{ max float32 }
+
+func (l *cappedCentre) Layout(objs []fyne.CanvasObject, size fyne.Size) {
+	w := min(size.Width, l.max)
+	for _, o := range objs {
+		o.Move(fyne.NewPos((size.Width-w)/2, 0))
+		o.Resize(fyne.NewSize(w, size.Height))
+	}
+}
+
+func (l *cappedCentre) MinSize(objs []fyne.CanvasObject) fyne.Size {
+	var m fyne.Size
+	for _, o := range objs {
+		m = m.Max(o.MinSize())
+	}
+	return m
 }
 
 // window3DRanges returns what the 3D windowing rows' tracks cover and accept.
@@ -174,7 +232,7 @@ func (v *Viewer) paletteGroup() fyne.CanvasObject {
 	items := []fyne.CanvasObject{sectionTitle("Palette", ""), natural(v.palettePicker()), v.paletteLegend(),
 		hrow(8, rowLabel("Quality"), v.qualityPicker())}
 	var menus []fyne.CanvasObject
-	if v.narrowShelf && !v.st.focusVolume {
+	if v.narrowShelf {
 		btn := newButton("Lighting", nil)
 		btn.onTap = func() {
 			v.showPopupBelow(btn, vstack(6, sectionTitle("Lighting", ""), v.lightingRows()), 300)

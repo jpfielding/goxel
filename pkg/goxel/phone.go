@@ -51,7 +51,7 @@ func (v *Viewer) phoneRoot() fyne.CanvasObject {
 	case tabStudy:
 		body = v.phonePage(v.studyPage())
 	case tabFindings:
-		body = v.phonePage(v.findingsSection())
+		body = v.phonePage(v.findingsPage())
 	case tabSlice:
 		body = v.withSheet(v.phoneSliceArea(), v.sheetOpenFor(), v.sliceSheet)
 	default:
@@ -61,6 +61,16 @@ func (v *Viewer) phoneRoot() fyne.CanvasObject {
 }
 
 func (v *Viewer) sheetOpenFor() bool { return v.st.sheetOpen }
+
+// findingsPage is the Findings page. In landscape, which is short, the controls
+// stay put on the left while the list scrolls on the right.
+func (v *Viewer) findingsPage() fyne.CanvasObject {
+	rows := v.findingsList()
+	if v.st.layout != layoutPhoneLandscape || rows == nil {
+		return v.findingsSection()
+	}
+	return columns(24, v.findingsSummary(), rows)
+}
 
 // phonePage is a full page of reading content; pages hold no sliders, so they scroll.
 func (v *Viewer) phonePage(content fyne.CanvasObject) fyne.CanvasObject {
@@ -98,9 +108,9 @@ func (v *Viewer) withSheet(view fyne.CanvasObject, open bool, sheet func() fyne.
 	}
 	s := panel(colPanel, 0, inset(16, 8, sheet()))
 	if v.st.layout == layoutPhoneLandscape {
-		return border(nil, nil, nil, container.New(sizedLayout{w: landscapePanel}, border(nil, nil, hairline(), nil, s)), view)
+		return border(nil, nil, nil, container.New(sizedLayout{w: landscapePanel}, edged(s, edgeLeft)), view)
 	}
-	return border(nil, container.New(sizedLayout{h: sheetHeight}, border(hairline(), nil, nil, nil, s)), nil, nil, view)
+	return border(nil, container.New(sizedLayout{h: sheetHeight}, edged(s, edgeTop)), nil, nil, view)
 }
 
 // tabBar: four tabs; the active one has an ACCENT top bar and label, view
@@ -112,7 +122,7 @@ func (v *Viewer) tabBar() fyne.CanvasObject {
 	}
 	row := container.New(sizedLayout{h: tabRowHeight}, inset(8, 0, columns(0, tabs...)))
 	home := v.st.layout.homeIndicatorInset()
-	return panel(colBG, 0, vstack(0, hairline(), row, container.New(sizedLayout{h: home}, vstack(0))))
+	return edged(panel(colBG, 0, vstack(0, row, container.New(sizedLayout{h: home}, vstack(0)))), edgeTop)
 }
 
 func (v *Viewer) tabButton(t phoneTab) fyne.CanvasObject {
@@ -144,15 +154,31 @@ type tabCell struct {
 	badge   int
 	onTap   func()
 	pressed bool
+	focused bool
 }
 
-func (c *tabCell) Tapped(*fyne.PointEvent)       { c.onTap() }
-func (c *tabCell) MouseDown(*desktop.MouseEvent) { c.pressed = true; c.Refresh() }
-func (c *tabCell) MouseUp(*desktop.MouseEvent)   { c.pressed = false; c.Refresh() }
-func (c *tabCell) Cursor() desktop.Cursor        { return desktop.PointerCursor }
+func (c *tabCell) Tapped(*fyne.PointEvent) { c.onTap() }
+func (c *tabCell) MouseDown(*desktop.MouseEvent) {
+	c.pressed = true
+	unfocus(c) // a tap is not keyboard focus
+	c.Refresh()
+}
+func (c *tabCell) MouseUp(*desktop.MouseEvent) { c.pressed = false; c.Refresh() }
+func (c *tabCell) Cursor() desktop.Cursor      { return desktop.PointerCursor }
+
+func (c *tabCell) FocusGained()   { c.focused = true; c.Refresh() }
+func (c *tabCell) FocusLost()     { c.focused = false; c.Refresh() }
+func (c *tabCell) TypedRune(rune) {}
+func (c *tabCell) TypedKey(e *fyne.KeyEvent) {
+	if isActivate(e) {
+		c.onTap()
+		return
+	}
+	passKey(c, e)
+}
 
 func (c *tabCell) CreateRenderer() fyne.WidgetRenderer {
-	r := &tabRenderer{c: c, bg: rrect(colPanel, color.Transparent, 8, 0), bar: rrect(colAccent, color.Transparent, 2, 0),
+	r := &tabRenderer{c: c, bg: rrect(colPanel, color.Transparent, 8, 0), bar: rrect(colAccent, color.Transparent, 2, 0), ring: newRing(8),
 		text: text(c.label, 14, colText), badgeDot: canvas.NewCircle(colDanger), count: text("", 11, colBG)}
 	r.chev[0], r.chev[1] = line(colText, 1.6), line(colText, 1.6)
 	return r
@@ -161,6 +187,7 @@ func (c *tabCell) CreateRenderer() fyne.WidgetRenderer {
 type tabRenderer struct {
 	c        *tabCell
 	bg, bar  *canvas.Rectangle
+	ring     *canvas.Rectangle
 	text     *canvas.Text
 	chev     [2]*canvas.Line
 	badgeDot *canvas.Circle
@@ -173,6 +200,8 @@ func (r *tabRenderer) Layout(size fyne.Size) {
 	c := r.c
 	r.bg.Move(fyne.NewPos(3, 2))
 	r.bg.Resize(fyne.NewSize(size.Width-6, size.Height-6))
+	r.ring.Move(fyne.NewPos(3-ringWidth, 2-ringWidth))
+	r.ring.Resize(fyne.NewSize(size.Width-6+2*ringWidth, size.Height-6+2*ringWidth))
 	r.bar.Move(fyne.NewPos(14, 2))
 	r.bar.Resize(fyne.NewSize(size.Width-28, 3))
 	ts := fyne.MeasureText(c.label, 14, fyne.TextStyle{})
@@ -236,12 +265,13 @@ func (r *tabRenderer) Refresh() {
 		r.badgeDot.Hide()
 		r.count.Hide()
 	}
+	showWhen(r.ring, c.focused)
 	r.Layout(c.Size())
 	canvas.Refresh(r.bg)
 }
 
 func (r *tabRenderer) Objects() []fyne.CanvasObject {
-	return []fyne.CanvasObject{r.bg, r.bar, r.text, r.chev[0], r.chev[1], r.badgeDot, r.count}
+	return []fyne.CanvasObject{r.bg, r.bar, r.text, r.chev[0], r.chev[1], r.badgeDot, r.count, r.ring}
 }
 
 func (r *tabRenderer) Destroy() {}
@@ -255,9 +285,13 @@ func pageSelector(labels []string, selected int, onSelect func(int)) fyne.Canvas
 func buttonRow(buttons ...*button) fyne.CanvasObject {
 	objs := make([]fyne.CanvasObject, len(buttons))
 	for i, b := range buttons {
-		objs[i] = b.sized(0, touchTarget)
+		objs[i] = b.sized(0, controlHeight())
 	}
-	return columns(10, objs...)
+	gap := float32(8)
+	if uiTouch {
+		gap = 10
+	}
+	return columns(gap, objs...)
 }
 
 // touchRow is a label cell then content, at touch height.
@@ -315,7 +349,7 @@ func (v *Viewer) volumeSheet() fyne.CanvasObject {
 	default:
 		page = v.lightingRows()
 	}
-	return border(sel, nil, nil, nil, inset(0, 8, page))
+	return vstack(8, sel, page)
 }
 
 // slicePlaneSheetPage: the slice plane, the cutaway with its dependent option
@@ -363,13 +397,13 @@ func (v *Viewer) cameraPage() fyne.CanvasObject {
 	var rows []fyne.CanvasObject
 	if !v.st.focusVolume {
 		rows = append(rows, buttonRow(
-			newButton("Fit view", vr.FitView),
-			newButton("Focus volume", v.toggleFocusVolume)))
+			newButton("Fit view", vr.FitView).withTip("Center and fit the whole volume"),
+			newButton("Focus volume", v.toggleFocusVolume).withTip("Enlarge the 3D view to fill the workspace")))
 	}
 	rows = append(rows, touchRow("View along", buttonRow(
-		newButton("X", func() { vr.LookAlong(0) }),
-		newButton("Y", func() { vr.LookAlong(1) }),
-		newButton("Z", func() { vr.LookAlong(2) }))))
+		newButton("X", func() { vr.LookAlong(0) }).withTip("Look along the X axis"),
+		newButton("Y", func() { vr.LookAlong(1) }).withTip("Look along the Y axis"),
+		newButton("Z", func() { vr.LookAlong(2) }).withTip("Look along the Z axis"))))
 	mode := 0
 	if v.st.dragPans {
 		mode = 1
@@ -379,13 +413,18 @@ func (v *Viewer) cameraPage() fyne.CanvasObject {
 		v.rebuild()
 	})
 	arrow := func(icon iconKind, dx, dy float64) *button {
+		name := map[iconKind]string{iconLeft: "left", iconRight: "right", iconUp: "up", iconDown: "down"}[icon]
+		verb := "Orbit"
+		if v.st.dragPans {
+			verb = "Pan"
+		}
 		return newIconButton(icon, "", func() {
 			if v.st.dragPans {
 				vr.PanPixels(dx*panStep, dy*panStep)
 			} else {
 				vr.Orbit(dx*orbitStep, -dy*orbitStep)
 			}
-		}).sized(touchTarget, touchTarget)
+		}).sized(touchTarget, touchTarget).withTip(verb + " " + name)
 	}
 	rows = append(rows, minHeight(touchTarget, flexRow(10, 0, orbitPan,
 		arrow(iconLeft, -1, 0), arrow(iconRight, 1, 0), arrow(iconUp, 0, -1), arrow(iconDown, 0, 1))))
@@ -393,8 +432,8 @@ func (v *Viewer) cameraPage() fyne.CanvasObject {
 	if v.st.dragPans {
 		tip = "Or drag to pan and pinch to zoom."
 	}
-	zoomOut := newButton("−", func() { vr.ZoomBy(1.25) }).textSize(22).sized(touchTarget, touchTarget)
-	zoomIn := newButton("+", func() { vr.ZoomBy(1 / 1.25) }).textSize(22).sized(touchTarget, touchTarget)
+	zoomOut := newButton("−", func() { vr.ZoomBy(1.25) }).textSize(22).sized(touchTarget, touchTarget).withTip("Zoom out")
+	zoomIn := newButton("+", func() { vr.ZoomBy(1 / 1.25) }).textSize(22).sized(touchTarget, touchTarget).withTip("Zoom in")
 	rows = append(rows, minHeight(touchTarget, flexRow(10, 3, fixedWidth(78, rowLabel("Zoom")), zoomOut, zoomIn, hint(tip))))
 	return vstack(8, rows...)
 }
@@ -430,12 +469,12 @@ func (v *Viewer) sliceSheet() fyne.CanvasObject {
 			minHeight(touchTarget, v.compositeToggle())}
 		if !v.st.focusSlice {
 			rows = append(rows, buttonRow(
-				newButton("Fit image", v.fitImage),
-				newButton("Focus slice", v.toggleFocusSlice)))
+				newButton("Fit image", v.fitImage).withTip("Show the whole slice"),
+				newButton("Focus slice", v.toggleFocusSlice).withTip("Enlarge the 2D slice to fill the workspace")))
 		}
 		page = vstack(8, rows...)
 	}
-	return border(sel, nil, nil, nil, inset(0, 8, page))
+	return vstack(8, sel, page)
 }
 
 // phoneFocusView: the view fills the screen above one action bar; "Adjust
@@ -456,10 +495,9 @@ func (v *Viewer) phoneFocusView() fyne.CanvasObject {
 		v.rebuild()
 	})
 	adjust.selected = v.st.focusAdjustOpen
-	bar := panel(colBG, 0, vstack(0,
-		hairline(),
+	bar := edged(panel(colBG, 0, vstack(0,
 		inset(16, 8, buttonRow(exit, newButton(fitLabel, fit), adjust)),
-		container.New(sizedLayout{h: v.st.layout.homeIndicatorInset()}, vstack(0))))
+		container.New(sizedLayout{h: v.st.layout.homeIndicatorInset()}, vstack(0)))), edgeTop)
 
 	view, sheet := fyne.CanvasObject(v.volumeRenderer), v.volumeSheet
 	if slice {
@@ -470,7 +508,7 @@ func (v *Viewer) phoneFocusView() fyne.CanvasObject {
 	} else if slice && !v.st.composite && v.dicox.MaxSlice() > 0 {
 		// Stepping through slices is the main thing to do here: keep it out.
 		row := panel(colPanel, 0, inset(16, 8, v.sliceRow().obj))
-		view = border(nil, border(hairline(), nil, nil, nil, row), nil, nil, view)
+		view = border(nil, edged(row, edgeTop), nil, nil, view)
 	}
 	return border(nil, bar, nil, nil, view)
 }

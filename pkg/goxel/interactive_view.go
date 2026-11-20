@@ -1,7 +1,9 @@
 package goxel
 
 import (
+	"image"
 	"image/color"
+	"math"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
@@ -10,7 +12,8 @@ import (
 )
 
 // Interactive2DView shows the 2D slice centred in a black well. Zoom scales
-// the fitted image; a drag pans it, or draws an ROI when annotating.
+// the fitted image (Ctrl + scroll or a pinch zooms about the pointer, 50-500 %);
+// a drag pans it, or draws an ROI when annotating.
 type Interactive2DView struct {
 	widget.BaseWidget
 	image     *canvas.Image
@@ -22,6 +25,11 @@ type Interactive2DView struct {
 
 	zoom       float32 // 1 = fit
 	panX, panY float32
+
+	// TurnToFit lets a slice that is clearly larger on its side be drawn
+	// turned a quarter turn (phone focus). turned says whether it is.
+	TurnToFit bool
+	turned    bool
 
 	OnAnnotationAdded func(x, y, w, h float32)
 	viewer            *Viewer // Reference to check annotation mode
@@ -57,6 +65,84 @@ func (iv *Interactive2DView) SetZoom(percent float64) {
 		iv.panX, iv.panY = 0, 0
 	}
 	iv.Refresh()
+}
+
+// centre puts the image back in the middle of the well.
+func (iv *Interactive2DView) centre() {
+	iv.panX, iv.panY = 0, 0
+	iv.Refresh()
+}
+
+// turnGain is how much larger a slice must get on its side before it is turned.
+const turnGain = 1.25
+
+// Zoom limits, as fractions of the fitted size.
+const (
+	minImageZoom = 0.5
+	maxImageZoom = 5
+)
+
+// Scrolled zooms about the pointer: a touch pinch (a ratio from the page) or
+// Ctrl + scroll. A plain scroll does nothing here.
+func (iv *Interactive2DView) Scrolled(e *fyne.ScrollEvent) {
+	f := takePinch()
+	if f == 0 {
+		if !zoomModifierDown() {
+			return
+		}
+		f = math.Exp(math.Max(-0.2, math.Min(0.2, float64(e.Scrolled.DY)*0.01)))
+	}
+	iv.zoomAbout(float32(f), e.Position)
+}
+
+// zoomAbout multiplies the zoom by f, keeping the point under at where it is,
+// and tells the Zoom slider.
+func (iv *Interactive2DView) zoomAbout(f float32, at fyne.Position) {
+	old := iv.zoom
+	z := max(minImageZoom, min(maxImageZoom, old*f))
+	if z == old {
+		return
+	}
+	size := iv.Size()
+	if z <= 1 {
+		iv.panX, iv.panY = 0, 0
+	} else {
+		r := z / old
+		px, py := at.X-size.Width/2, at.Y-size.Height/2
+		iv.panX = px - (px-iv.panX)*r
+		iv.panY = py - (py-iv.panY)*r
+	}
+	iv.zoom = z
+	iv.Refresh()
+	if iv.viewer != nil {
+		iv.viewer.zoomChanged(float64(z) * 100)
+	}
+}
+
+// applySource points the image at the slice, turned when it is drawn on its side.
+func (iv *Interactive2DView) applySource() {
+	if iv.viewer == nil {
+		return
+	}
+	var src image.Image = iv.viewer.dicox
+	if iv.turned {
+		src = rotatedCW{iv.viewer.dicox}
+	}
+	iv.image.Image = src
+}
+
+// rotatedCW is an image turned a quarter turn clockwise: the source's left
+// edge runs along the top.
+type rotatedCW struct{ src image.Image }
+
+func (r rotatedCW) ColorModel() color.Model { return r.src.ColorModel() }
+func (r rotatedCW) Bounds() image.Rectangle {
+	b := r.src.Bounds()
+	return image.Rect(0, 0, b.Dy(), b.Dx())
+}
+func (r rotatedCW) At(x, y int) color.Color {
+	b := r.src.Bounds()
+	return r.src.At(b.Min.X+y, b.Max.Y-1-x)
 }
 
 func (iv *Interactive2DView) CreateRenderer() fyne.WidgetRenderer {
@@ -146,9 +232,27 @@ func (r *interactive2DRenderer) Layout(size fyne.Size) {
 	iv.well.Resize(size)
 
 	imgW, imgH := iv.imageSize()
-	scale := min(size.Width/imgW, size.Height/imgH) * iv.zoom
+	upright := min(size.Width/imgW, size.Height/imgH)
+	onSide := min(size.Width/imgH, size.Height/imgW)
+	turned := iv.TurnToFit && onSide >= upright*turnGain
+	if turned != iv.turned {
+		iv.turned = turned
+		iv.panX, iv.panY = 0, 0
+		iv.applySource()
+		iv.image.Refresh()
+	}
+	fit := upright
+	shownW, shownH := imgW, imgH
+	if turned {
+		fit, shownW, shownH = onSide, imgH, imgW
+	}
+	scale := fit * iv.zoom
 	iv.scale = scale
-	w, h := imgW*scale, imgH*scale
+	w, h := shownW*scale, shownH*scale
+	// The image never leaves the well: pan only as far as it overflows.
+	maxX, maxY := max((w-size.Width)/2, 0), max((h-size.Height)/2, 0)
+	iv.panX = max(-maxX, min(maxX, iv.panX))
+	iv.panY = max(-maxY, min(maxY, iv.panY))
 	iv.image.Move(fyne.NewPos((size.Width-w)/2+iv.panX, (size.Height-h)/2+iv.panY))
 	iv.image.Resize(fyne.NewSize(w, h))
 
