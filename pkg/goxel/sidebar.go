@@ -2,47 +2,52 @@ package goxel
 
 import (
 	"fmt"
-	"sort"
-	"strings"
-	"time"
+	"image/color"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/layout"
-	"fyne.io/fyne/v2/widget"
 )
 
 // sidebar is the desktop left column: Study, Details, Volumes, Findings and
 // the DICOM metadata, collapsed, at the bottom.
 func (v *Viewer) sidebar() fyne.CanvasObject {
-	items := []fyne.CanvasObject{v.studySection(), hairline(), v.detailsSection()}
+	items := []fyne.CanvasObject{v.studySection(), rule(), v.detailsSection()}
 	if len(v.volumeKeys()) > 1 {
-		items = append(items, hairline(), v.volumesSection())
+		items = append(items, rule(), v.volumesSection())
 	}
-	items = append(items, hairline(), v.findingsSection(), hairline(), v.metadataSection())
-	body := container.NewVScroll(inset(12, 10, container.NewVBox(items...)))
-	edge := filled(colHairline)
-	edge.SetMinSize(fyne.NewSize(1, 1))
-	return container.NewStack(filled(colPanel), container.NewBorder(nil, nil, nil, edge, body))
+	items = append(items, rule(), v.findingsSection(), rule(), v.metadataSection())
+	body := container.NewVScroll(inset(16, 16, vstack(8, items...)))
+	return edged(panel(colPanel, 0, body), edgeRight)
 }
 
 // studySection: the "Open now" card, open actions and load status.
 func (v *Viewer) studySection() fyne.CanvasObject {
 	items := []fyne.CanvasObject{sectionTitle("Study", "")}
 	if v.loaded() {
-		label := text("Open now", 12, colMuted, false)
-		name := widget.NewLabel(elideMiddle(v.st.loadedName, 30))
-		name.Truncation = fyne.TextTruncateEllipsis
+		label := text("Open now", 12, colAccent)
+		// The whole name, wrapped: nothing is cut off, on any screen.
+		name := newWrapped(v.st.loadedName, bodySize(), colHeading)
+		// The accent edge is 4 wide with only its left corners rounded: roxel
+		// asks for the card's 6, and a bar this narrow takes 2 of it.
 		edge := filled(colAccent)
+		edge.TopLeftCornerRadius, edge.BottomLeftCornerRadius = 2, 2
 		edge.SetMinSize(fyne.NewSize(4, 1))
-		card := container.NewStack(filled(colOpenCard),
-			container.NewBorder(nil, nil, edge, nil, inset(8, 4, container.NewVBox(label, name))))
-		items = append(items, card)
+		body := container.New(insetsLayout{left: 14, right: 10, top: 8, bottom: 9},
+			vstack(2, minHeight(eguiRowHeight(12), leftCentre(label)), name))
+		path := v.st.loadedPath
+		if path == "" {
+			path = v.st.loadedName
+		}
+		items = append(items, newTipArea(container.NewStack(rrect(colOpenCard, color.Transparent, 6, 0),
+			border(nil, nil, edge, nil, nil), body), path))
 	} else {
 		items = append(items, note("No study open"))
 	}
-	items = append(items, v.openButtons(false), v.loadStatus())
-	return container.NewVBox(items...)
+	items = append(items, v.openButtons(false))
+	if st := v.loadStatus(); st != nil {
+		items = append(items, st)
+	}
+	return vstack(8, items...)
 }
 
 // detailsSection: voxels, physical extent, modality and volume count.
@@ -50,7 +55,7 @@ func (v *Viewer) detailsSection() fyne.CanvasObject {
 	items := []fyne.CanvasObject{sectionTitle("Details", "")}
 	p := v.primary
 	if p == nil {
-		return container.NewVBox(append(items, note("—"))...)
+		return vstack(8, append(items, note("—"))...)
 	}
 	ex, ey, ez := float64(p.Width)*spacingOr1(p.VoxelSizeX), float64(p.Height)*spacingOr1(p.VoxelSizeY),
 		float64(p.Depth)*spacingOr1(p.VoxelSizeZ)
@@ -58,91 +63,114 @@ func (v *Viewer) detailsSection() fyne.CanvasObject {
 	if modality == "" {
 		modality = "—"
 	}
-	items = append(items,
+	rows := vstack(2,
 		keyValue("Voxels", fmt.Sprintf("%d × %d × %d", p.Width, p.Height, p.Depth)),
-		keyValue("Extent (mm)", fmt.Sprintf("%.0f × %.0f × %.0f", ex, ey, ez)),
+		keyValue("Extent", fmt.Sprintf("%.0f × %.0f × %.0f mm", ex, ey, ez)),
 		keyValue("Modality", modality),
 		keyValue("Volumes", fmt.Sprintf("%d", len(v.volumeKeys()))),
 	)
-	return container.NewVBox(items...)
+	return vstack(8, append(items, rows)...)
 }
 
-// volumesSection: one row per 3D volume — visibility and opacity.
+// volumesSection picks the volume shown in both the 3D view and the 2D slice,
+// one at a time, as roxel does.
 func (v *Viewer) volumesSection() fyne.CanvasObject {
 	items := []fyne.CanvasObject{sectionTitle("Volumes", "")}
 	for _, k := range v.volumeKeys() {
-		vol := v.compositeVolumes[k]
-		check := newCheck(elideMiddle(k, 24), vol.Enabled, func(b bool) {
-			vol.Enabled = b
-			v.setup3DView()
+		b := newButton(elideMiddle(k, 24), func() {
+			if k != v.active3D {
+				v.showVolume(k, false)
+				v.rebuild()
+			}
 		})
-		alpha := newSliderRow(v.st.layout.compact(), "Opacity", 0, 1, 0.05,
-			func(x float64) string { return fmt.Sprintf("%.2f", x) }, vol.Alpha,
-			func(x float64) {
-				vol.Alpha = x
-				v.debounced("layers", 80*time.Millisecond, v.setup3DView)
-			}, nil)
-		items = append(items, check, alpha.obj)
+		b.selected = k == v.active3D
+		b.flat = true
+		items = append(items, b)
 	}
-	return container.NewVBox(items...)
+	return vstack(8, items...)
 }
 
-// findingsSection: count and rows, or roxel's empty sentence.
+// findingsSection: heading with the count, the controls that act on every
+// finding, then one selectable row per finding; or roxel's one sentence saying
+// nothing was loaded.
 func (v *Viewer) findingsSection() fyne.CanvasObject {
-	n := v.findingCount()
-	head := container.NewBorder(nil, nil, sectionTitle("Findings", ""), nil,
-		container.NewHBox(layout.NewSpacer(), container.NewCenter(text(fmt.Sprintf("%d reported", n), 12, colMuted, false))))
-	if n == 0 {
-		return container.NewVBox(head, note("No findings were loaded with this study."))
+	summary, rows := v.findingsSummary(), v.findingsList()
+	if rows == nil {
+		return summary
 	}
-	items := []fyne.CanvasObject{head}
-	var keys []string
-	for _, k := range v.sortedKeys() {
-		if strings.HasPrefix(k, "finding_") {
-			keys = append(keys, k)
-		}
-	}
-	allOn := true
-	for _, k := range keys {
-		allOn = allOn && v.compositeVolumes[k].Enabled
-	}
-	show := newCheck("Show finding boxes", allOn, func(b bool) {
-		for _, k := range keys {
-			v.compositeVolumes[k].Enabled = b
-		}
-		v.setup3DView()
-		v.rebuild()
-	})
-	items = append(items, show)
-	for _, k := range keys {
-		vol := v.compositeVolumes[k]
-		swatch := filled(vol.Color)
-		swatch.SetMinSize(fyne.NewSize(12, 12))
-		check := newCheck(strings.TrimPrefix(k, "finding_"), vol.Enabled, func(b bool) {
-			vol.Enabled = b
-			v.setup3DView()
-		})
-		items = append(items, container.NewBorder(nil, nil, container.NewCenter(swatch), nil, check))
-	}
-	return container.NewVBox(items...)
+	return vstack(8, summary, rows)
 }
 
-func (v *Viewer) sortedKeys() []string {
-	keys := make([]string, 0, len(v.compositeVolumes))
-	for k := range v.compositeVolumes {
-		keys = append(keys, k)
+// findingsSummary is the heading with the count, then either the sentence
+// saying no findings were loaded or the controls that act on every finding.
+func (v *Viewer) findingsSummary() fyne.CanvasObject {
+	n := v.findingCount()
+	count := ""
+	if n > 0 {
+		count = fmt.Sprintf("%d reported", n)
 	}
-	sort.Strings(keys)
-	return keys
+	head := sectionTitle("Findings", count)
+	if n == 0 {
+		// Says what is missing; never that the scan is clear.
+		return vstack(8, head, bodyNote("No findings were loaded with this study."))
+	}
+	show := newCheck("Show finding boxes", v.st.showFindingBoxes, func(b bool) {
+		v.st.showFindingBoxes = b
+		v.syncFindings()
+	}).withTip("Draw a box around each finding in the 3D view")
+	all := newButton("Show all", func() { v.showFindings(func(int) bool { return true }) })
+	none := newButton("Hide all", func() { v.showFindings(func(int) bool { return false }) })
+	selected := v.selectedFinding()
+	only := newButton("Show only the selected one", func() {
+		v.showFindings(func(i int) bool { return i == selected })
+	})
+	if selected < 0 {
+		only.Disable() // always present, so the list never jumps
+	}
+	return vstack(8, head, show, buttonRow(all, none), only)
+}
+
+// findingsList is one row per finding: a box to show or hide it, and the row
+// itself to select it. It is nil when there are none.
+func (v *Viewer) findingsList() fyne.CanvasObject {
+	if v.findingCount() == 0 {
+		return nil
+	}
+	selected := v.selectedFinding()
+	rows := make([]fyne.CanvasObject, 0, v.findingCount())
+	for i, f := range v.scan.Findings {
+		check := newCheck("", f.Visible, func(b bool) {
+			f.Visible = b
+			v.syncFindings()
+		}).withTip("Show this finding")
+		conf := ""
+		if f.Confidence > 0 {
+			conf = percent(f.Confidence)
+		}
+		row := newListRow(f.Name, conf, f.Color, i == selected, func() {
+			v.st.selectedFinding = i
+			v.rebuild()
+		})
+		rows = append(rows, minHeight(max(28, controlHeight()), flexRow(8, 1, check, row)))
+	}
+	return vstack(8, rows...)
 }
 
 // metadataSection keeps goxel's DICOM fields, collapsed by default.
 func (v *Viewer) metadataSection() fyne.CanvasObject {
 	s := v.scan
 	if s == nil {
-		return layout.NewSpacer()
+		return vstack(0)
 	}
-	form := container.NewVBox()
+	title := "DICOM metadata"
+	head := newTapArea(hrow(8, chevron(v.st.metadataOpen), text(title, 14.5, colHeading)), func() {
+		v.st.metadataOpen = !v.st.metadataOpen
+		v.rebuild()
+	})
+	if !v.st.metadataOpen {
+		return minHeight(28, head)
+	}
+	rows := vstack(2)
 	for _, kv := range [][2]string{
 		{"Patient ID", s.PatientID}, {"Patient name", s.PatientName},
 		{"Study date", s.StudyDate}, {"Study time", s.StudyTime},
@@ -154,8 +182,7 @@ func (v *Viewer) metadataSection() fyne.CanvasObject {
 		if val == "" {
 			val = "—"
 		}
-		form.Add(keyValue(kv[0], val))
+		rows.Add(keyValue(kv[0], elideMiddle(val, 18)))
 	}
-	acc := widget.NewAccordion(widget.NewAccordionItem("DICOM metadata", form))
-	return acc
+	return vstack(8, minHeight(28, head), rows)
 }

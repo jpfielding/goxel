@@ -35,6 +35,7 @@ type RenderParams struct {
 	WindowLevel       float64
 	WindowWidth       float64
 	AlphaScale        float64
+	ScaleY            float64
 	ScaleZ            float64
 	RescaleIntercept  float64
 	StepSize          float64

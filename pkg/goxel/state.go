@@ -1,6 +1,10 @@
 package goxel
 
-import "github.com/jpfielding/goxel/pkg/volume"
+import (
+	"math"
+
+	"github.com/jpfielding/goxel/pkg/volume"
+)
 
 // layoutClass is the responsive layout, chosen from the window's logical size
 // only (never a platform flag), as roxel does.
@@ -35,6 +39,14 @@ func layoutFromSize(w, h float32) layoutClass {
 }
 
 func (l layoutClass) compact() bool { return l != layoutDesktop }
+
+// shelfInset is the shelf's padding at each side; the breakpoint measures the
+// column inside it, as roxel does.
+const shelfInset = 16
+
+// shelfThreeColumns is the shelf's inner width from which it has three columns
+// (windowing, palette, lighting); below it, two, with lighting in a menu.
+const shelfThreeColumns = 720
 
 // slicePanelWidth is the desktop 2D panel width: about a third of the window
 // so the slice is large, but never at the cost of the 3D column.
@@ -125,14 +137,15 @@ const (
 
 var qualityLabels = []string{"Fast", "Balanced", "High"}
 
-func (q renderQuality) stepSize() float64 {
+// stepVoxels is the ray step, in smallest voxels, as roxel steps.
+func (q renderQuality) stepVoxels() float64 {
 	switch q {
 	case qualityFast:
-		return 0.004
+		return 1.5
 	case qualityBalanced:
-		return 0.002
+		return 1.0
 	default:
-		return 0.001
+		return 0.5
 	}
 }
 
@@ -153,6 +166,7 @@ type uiState struct {
 	volumePage      volumePage
 	slicePage       slicePage
 	bandsOpen       bool
+	metadataOpen    bool
 	selectedBand    int
 	dragPans        bool
 
@@ -160,12 +174,18 @@ type uiState struct {
 	cutaway        bool
 	reverseCutaway bool
 
+	// Findings: boxes in the 3D view (on by default, as in roxel) and the
+	// selected row, or -1.
+	showFindingBoxes bool
+	selectedFinding  int
+
 	preset  palettePreset
 	bands   []volume.ColorBand
 	quality renderQuality
 
 	windowCenter3D float64
 	windowWidth3D  float64
+	range3D        windowRange
 	opacity        float64
 	density        float64
 	ambient        float64
@@ -179,6 +199,7 @@ type uiState struct {
 	zoom2D         float64 // percent, 50-500
 	windowCenter2D float64
 	windowWidth2D  float64
+	range2D        windowRange
 
 	loadedName  string
 	loadedPath  string
@@ -188,18 +209,26 @@ type uiState struct {
 
 func newUIState() uiState {
 	return uiState{
-		layout:      layoutDesktop,
-		phoneTab:    tabView3D,
-		sheetOpen:   true,
-		bands:       volume.DefaultColorBands(),
-		quality:     qualityHigh,
-		opacity:     0.5,
-		density:     float64(volume.DefaultColorBands()[0].Threshold) / 30000,
-		ambient:     0.55,
-		diffuse:     0.65,
-		specular:    0.4,
-		orientation: Axial,
-		zoom2D:      100,
+		layout:         layoutDesktop,
+		phoneTab:       tabView3D,
+		sheetOpen:      true,
+		bands:          volume.DefaultColorBands(),
+		preset:         paletteGrayscale,
+		quality:        qualityHigh,
+		opacity:        volume.DefaultOpacity,
+		density:        volume.DefaultDensity,
+		ambient:        volume.DefaultAmbient,
+		diffuse:        volume.DefaultDiffuse,
+		specular:       volume.DefaultSpecular,
+		depthCue:       volume.DefaultDepthCue,
+		showSlicePlane: true,
+
+		showFindingBoxes: true,
+		selectedFinding:  -1,
+		orientation:      Coronal,
+		zoom2D:           100,
+		range3D:          windowRangeFor(32768, 65536),
+		range2D:          windowRangeFor(32768, 65536),
 	}
 }
 
@@ -250,4 +279,40 @@ func cutawayPlane(o ViewOrientation, slice, count int, reverse bool) (nx, ny, nz
 		nx, ny, nz, d = -nx, -ny, -nz, frac
 	}
 	return nx, ny, nz, d
+}
+
+// windowRange is what a pair of windowing rows' tracks cover: the useful range
+// around the volume's own window, so the thumbs start centred. The number
+// boxes and steppers accept the full stored range.
+type windowRange struct {
+	centerLo, centerHi float64
+	widthLo, widthHi   float64
+	step               float64 // one press of a stepper
+}
+
+// windowRangeFor is the range for a volume whose window is (center, width):
+// the centre track covers the window itself, the width track 1 to twice it.
+func windowRangeFor(center, width float64) windowRange {
+	width = math.Max(width, 1)
+	r := windowRange{
+		centerLo: center - width/2, centerHi: center + width/2,
+		widthLo: 1, widthHi: width * 2,
+	}
+	r.step = windowStep(r.widthHi - r.widthLo)
+	return r
+}
+
+// windowStep is about 1/200 of the useful range, rounded up to a tidy number.
+func windowStep(span float64) float64 {
+	raw := span / 200
+	if raw <= 1 {
+		return 1
+	}
+	magnitude := math.Pow(10, math.Floor(math.Log10(raw)))
+	for _, m := range []float64{1, 2, 5, 10} {
+		if s := m * magnitude; s >= raw {
+			return s
+		}
+	}
+	return raw
 }

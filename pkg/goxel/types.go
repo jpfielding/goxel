@@ -105,6 +105,13 @@ type VolumeData struct {
 
 	RescaleIntercept float64
 	RescaleSlope     float64
+
+	// Window Center / Width from the file, when it carries one single, usable
+	// preset (see windowFromDataset). Otherwise the window is derived from the
+	// data (see defaultWindow).
+	WindowCenter   float64
+	WindowWidth    float64
+	WindowFromTags bool
 }
 
 // FindingData represents a detected finding region (lesion, nodule, ROI, etc).
@@ -116,6 +123,9 @@ type FindingData struct {
 	Density float64
 	Zeff    float64
 	Mass    float64
+
+	// Confidence is the source's own score, 0-1; zero when it gave none.
+	Confidence float64
 
 	Overlay *VolumeData
 	BBox    FindingBoundingBox

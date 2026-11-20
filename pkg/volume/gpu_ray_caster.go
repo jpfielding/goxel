@@ -67,19 +67,16 @@ type GPUVolumeRenderer struct {
 	lineVBO     uint32
 	lineMVPLoc  int32
 
-	// Gizmo (Orientation Widget)
-	gizmoProgram uint32
-	gizmoVAO     uint32
-	gizmoVBO     uint32
-
 	// Camera controls
 	rotationX, rotationY float64
 	zoom                 float64
 
 	// Global Rendering parameters (used as defaults or overrides)
 	alphaScale        float64
-	scaleZ            float64
+	scaleY            float64 // Y extent of the box relative to X
+	scaleZ            float64 // Z extent of the box relative to X
 	stepSize          float64
+	stepVoxels        float64 // when above zero, the step in voxels (see rayStep); else stepSize
 	densityThreshold  float64 // Clips voxels below this normalized density (0-1)
 	ambientIntensity  float64 // Ambient lighting coefficient (0-1)
 	diffuseIntensity  float64 // Diffuse lighting coefficient (0-1)
@@ -90,11 +87,13 @@ type GPUVolumeRenderer struct {
 	clipPlane  [4]float32
 	enableClip bool
 
-	// Pan offset for rotation pivot (screen-space, applied via right/up vectors)
-	panX, panY float64
+	// Pan: the offset of the orbit pivot from the box centre, in box space.
+	// The caller moves it along the camera's right and up vectors.
+	panX, panY, panZ float64
 
 	// Render dimensions
 	renderWidth, renderHeight int
+	wantWidth, wantHeight     int // requested size, applied on the GL thread
 	bgColor                   [3]float32
 
 	// OpenGL resources
@@ -132,6 +131,7 @@ type volumeUniforms struct {
 	fov               int32
 	aspectRatio       int32
 	stepSize          int32
+	scaleY            int32
 	scaleZ            int32
 	ambientIntensity  int32
 	diffuseIntensity  int32
@@ -177,15 +177,19 @@ func NewGPUVolumeRenderer(width, height int) (*GPUVolumeRenderer, error) {
 		rotationX:         0.3,
 		rotationY:         0.5,
 		zoom:              1.0,
-		alphaScale:        0.08, // Slightly higher for better material visibility
-		scaleZ:            2.0,
+		alphaScale:        DefaultOpacity,
+		scaleY:            1.0,
+		scaleZ:            1.0,
 		stepSize:          0.001, // Default ray step size
-		densityThreshold:  0.03,  // Lower threshold for more detail
-		ambientIntensity:  0.55,  // Reduced ambient for better depth contrast
-		diffuseIntensity:  0.65,  // Higher diffuse for surface definition
-		specularIntensity: 0.4,   // Moderate specular for subtle highlights
+		densityThreshold:  DefaultDensity,
+		ambientIntensity:  DefaultAmbient,
+		diffuseIntensity:  DefaultDiffuse,
+		specularIntensity: DefaultSpecular,
+		depthCue:          DefaultDepthCue,
 		renderWidth:       width,
 		renderHeight:      height,
+		wantWidth:         width,
+		wantHeight:        height,
 		needsRender:       true,
 		rendered:          image.NewRGBA(image.Rect(0, 0, width, height)),
 		commandChan:       make(chan func(), 10), // Buffer for commands
@@ -303,11 +307,6 @@ func (gr *GPUVolumeRenderer) initGLResources() error {
 	gl.AttachShader(gr.program, fragmentShader)
 	gl.LinkProgram(gr.program)
 
-	// Initialize Gizmo
-	if err := gr.initGizmo(); err != nil {
-		return fmt.Errorf("gizmo init: %w", err)
-	}
-
 	var status int32
 	gl.GetProgramiv(gr.program, gl.LINK_STATUS, &status)
 	if status == gl.FALSE {
@@ -375,6 +374,7 @@ func (gr *GPUVolumeRenderer) cacheUniforms() {
 		fov:               gl.GetUniformLocation(gr.program, gl.Str("fov\x00")),
 		aspectRatio:       gl.GetUniformLocation(gr.program, gl.Str("aspectRatio\x00")),
 		stepSize:          gl.GetUniformLocation(gr.program, gl.Str("stepSize\x00")),
+		scaleY:            gl.GetUniformLocation(gr.program, gl.Str("scaleY\x00")),
 		scaleZ:            gl.GetUniformLocation(gr.program, gl.Str("scaleZ\x00")),
 		ambientIntensity:  gl.GetUniformLocation(gr.program, gl.Str("ambientIntensity\x00")),
 		diffuseIntensity:  gl.GetUniformLocation(gr.program, gl.Str("diffuseIntensity\x00")),
@@ -641,27 +641,73 @@ func (gr *GPUVolumeRenderer) SetScaleZ(scale float64) {
 	gr.mu.Unlock()
 }
 
-// SetPan sets the screen-space pan offset
-func (gr *GPUVolumeRenderer) SetPan(px, py float64) {
+// SetScaleY sets the Y extent of the volume box relative to X
+func (gr *GPUVolumeRenderer) SetScaleY(scale float64) {
 	gr.mu.Lock()
-	gr.panX = px
-	gr.panY = py
+	gr.scaleY = scale
 	gr.needsRender = true
 	gr.mu.Unlock()
 }
 
-// GetPan returns the current pan offset
-func (gr *GPUVolumeRenderer) GetPan() (float64, float64) {
-	gr.mu.RLock()
-	defer gr.mu.RUnlock()
-	return gr.panX, gr.panY
+// SetStepSize sets the ray step in box units (X is 1.0) without touching
+// anything else.
+func (gr *GPUVolumeRenderer) SetStepSize(step float64) {
+	gr.mu.Lock()
+	gr.stepSize = step
+	gr.needsRender = true
+	gr.mu.Unlock()
 }
 
-// AdjustPan adjusts the pan offset by delta values
-func (gr *GPUVolumeRenderer) AdjustPan(dx, dy float64) {
+// SetStepVoxels sets the ray step as a fraction of the smallest voxel, as roxel
+// does: the step shrinks as the camera backs off, so a thin shell is still
+// sampled from far away.
+func (gr *GPUVolumeRenderer) SetStepVoxels(n float64) {
+	gr.mu.Lock()
+	gr.stepVoxels = n
+	gr.needsRender = true
+	gr.mu.Unlock()
+}
+
+// SetRenderSize asks for a new render target size; it is applied before the
+// next frame. Sizes are clamped to a sane range.
+func (gr *GPUVolumeRenderer) SetRenderSize(width, height int) {
+	width, height = clampRenderSize(width), clampRenderSize(height)
+	gr.mu.Lock()
+	if width != gr.wantWidth || height != gr.wantHeight {
+		gr.wantWidth, gr.wantHeight = width, height
+		gr.needsRender = true
+	}
+	gr.mu.Unlock()
+}
+
+// RenderSize returns the size of the last rendered image.
+func (gr *GPUVolumeRenderer) RenderSize() (int, int) {
+	gr.mu.RLock()
+	defer gr.mu.RUnlock()
+	return gr.renderWidth, gr.renderHeight
+}
+
+// SetPan sets the orbit pivot's offset from the box centre, in box space.
+func (gr *GPUVolumeRenderer) SetPan(px, py, pz float64) {
+	gr.mu.Lock()
+	gr.panX, gr.panY, gr.panZ = px, py, pz
+	gr.needsRender = true
+	gr.mu.Unlock()
+}
+
+// GetPan returns the orbit pivot's offset from the box centre.
+func (gr *GPUVolumeRenderer) GetPan() (x, y, z float64) {
+	gr.mu.RLock()
+	defer gr.mu.RUnlock()
+	return gr.panX, gr.panY, gr.panZ
+}
+
+// AdjustPan moves the orbit pivot by a box-space vector.
+func (gr *GPUVolumeRenderer) AdjustPan(dx, dy, dz float64) {
 	gr.mu.Lock()
 	gr.panX += dx
 	gr.panY += dy
+	gr.panZ += dz
 	gr.needsRender = true
 	gr.mu.Unlock()
 }
@@ -717,8 +763,7 @@ func (gr *GPUVolumeRenderer) ClearVolumes() {
 		}
 	}
 	gr.volumes = nil
-	gr.panX = 0
-	gr.panY = 0
+	gr.panX, gr.panY, gr.panZ = 0, 0, 0
 	gr.needsRender = true
 }
 
@@ -762,6 +807,7 @@ func (gr *GPUVolumeRenderer) Params() RenderParams {
 		WindowLevel:       gr.defaultWindowLevel(),
 		WindowWidth:       gr.defaultWindowWidth(),
 		AlphaScale:        gr.alphaScale,
+		ScaleY:            gr.scaleY,
 		ScaleZ:            gr.scaleZ,
 		RescaleIntercept:  gr.defaultRescaleIntercept(),
 		StepSize:          gr.stepSize,
@@ -776,6 +822,9 @@ func (gr *GPUVolumeRenderer) Params() RenderParams {
 func (gr *GPUVolumeRenderer) SetParams(p RenderParams) {
 	gr.mu.Lock()
 	gr.alphaScale = p.AlphaScale
+	if p.ScaleY > 0 {
+		gr.scaleY = p.ScaleY
+	}
 	gr.scaleZ = p.ScaleZ
 	gr.stepSize = p.StepSize
 	gr.densityThreshold = p.DensityThreshold
@@ -942,17 +991,9 @@ func (gr *GPUVolumeRenderer) uploadVolume(vol *ActiveVolume) {
 				// R = density (raw uint16)
 				rgba[outIdx] = vol.Data[idx]
 
-				// Central-difference gradients (zero at volume boundaries)
-				var dx, dy, dz float64
-				if x > 0 && x < dimX-1 {
-					dx = float64(vol.Data[idx+1]) - float64(vol.Data[idx-1])
-				}
-				if y > 0 && y < dimY-1 {
-					dy = float64(vol.Data[idx+dimX]) - float64(vol.Data[idx-dimX])
-				}
-				if z > 0 && z < dimZ-1 {
-					dz = float64(vol.Data[idx+sliceSize]) - float64(vol.Data[idx-sliceSize])
-				}
+				dx := voxelDiff(vol.Data, idx, x, dimX, 1)
+				dy := voxelDiff(vol.Data, idx, y, dimY, dimX)
+				dz := voxelDiff(vol.Data, idx, z, dimZ, sliceSize)
 
 				// Encode gradients: map [-65535, +65535] to [0, 65535]
 				rgba[outIdx+1] = uint16(math.Max(0, math.Min(65535, (dx+65535.0)/2.0)))
@@ -1043,10 +1084,15 @@ func (gr *GPUVolumeRenderer) renderInternal() *image.RGBA {
 	rotX, rotY := gr.rotationX, gr.rotationY
 	zoom := gr.zoom
 	alpha := float32(gr.alphaScale)
-	scaleZ := float32(gr.scaleZ)
-	stepSize := gr.stepSize
+	scaleY, scaleZ := float32(gr.scaleY), float32(gr.scaleZ)
+	stepSize, stepVoxels := gr.stepSize, gr.stepVoxels
+	resize := gr.wantWidth != gr.renderWidth || gr.wantHeight != gr.renderHeight
+	if resize {
+		gr.renderWidth, gr.renderHeight = gr.wantWidth, gr.wantHeight
+		gr.rendered = image.NewRGBA(image.Rect(0, 0, gr.renderWidth, gr.renderHeight))
+	}
 	width, height := gr.renderWidth, gr.renderHeight
-	panX, panY := float32(gr.panX), float32(gr.panY)
+	panX, panY, panZ := float32(gr.panX), float32(gr.panY), float32(gr.panZ)
 
 	needsTransferUpload := gr.needsTransferUpload
 	gr.needsRender = false
@@ -1062,6 +1108,11 @@ func (gr *GPUVolumeRenderer) renderInternal() *image.RGBA {
 	gr.mu.Unlock()
 
 	// GL Context is already current on this thread
+
+	if resize {
+		gl.BindTexture(gl.TEXTURE_2D, gr.colorBuffer)
+		gl.TexImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, int32(width), int32(height), 0, gl.RGBA, gl.UNSIGNED_BYTE, nil)
+	}
 
 	// Upload transfer function
 	if needsTransferUpload && gr.transferTex != 0 {
@@ -1096,7 +1147,7 @@ func (gr *GPUVolumeRenderer) renderInternal() *image.RGBA {
 	sinEl, cosEl := float32(math.Sin(rotY)), float32(math.Cos(rotY))
 
 	// Geometric center as rotation pivot, offset by user pan
-	centerX, centerY, centerZ := float32(0.5)+panX, float32(0.5)+panY, scaleZ*0.5
+	centerX, centerY, centerZ := float32(0.5)+panX, scaleY*0.5+panY, scaleZ*0.5+panZ
 	camX := sinAz*cosEl*float32(zoom) + centerX
 	camY := sinEl*float32(zoom) + centerY
 	camZ := cosAz*cosEl*float32(zoom) + centerZ
@@ -1145,9 +1196,13 @@ func (gr *GPUVolumeRenderer) renderInternal() *image.RGBA {
 	gl.Uniform1f(gr.uniforms.aspectRatio, float32(width)/float32(height))
 	// Adaptive step size: scale by zoom for better interactivity when zoomed out,
 	// finer quality when zoomed in. At zoom=1.0, step equals the configured base.
-	clampedZoom := math.Max(0.5, math.Min(5.0, zoom))
-	adaptiveStep := stepSize * clampedZoom
+	var first *ActiveVolume
+	if len(volumesToRender) > 0 {
+		first = volumesToRender[0]
+	}
+	adaptiveStep := rayStep(stepSize, stepVoxels, first, float64(scaleY), float64(scaleZ), zoom)
 	gl.Uniform1f(gr.uniforms.stepSize, float32(adaptiveStep))
+	gl.Uniform1f(gr.uniforms.scaleY, scaleY)
 	gl.Uniform1f(gr.uniforms.scaleZ, scaleZ)
 	gl.Uniform1f(gr.uniforms.ambientIntensity, float32(gr.ambientIntensity))
 	gl.Uniform1f(gr.uniforms.diffuseIntensity, float32(gr.diffuseIntensity))
@@ -1292,25 +1347,21 @@ func (gr *GPUVolumeRenderer) renderInternal() *image.RGBA {
 		gr.drawFindings(mvp)
 	}
 
-	// Draw Orientation Gizmo
-	gr.drawGizmo()
-
 	// Read pixels back
 	pixels := make([]byte, width*height*4)
 	gl.ReadPixels(0, 0, int32(width), int32(height), gl.RGBA, gl.UNSIGNED_BYTE, gl.Ptr(pixels))
 
-	// Convert to image.RGBA (flip Y)
+	// Convert to image.RGBA, full alpha for UI display. GL's first row is the
+	// bottom of the framebuffer; the shader's up vector points down the screen
+	// (the camera model of roxel), so the rows are used as they come.
 	gr.mu.Lock()
+	stride := width * 4
 	for y := 0; y < height; y++ {
-		srcY := height - 1 - y
-		for x := 0; x < width; x++ {
-			srcIdx := (srcY*width + x) * 4
-			gr.rendered.SetRGBA(x, y, color.RGBA{
-				R: pixels[srcIdx],
-				G: pixels[srcIdx+1],
-				B: pixels[srcIdx+2],
-				A: 255, // Full alpha for UI display
-			})
+		src := pixels[y*stride : (y+1)*stride]
+		dst := gr.rendered.Pix[y*gr.rendered.Stride : y*gr.rendered.Stride+stride]
+		copy(dst, src)
+		for i := 3; i < stride; i += 4 {
+			dst[i] = 255
 		}
 	}
 	gr.mu.Unlock()
@@ -1423,10 +1474,10 @@ func (gr *GPUVolumeRenderer) drawFindings(mvp [16]float32) {
 
 		// Normalize bbox (0..1)
 		minX := float32(t.BBox.X) / float32(refDimX)
-		minY := float32(t.BBox.Y) / float32(refDimY)
+		minY := float32(t.BBox.Y) / float32(refDimY) * float32(gr.scaleY)
 		minZ := float32(t.BBox.Z) / float32(refDimZ) * float32(gr.scaleZ)
 		maxX := float32(t.BBox.X+t.BBox.Width) / float32(refDimX)
-		maxY := float32(t.BBox.Y+t.BBox.Height) / float32(refDimY)
+		maxY := float32(t.BBox.Y+t.BBox.Height) / float32(refDimY) * float32(gr.scaleY)
 		maxZ := float32(t.BBox.Z+t.BBox.Depth) / float32(refDimZ) * float32(gr.scaleZ)
 
 		// Debug Log

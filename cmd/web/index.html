@@ -19,15 +19,53 @@
     <div id="goxel-status">Loading goxel… (about 12 MB)</div>
     <div id="goxel-error" role="alert"></div>
     <noscript>goxel needs JavaScript, WebAssembly and WebGL.</noscript>
+    <script>
+      // Fyne's browser driver re-applies its theme when the OS colour scheme
+      // changes (a "change" event on matchMedia("(prefers-color-scheme: dark)"),
+      // which browsers also fire when a hidden window is restored). That path
+      // reloads every text texture from the JS event goroutine, where no GL
+      // context is current, and Go panics: "syscall/js: call of Value.Call on
+      // null" from (*window).RescaleContext, and the page stops responding.
+      // goxel's theme is dark whatever the browser prefers, so hand Fyne the
+      // query's current answer and never tell it about changes.
+      (() => {
+        const real = window.matchMedia.bind(window);
+        const quiet = new Set(["addEventListener", "removeEventListener", "addListener", "removeListener"]);
+        window.matchMedia = (query) => {
+          const list = real(query);
+          if (!/prefers-color-scheme/.test(query)) return list;
+          return new Proxy(list, {
+            get: (target, key) => {
+              if (quiet.has(key)) return () => {};
+              const value = Reflect.get(target, key, target);
+              return typeof value === "function" ? value.bind(target) : value;
+            },
+          });
+        };
+      })();
+    </script>
     <script src="wasm_exec.js"></script>
     <script>
-      // Touch shim. Fyne's browser driver only listens to mouse and wheel
-      // events, so translate: one finger -> mouse (tap, drag, slider drag),
-      // two fingers -> wheel by the change in finger distance (pinch zoom).
-      // Two-finger pan is not reproduced; the Camera page has an Orbit|Pan
-      // toggle and arrow buttons instead.
+      // Input shim. Fyne's browser driver only listens to mouse and wheel
+      // events and reports no key modifiers, so translate and publish:
+      //   one finger   -> mouse (tap, drag, slider drag)
+      //   two fingers  -> a pinch (a wheel event plus the exact ratio, for the
+      //                   zoom) and, over the 3D view, a drag with window.goxel.pan
+      //                   set, which the 3D view takes as a pan
+      //   Shift, Ctrl  -> window.goxel.shift / .ctrl (Shift + drag pans the 3D
+      //                   view; Ctrl + scroll zooms the 2D slice)
+      // pkg/goxel/input_js.go reads window.goxel.
       (() => {
-        let last = null, pinch = null;
+        const g = (window.goxel = { shift: false, ctrl: false, pan: false, pinch: 0, pinchAt: 0, view: null });
+        const keys = (e) => { g.shift = e.shiftKey; g.ctrl = e.ctrlKey || e.metaKey; };
+        addEventListener("keydown", keys, { capture: true, passive: true });
+        addEventListener("keyup", keys, { capture: true, passive: true });
+        addEventListener("blur", () => { g.shift = g.ctrl = false; });
+        // A wheel event says whether Ctrl is held (a trackpad pinch sets it too).
+        addEventListener("wheel", (e) => { g.ctrl = e.ctrlKey || e.metaKey; },
+          { capture: true, passive: true });
+
+        let last = null, pinch = null, mid = null, panning = false;
         const fire = (type, x, y, dx = 0, dy = 0) => {
           const ev = new MouseEvent(type, { clientX: x, clientY: y, button: 0,
             buttons: type === "mouseup" ? 0 : 1, bubbles: true, cancelable: true });
@@ -38,7 +76,17 @@
           document.dispatchEvent(ev);
         };
         const spread = (ts) => Math.hypot(ts[0].clientX - ts[1].clientX, ts[0].clientY - ts[1].clientY);
+        const centre = (ts) => ({ x: (ts[0].clientX + ts[1].clientX) / 2, y: (ts[0].clientY + ts[1].clientY) / 2 });
         const mine = (e) => e.target instanceof HTMLCanvasElement;
+        // Two fingers pan only where the 3D view is: elsewhere they would drag
+        // whatever control is under them.
+        const inView = (p) => g.view && g.view.w > 0 && p.x >= g.view.x && p.x < g.view.x + g.view.w &&
+          p.y >= g.view.y && p.y < g.view.y + g.view.h;
+        const stopPan = () => {
+          if (panning) fire("mouseup", mid.x, mid.y);
+          panning = false;
+          g.pan = false;
+        };
         addEventListener("touchstart", (e) => {
           if (!mine(e)) return;
           e.preventDefault();
@@ -50,6 +98,13 @@
           } else if (e.touches.length === 2) {
             if (last) { fire("mouseup", last.x, last.y); last = null; }
             pinch = spread(e.touches);
+            mid = centre(e.touches);
+            fire("mousemove", mid.x, mid.y);
+            if (inView(mid)) {
+              panning = true;
+              g.pan = true;
+              fire("mousedown", mid.x, mid.y);
+            }
           }
         }, { passive: false });
         addEventListener("touchmove", (e) => {
@@ -61,10 +116,18 @@
             last = { x: t.clientX, y: t.clientY };
           } else if (e.touches.length === 2 && pinch !== null) {
             const d = spread(e.touches);
-            const cx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
-            const cy = (e.touches[0].clientY + e.touches[1].clientY) / 2;
-            document.dispatchEvent(new WheelEvent("wheel", { clientX: cx, clientY: cy,
-              deltaY: (pinch - d) * 2, bubbles: true, cancelable: true }));
+            const m = centre(e.touches);
+            // The pointer follows the fingers' midpoint: a pan drag when over the
+            // 3D view, else just the place a zoom is about.
+            fire("mousemove", m.x, m.y, panning ? m.x - mid.x : 0, panning ? m.y - mid.y : 0);
+            if (pinch > 8 && d > 8) {
+              g.pinch = d / pinch;
+              g.pinchAt = performance.now();
+              g.ctrl = true;
+              document.dispatchEvent(new WheelEvent("wheel", { clientX: m.x, clientY: m.y,
+                deltaY: (pinch - d) * 2, ctrlKey: true, bubbles: true, cancelable: true }));
+            }
+            mid = m;
             pinch = d;
           }
         }, { passive: false });
@@ -72,7 +135,7 @@
           if (!mine(e)) return;
           e.preventDefault();
           if (e.touches.length === 0 && last) { fire("mouseup", last.x, last.y); last = null; }
-          if (e.touches.length < 2) pinch = null;
+          if (e.touches.length < 2) { stopPan(); pinch = null; g.pinch = 0; g.ctrl = false; }
         };
         addEventListener("touchend", end, { passive: false });
         addEventListener("touchcancel", end, { passive: false });

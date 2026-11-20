@@ -19,13 +19,12 @@ func (l *responsiveLayout) Layout(objs []fyne.CanvasObject, size fyne.Size) {
 	}
 	v := l.v
 	class := layoutFromSize(size.Width, size.Height)
-	narrow := class == layoutDesktop && shelfIsNarrow(size.Width)
+	narrow := class == layoutDesktop && shelfNarrow(size.Width, v.st.focusVolume)
 	if (class != v.st.layout || narrow != v.narrowShelf) && !v.rebuildPending {
 		v.rebuildPending = true
 		go fyne.Do(func() {
 			v.rebuildPending = false
 			v.st.layout = class
-			v.narrowShelf = narrow
 			v.rebuild()
 			v.volumeRenderer.FitView()
 		})
@@ -37,10 +36,19 @@ func (l *responsiveLayout) MinSize([]fyne.CanvasObject) fyne.Size {
 	return fyne.NewSize(320, 320)
 }
 
-// shelfIsNarrow: below 720 px of 3D column the shelf drops to two columns
-// and lighting moves into a menu button.
+// shelfIsNarrow: below 720 px inside the 3D column the shelf drops to two
+// columns and lighting moves into a menu button.
 func shelfIsNarrow(window float32) bool {
-	return window-sidebarWidth-slicePanelWidth(window) < 720
+	return window-sidebarWidth-slicePanelWidth(window)-2*shelfInset < shelfThreeColumns
+}
+
+// shelfNarrow is shelfIsNarrow for the layout in use: in focus the 3D column
+// is the whole window.
+func shelfNarrow(window float32, focusVolume bool) bool {
+	if focusVolume {
+		return window-2*shelfInset < shelfThreeColumns
+	}
+	return shelfIsNarrow(window)
 }
 
 // desktopLayout places [sidebar, slice panel, centre]: the sidebar at its
@@ -72,16 +80,16 @@ func (desktopLayout) MinSize(objs []fyne.CanvasObject) fyne.Size {
 func (v *Viewer) desktopRoot() fyne.CanvasObject {
 	bar := v.appBar()
 	if !v.loaded() {
-		return container.NewBorder(bar, nil, nil, nil, v.emptyState())
+		return border(bar, nil, nil, nil, v.emptyState())
 	}
 	status := v.statusBar()
 	if v.st.focusSlice {
-		return container.NewBorder(bar, status, nil, nil, v.sliceFocusView())
+		return border(bar, status, nil, nil, v.sliceFocusView())
 	}
-	centre := container.NewBorder(v.volumeHeader(), v.shelf(), nil, nil, v.volumeRenderer)
+	centre := border(v.volumeHeader(), v.shelf(), nil, nil, v.volumeRenderer)
 	if v.st.focusVolume {
-		return container.NewBorder(bar, status, nil, nil, centre)
+		return border(bar, status, nil, nil, centre)
 	}
 	body := container.New(desktopLayout{}, v.sidebar(), v.slicePanel(), centre)
-	return container.NewBorder(bar, status, nil, nil, body)
+	return border(bar, status, nil, nil, body)
 }

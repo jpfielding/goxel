@@ -72,6 +72,7 @@ type CPUVolumeRenderer struct {
 	WindowLevel      float64
 	WindowWidth      float64
 	AlphaScale       float64
+	ScaleY           float64 // Y extent of the box relative to X
 	ScaleZ           float64 // Z-axis scaling factor
 	RescaleIntercept float64 // Offset applied to raw pixel values (default 0)
 
@@ -103,6 +104,7 @@ func NewCPUVolumeRenderer() *CPUVolumeRenderer {
 		AlphaScale:    0.05,
 		WindowLevel:   40.0,
 		WindowWidth:   380.0,
+		ScaleY:        1.0,
 		ScaleZ:        1.0,
 		RenderWidth:   512,
 		RenderHeight:  512,
@@ -153,6 +155,14 @@ func (vr *CPUVolumeRenderer) SetWindowWidth(width float64) {
 	vr.Mu.Unlock()
 }
 
+// SetScaleY sets the Y extent of the volume box relative to X
+func (vr *CPUVolumeRenderer) SetScaleY(scale float64) {
+	vr.Mu.Lock()
+	vr.ScaleY = scale
+	vr.NeedsRender = true
+	vr.Mu.Unlock()
+}
+
 // SetScaleZ sets the Z-axis scaling factor
 func (vr *CPUVolumeRenderer) SetScaleZ(scale float64) {
 	vr.Mu.Lock()
@@ -177,6 +187,7 @@ func (vr *CPUVolumeRenderer) Params() RenderParams {
 		WindowLevel:       vr.WindowLevel,
 		WindowWidth:       vr.WindowWidth,
 		AlphaScale:        vr.AlphaScale,
+		ScaleY:            vr.ScaleY,
 		ScaleZ:            vr.ScaleZ,
 		RescaleIntercept:  vr.RescaleIntercept,
 		StepSize:          vr.StepSize,
@@ -193,6 +204,9 @@ func (vr *CPUVolumeRenderer) SetParams(p RenderParams) {
 	vr.WindowLevel = p.WindowLevel
 	vr.WindowWidth = p.WindowWidth
 	vr.AlphaScale = p.AlphaScale
+	if p.ScaleY > 0 {
+		vr.ScaleY = p.ScaleY
+	}
 	vr.ScaleZ = p.ScaleZ
 	vr.RescaleIntercept = p.RescaleIntercept
 	if p.StepSize > 0 {
@@ -610,6 +624,10 @@ func (vr *CPUVolumeRenderer) Render() {
 	copy(findings, vr.Findings)
 
 	// Copy ScaleZ safely
+	scaleY := vr.ScaleY
+	if scaleY <= 0 {
+		scaleY = 1.0
+	}
 	scaleZ := vr.ScaleZ
 	if scaleZ <= 0 {
 		scaleZ = 1.0
@@ -629,7 +647,7 @@ func (vr *CPUVolumeRenderer) Render() {
 
 	// Camera position using turntable coordinates
 	// Adjust center for scaled Z
-	center := Vec3{0.5, 0.5, 0.5 * scaleZ}
+	center := Vec3{0.5, 0.5 * scaleY, 0.5 * scaleZ}
 
 	camPos := Vec3{
 		X: math.Sin(azimuth) * math.Cos(elevation) * zoom,
@@ -694,7 +712,7 @@ func (vr *CPUVolumeRenderer) Render() {
 					rayDir := forward.Add(right.Mul(u)).Add(up.Mul(v)).Normalize()
 
 					// Intersect with volume bounding box (scaled)
-					boxMax := Vec3{1.0, 1.0, scaleZ}
+					boxMax := Vec3{1.0, scaleY, scaleZ}
 					tNear, tFar, hit := IntersectBox(camPos, rayDir, boxMax)
 					if !hit {
 						vr.Rendered.SetRGBA(px, py, color.RGBA{25, 25, 30, 255})
@@ -714,9 +732,9 @@ func (vr *CPUVolumeRenderer) Render() {
 
 						// Trilinear volume sampling for smooth rendering
 						// Normalize Z coord by ScaleZ for texture lookup (0..1)
-						if pos.X >= 0 && pos.X < 1 && pos.Y >= 0 && pos.Y < 1 && pos.Z >= 0 && pos.Z < scaleZ {
+						if pos.X >= 0 && pos.X < 1 && pos.Y >= 0 && pos.Y < scaleY && pos.Z >= 0 && pos.Z < scaleZ {
 							// Sample primary (HE) volume
-							sample := sampleVolumeTrilinear(volumeData, dimX, dimY, dimZ, pos.X, pos.Y, pos.Z/scaleZ)
+							sample := sampleVolumeTrilinear(volumeData, dimX, dimY, dimZ, pos.X, pos.Y/scaleY, pos.Z/scaleZ)
 							density := float64(sample) + rescaleIntercept
 
 							// Compute normalized density and apply threshold (matching GPU path)
@@ -733,7 +751,7 @@ func (vr *CPUVolumeRenderer) Render() {
 
 								if compositeMode {
 									// Dual-energy composite mode: use HE/LE ratio for material colorization
-									leSample := sampleVolumeTrilinear(secondaryData, secDimX, secDimY, secDimZ, pos.X, pos.Y, pos.Z/scaleZ)
+									leSample := sampleVolumeTrilinear(secondaryData, secDimX, secDimY, secDimZ, pos.X, pos.Y/scaleY, pos.Z/scaleZ)
 									leDensity := float64(leSample)
 
 									// Compute HE/LE ratio (clamped to avoid division issues)
@@ -787,7 +805,7 @@ func (vr *CPUVolumeRenderer) Render() {
 									// Sample finding volume at same position
 									// Map from primary volume space to finding volume space
 									sampleX := pos.X
-									sampleY := pos.Y
+									sampleY := pos.Y / scaleY
 									sampleZ := pos.Z
 									findingX := sampleX * float64(findingDimX-1)
 									findingY := sampleY * float64(findingDimY-1)
@@ -1051,6 +1069,22 @@ func (vr *CPUVolumeRenderer) Scrolled(e *fyne.ScrollEvent) {
 	if vr.Zoom > 5 {
 		vr.Zoom = 5
 	}
+	vr.NeedsRender = true
+	vr.Mu.Unlock()
+
+	go func() {
+		vr.Render()
+		fyne.Do(func() {
+			vr.Refresh()
+		})
+	}()
+}
+
+// ZoomBy multiplies the camera distance by f (below 1 zooms in), within the
+// same limits as Scrolled, and renders.
+func (vr *CPUVolumeRenderer) ZoomBy(f float64) {
+	vr.Mu.Lock()
+	vr.Zoom = math.Max(0.5, math.Min(5, vr.Zoom*f))
 	vr.NeedsRender = true
 	vr.Mu.Unlock()
 
